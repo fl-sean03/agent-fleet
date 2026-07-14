@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# idle-down [--days N] [--dry] — spin down agent workspaces the operator hasn't INTERACTED with in >=N days
+# (default 7). Rolling cleanup so idle sessions don't hold RAM + burn the account.
+#
+# "Interacted" = the timestamp of the LAST USER TURN in the session transcript — NOT the file mtime,
+# because an account-swap bounce or a resume touches the file without any human input (that false
+# signal is exactly what made a naive mtime check wrong). Automated nudges are rare (only AUTOCONTINUE
+# workspaces on a swap) and only make a session look MORE recent, i.e. fail-safe (won't wrongly kill).
+#
+# NEVER downs: main (the home base / control surface), claude-remote workspaces (agent lives on a
+# remote box — no local transcript), NOIDLE="yes" descriptors, a pane mid-turn (busy = working now),
+# or a session whose transcript was written in the last 6h (recent autonomous activity).
+# Transient `agentctl stop` (flush-safe; stays listed — idle != ended). Log: ~/.agents/idle-down.log.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+A="$HOME/.agents"; P="$A/projects"; AGENTCTL="$HOME/.local/bin/agentctl"; LOG="$A/idle-down.log"
+DAYS=7; DRY=0
+while [ $# -gt 0 ]; do case "$1" in --days) DAYS="${2:?}"; shift 2;; --dry) DRY=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
+log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+now=$(date +%s); downed=0; kept=0
+
+# last user-turn epoch for a workspace's transcript (empty if none / no file)
+last_user_epoch(){ # <jsonl>
+  python3 - "$1" <<'PY'
+import json,sys,datetime
+last=None
+try:
+    with open(sys.argv[1],encoding='utf-8',errors='ignore') as fh:
+        for line in fh:
+            if '"user"' not in line: continue
+            try: o=json.loads(line)
+            except: continue
+            if o.get('type')=='user' or o.get('message',{}).get('role')=='user':
+                ts=o.get('timestamp')
+                if ts: last=ts
+except FileNotFoundError: pass
+if last:
+    print(int(datetime.datetime.fromisoformat(last.replace('Z','+00:00')).timestamp()))
+PY
+}
+pane_busy(){ # <ws> → 0 if the agent pane is mid-turn RIGHT NOW.
+  # Match only "esc to interrupt" — the footer shows it ONLY during an active, interruptible turn.
+  # (The spinner glyphs ✻/✽/✢ are unreliable: a completed "✻ Crunched for 8m" summary line stays
+  # visible in an idle pane and would false-positive every idle workspace.)
+  tmux capture-pane -p -t "agent-$1:main.2" 2>/dev/null | grep -qi 'esc to interrupt'
+}
+
+[ "$DRY" = 1 ] && echo "idle-down --dry (threshold ${DAYS}d) — nothing will be stopped"
+log "=== idle-down scan (threshold ${DAYS}d, dry=$DRY) ==="
+
+while read -r kind name; do
+  [ "$name" = main ] && { log "keep main (home base, always exempt)"; kept=$((kept+1)); continue; }
+  desc="$P/$name.env"
+  ag=$(grep -oP '^AGENTS="?\K[^"]+' "$desc" 2>/dev/null | head -1)
+  [ "$ag" = claude-remote ] && { log "keep $name (remote agent — no local transcript)"; kept=$((kept+1)); continue; }
+  grep -qE '^NOIDLE="?yes' "$desc" 2>/dev/null && { log "keep $name (NOIDLE=yes)"; kept=$((kept+1)); continue; }
+
+  sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$desc" 2>/dev/null | head -1)
+  root=$(grep -oP 'ROOT="?\K[^"]+' "$desc" | head -1); root="${root/\$HOME/$HOME}"; root="${root/#\~/$HOME}"
+  enc=$(printf '%s' "$root" | sed 's#[^a-zA-Z0-9]#-#g')
+  [ "$kind" = confined ] && f="$A/confined-cfg/$name/projects/-work/$sid.jsonl" || f="$HOME/.claude/projects/$enc/$sid.jsonl"
+
+  if pane_busy "$name"; then log "keep $name (pane busy — working now)"; kept=$((kept+1)); continue; fi
+  if [ -f "$f" ]; then
+    m=$(stat -c %Y "$f"); [ $(( (now-m)/3600 )) -lt 6 ] && { log "keep $name (transcript written <6h ago — recent activity)"; kept=$((kept+1)); continue; }
+  fi
+  u=$(last_user_epoch "$f"); [ -z "$u" ] && { log "keep $name (no user turns recorded — leave to owner)"; kept=$((kept+1)); continue; }
+  idle=$(( (now-u)/86400 ))
+  if [ "$idle" -ge "$DAYS" ]; then
+    if [ "$DRY" = 1 ]; then echo "  WOULD DOWN: $name ($kind) — idle ${idle}d"; log "would down $name (idle ${idle}d)"
+    else log "STOP $name (idle ${idle}d >= ${DAYS}d)"; "$AGENTCTL" stop "$name" >>"$LOG" 2>&1 && log "✓ stopped $name"; fi   # transient stop (stays listed), not retire — merely-idle ≠ ended
+    downed=$((downed+1))
+  else
+    [ "$DRY" = 1 ] && echo "  keep: $name ($kind) — idle ${idle}d < ${DAYS}d"
+    log "keep $name (idle ${idle}d < ${DAYS}d)"; kept=$((kept+1))
+  fi
+done < <("$AGENTCTL" status --json 2>/dev/null | python3 -c "import json,sys;[print(w['kind'],w['name']) for w in json.load(sys.stdin) if w['status']=='up']")
+
+log "=== done: ${downed} $([ "$DRY" = 1 ] && echo would-be) down, ${kept} kept ==="
+[ "$DRY" = 1 ] && echo "(${downed} would be stopped, ${kept} kept)"

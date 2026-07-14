@@ -1,0 +1,6 @@
+[Unit]
+Description=brain — failure alert to the main pane (OnFailure hook of brain-nightly.service)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agentctl send main "[brain] brain-nightly.service FAILED (nonzero exit). Run `brain status` and check {{FLEET_KIT_ROOT}}/brain/state/runs/ + journalctl --user -u brain-nightly."

@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly second-brain tick (replaces memory-harvest.timer + fleet-review.timer, 2026-07-09)
+
+[Timer]
+OnCalendar=*-*-* 09:17:00 UTC
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

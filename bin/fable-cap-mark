@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# fable-cap-mark <label> — record "this account is Fable-5-model-capped" so rotation can see it.
+#
+# Fable 5 enforces a PER-MODEL cap the OAuth usage endpoint does not surface: an account can read
+# 72%/5h (healthy) while every Fable call walls with "You've reached your Fable 5 limit" (observed
+# 2026-07-10 on brain harvest 14:45/17:49 and example-confined-nightly 18:08). Utilization-based rotation is
+# blind to it, so the components that HIT the wall report it here, event-driven.
+#
+# Marker: ~/.agents/accounts/.fable-cap.<label>, content = expiry epoch (one line). Fresh marker =>
+# account-watch treats the account as Fable-dead (trigger if active, ineligible as target). Expiry =
+# the account's five_hour resets_at when the usage endpoint answers quickly (the model window has
+# tracked the 5h window in every observation so far), else now + FALLBACK_TTL.
+set -uo pipefail
+LABEL="${1:?usage: fable-cap-mark <account-label>}"
+ACCTS="$HOME/.agents/accounts"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FALLBACK_TTL="${FALLBACK_TTL:-5400}"   # 90 min — conservative when the reset time is unknowable
+
+# refuse unknown labels (same convention as the rest of the harness: fail before acting)
+grep -qx "$LABEL" "$ACCTS/.rotation" 2>/dev/null || { echo "fable-cap-mark: unknown label '$LABEL'" >&2; exit 1; }
+
+expiry=$(( $(date +%s) + FALLBACK_TTL ))
+reset=$(timeout 8 "$SELF_DIR/account-usage" "$LABEL" 2>/dev/null \
+  | python3 -c "import sys,json,datetime
+for line in sys.stdin:
+    try: r=json.loads(line)
+    except ValueError: continue
+    ts=(r.get('five_hour') or {}).get('resets_at') or ''
+    if ts:
+        print(int(datetime.datetime.fromisoformat(ts).timestamp())); break" 2>/dev/null || true)
+if [ -n "$reset" ] && [ "$reset" -gt "$(date +%s)" ] 2>/dev/null; then expiry="$reset"; fi
+
+echo "$expiry" > "$ACCTS/.fable-cap.$LABEL"
+echo "marked $LABEL fable-capped until $(date -u -d "@$expiry" +%FT%TZ)"

@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""brain — the second-brain CLI (ARCHITECTURE §8).
+
+  brain nightly [--dry]          harvest → review → failures → consult → state (+ weekly on Sundays)
+  brain harvest [--limit N] [--workspace W] [--dry]
+  brain review  [--dry] [--since ISO]
+  brain failures [--dry] [--since ISO]
+  brain consult [--dry] [--cap N] [--batch N]
+  brain state   [--dry] [--workspace W]
+  brain weekly  [--dry]
+  brain status                   one-glance health + ledgers + staged-pool depth
+  brain health                   raw health.json
+
+Exit code is nonzero when any stage goes red — the systemd service surfaces it via OnFailure.
+"""
+import argparse
+import datetime
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from engine import STAGED, STATE  # noqa: E402
+from engine import runlog          # noqa: E402
+
+
+def cmd_status(_a):
+    h = runlog.health()
+    print(f"{'PIPELINE':<10} {'STATUS':<7} {'LAST OK':<21} {'LAST RUN':<21} NOTE")
+    for p in ("harvest", "review", "failures", "consult", "state", "usage", "weekly"):
+        e = h.get(p, {})
+        print(f"{p:<10} {e.get('status', '-'):<7} {e.get('last_ok', '-')[:19]:<21} "
+              f"{e.get('last_run', '-')[:19]:<21} {e.get('note', '')[:60]}")
+    from engine.ledger import Ledger
+    for p in ("harvest", "review", "failures", "consult"):
+        c = Ledger(p).counts()
+        if c:
+            print(f"ledger {p:<9} " + "  ".join(f"{k}:{v}" for k, v in sorted(c.items())))
+    import glob
+    cand = sum(1 for f in glob.glob(f"{STAGED}/candidates/*.jsonl") for _ in open(f))
+    lessons = 0
+    for f in glob.glob(f"{STAGED}/lessons/*.json"):
+        try:
+            lessons += len(json.load(open(f)))
+        except Exception:
+            pass
+    promoted = sum(1 for _ in open(f"{STAGED}/promoted.jsonl")) if os.path.exists(f"{STAGED}/promoted.jsonl") else 0
+    print(f"staged: {cand} candidates, {lessons} lessons | promoted (all-time): {promoted}")
+    from engine.store import audit_wiring
+    problems = audit_wiring()
+    if problems:
+        print(f"UNWIRED STORES ({len(problems)}) — knowledge written there never reaches a session:")
+        for ws, why in problems:
+            print(f"  {ws}: {why}")
+    return 0
+
+
+def cmd_health(_a):
+    print(json.dumps(runlog.health(), indent=1))
+    return 0
+
+
+def _red(pipelines):
+    h = runlog.health()
+    return [p for p in pipelines if h.get(p, {}).get("status") == "red"]
+
+
+def cmd_nightly(a):
+    """Stages are isolated: a crash in one marks it red and moves on (review does not depend on
+    harvest). Exit code reflects the worst stage."""
+    from pipelines import harvest, review, failures, consult, state as state_p, usage as usage_p
+    stages = [("harvest", lambda: harvest.run(limit=a.limit, dry=a.dry)),
+              ("review", lambda: review.run_daily(dry=a.dry)),
+              ("failures", lambda: failures.run(dry=a.dry)),
+              ("consult", lambda: consult.run(dry=a.dry)),
+              ("state", lambda: state_p.run(dry=a.dry)),
+              ("usage", lambda: usage_p.run(dry=a.dry))]
+    if datetime.datetime.now(datetime.timezone.utc).isoweekday() == 7:
+        stages.append(("weekly", lambda: review.run_weekly(dry=a.dry)))
+    for name, fn in stages:
+        try:
+            fn()
+        except Exception as e:   # the stage's Run already recorded red + notified
+            print(f"[nightly] stage {name} failed: {e}", file=sys.stderr)
+    # judge only the stages that ran THIS invocation — a stale red from a stage that didn't run
+    # (e.g. Sunday's weekly, judged on Monday) must not fail every subsequent nightly
+    bad = _red([name for name, _ in stages])
+    if bad:
+        print(f"[nightly] RED stages: {', '.join(bad)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="brain")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    n = sub.add_parser("nightly"); n.add_argument("--dry", action="store_true"); n.add_argument("--limit", type=int, default=40)
+    h = sub.add_parser("harvest"); h.add_argument("--limit", type=int); h.add_argument("--workspace"); h.add_argument("--dry", action="store_true")
+    r = sub.add_parser("review"); r.add_argument("--dry", action="store_true"); r.add_argument("--since")
+    f = sub.add_parser("failures"); f.add_argument("--dry", action="store_true"); f.add_argument("--since")
+    c = sub.add_parser("consult"); c.add_argument("--dry", action="store_true"); c.add_argument("--cap", type=int); c.add_argument("--batch", type=int, default=8)
+    s = sub.add_parser("state"); s.add_argument("--dry", action="store_true"); s.add_argument("--workspace")
+    w = sub.add_parser("weekly"); w.add_argument("--dry", action="store_true")
+    u = sub.add_parser("usage"); u.add_argument("--dry", action="store_true")
+    pr = sub.add_parser("propose"); pr.add_argument("--dry", action="store_true")
+    pr.add_argument("--cap", type=int, default=3); pr.add_argument("--window-days", type=int, default=7)
+    sub.add_parser("status"); sub.add_parser("health")
+    a = ap.parse_args()
+
+    if a.cmd == "status":
+        return cmd_status(a)
+    if a.cmd == "health":
+        return cmd_health(a)
+    if a.cmd == "nightly":
+        return cmd_nightly(a)
+
+    from pipelines import harvest, review, failures, consult, state as state_p, usage as usage_p
+    if a.cmd == "harvest":
+        harvest.run(limit=a.limit, only_ws=a.workspace, dry=a.dry)
+    elif a.cmd == "review":
+        review.run_daily(dry=a.dry, since=a.since)
+    elif a.cmd == "failures":
+        failures.run(dry=a.dry, since=a.since)
+    elif a.cmd == "consult":
+        consult.run(dry=a.dry, cap=a.cap, batch=a.batch)
+    elif a.cmd == "state":
+        state_p.run(dry=a.dry, only_ws=a.workspace)
+    elif a.cmd == "weekly":
+        review.run_weekly(dry=a.dry)
+    elif a.cmd == "usage":
+        usage_p.run(dry=a.dry)
+    elif a.cmd == "propose":
+        from pipelines import harness
+        harness.run(dry=a.dry, cap=a.cap, window_days=a.window_days)
+    return 1 if _red([a.cmd]) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

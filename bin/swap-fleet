@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# swap-fleet <account> [--dry] [--no-confined] [--only-confined <name>] — ORDERED, VERIFIED, resilient fleet account swap.
+#
+# the operator's required order (2026-07-04):
+#   Phase A  — every OTHER project workspace (not main) → target, each VERIFIED before moving on.
+#   Phase B  — main (this home-base session) → target. DETACHED, because swapping main tears down the
+#              very pane running this script; the detached child survives that bounce.
+#   Phase C  — every UP confined workspace → target, AFTER main is confirmed on the new account, each using
+#              its OWN pre-staged per-confined-workspace credential (~/.agents/confined-cfg/<c>/.credentials.<label>.json)
+#              — NEVER another fleet profile's live credential. VERIFIED.
+#
+# Resilience: B+C run in a `setsid` child so the whole sequence COMPLETES even though main bounces and
+# even if no agent is interactive — every step is driven from descriptors/credentials/tmux and verified by
+# process env / account identity, never by asking an agent. Progress → ~/.agents/accounts/swap-fleet.log.
+#
+# Verification (never trusts "up" alone):
+#   project ws → the live claude proc for that workspace's session runs under the target CLAUDE_CONFIG_DIR.
+#   confined workspace  ws → confined-cfg/<c>/.claude.json oauthAccount email == the target account's email (survives the
+#                access-token refresh that rewrites .credentials.json on every launch).
+#
+# Called by account-watch (which chooses WHEN + a probed-healthy target) and by hand.
+#   swap-fleet account-b            swap-fleet account-a --dry            --no-confined
+#   swap-fleet account-b --only-confined example-confined  # confined workspace-only credential move; fleet stays put
+set -uo pipefail
+# Ensure ~/.local/bin is on PATH — this script (and its --tail-only re-exec) runs from systemd-run --user
+# transient units + account-watch.service, whose PATH may omit it (the 2026-07-04 agentctl-not-found bug).
+export PATH="$HOME/.local/bin:$PATH"
+# A/ACCTS/AUSAGE env-overridable for tests (SWAP_TEST=1 sourcing, mirror of account-watch's WATCH_TEST)
+A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"; AGENTCTL="$HOME/.local/bin/agentctl"
+AUSAGE="${AUSAGE:-$A/bin/account-usage}"
+LOG="${LOG:-$ACCTS/swap-fleet.log}"
+ACCT="${1:?usage: swap-fleet <account> [--dry] [--no-confined] [--only-confined <name>]}"; shift || true
+DRY=0; NOCONFINED=0; OPTIN=0; TAILONLY=0; NUDGE=0; ONLYCONFINED=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry) DRY=1 ;;
+    --no-confined) NOCONFINED=1 ;;
+    --confined-optin) OPTIN=1 ;;
+    --tail-only) TAILONLY=1 ;;
+    --nudge) NUDGE=1 ;;
+    --only-confined)
+      shift
+      ONLYCONFINED="${1:?--only-confined requires a confined workspace name}"
+      ;;
+    *) echo "unknown swap-fleet option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+# SERIALIZATION (replaces the removed .hold fence, the operator 2026-07-10 "no more hold"): concurrent
+# swaps must never interleave. Phase A fails fast if another swap is live. The detached B+C tail
+# waits for Phase A's process to exit, then acquires the same lock before proceeding.
+exec 9>"$ACCTS/.swap.lock"
+if [ "$TAILONLY" = 1 ]; then
+  flock 9
+else
+  flock -n 9 || { echo "another swap-fleet is in progress (accounts/.swap.lock) — aborting"; exit 1; }
+fi
+log(){ echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
+
+# account label → credentialed named profile + login email (for verification)
+cfg_of(){ "$A/bin/account-profile" "$1"; }
+email_of(){ python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$(cfg_of "$1")/.claude.json" 2>/dev/null || true; }
+
+# --- per-model cap gate (incident 2026-07-12: example-confined, the sole Fable-5 workspace, was moved onto a
+# Fable-capped account — swap validated only 5h/7d — and stranded ~6h on "reached your Fable 5
+# limit"). A workspace whose descriptor MODEL diverges to Fable must NOT be moved onto an account
+# that cannot serve Fable: it is LEFT on its current account (not bounced), loudly, and reported.
+FABLE_BLOCK_PCT="${FABLE_BLOCK_PCT:-99}"
+LEFT_BEHIND_F="$ACCTS/.swap-leftbehind"    # ws names Phase A leaves behind; read+cleared by the tail
+RC_MOVED_F="$ACCTS/.swap-rcmoved"          # RC-enabled ws that MOVED accounts (orphaned-bridge reminder)
+fable_blocked(){ # <acct> → rc 0 when <acct> cannot serve Fable NOW: fresh .fable-cap marker OR the
+  # usage endpoint's per-model fable utilization >= FABLE_BLOCK_PCT. Endpoint errors → not blocked
+  # (fail open: the pre-existing behavior; the marker path still catches walls seen by real calls).
+  local f="$ACCTS/.fable-cap.$1" exp u
+  if [ -f "$f" ]; then
+    exp=$(head -1 "$f" 2>/dev/null | tr -cd '0-9')
+    [ -n "$exp" ] && [ "$(date +%s)" -lt "$exp" ] && return 0
+  fi
+  u=$("$AUSAGE" --json "$1" 2>/dev/null | python3 -c '
+import json,sys
+try:
+    r = json.loads(sys.stdin.readline() or "{}")
+    fb = r.get("fable") or {}
+    u = fb.get("utilization")
+    print("" if u is None else u)
+except Exception:
+    print("")')
+  [ -n "$u" ] && awk -v u="$u" -v p="$FABLE_BLOCK_PCT" 'BEGIN{exit !(u>=p)}'
+}
+ws_model(){ grep -oP '^MODEL="?\K[^"# ]+' "$A/projects/$1.env" 2>/dev/null | head -1; }
+ws_rc_on(){ [ "$(grep -oP '^REMOTE_CONTROL="?\K[^"# ]+' "$A/projects/$1.env" 2>/dev/null | head -1)" = on ]; }
+model_gate_skip(){ # <ws> → rc 0 = leave this workspace where it is (Fable-pinned + target Fable-blocked)
+  [ "$(ws_model "$1")" = "claude-fable-5" ] || return 1
+  [ "${TARGET_FABLE_BLOCKED:-0}" = 1 ]
+}
+
+# --- test gate: SWAP_TEST=1 sourcing stops here (helpers only, no roster/moves) -------------------
+if [ "${SWAP_TEST:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+TCFG="$(cfg_of "$ACCT")" || exit 1
+TEMAIL="$(email_of "$ACCT")"
+# One decision per PROCESS: is the TARGET Fable-blocked? (one usage GET; consumed by model_gate_skip.
+# The detached B+C tail re-execs this script and recomputes here — systemd-run does not carry env.)
+TARGET_FABLE_BLOCKED=0
+if fable_blocked "$ACCT"; then
+  TARGET_FABLE_BLOCKED=1
+  log "per-model gate: target $ACCT is FABLE-BLOCKED — Fable-pinned workspaces will be left in place"
+fi
+
+# --- roster: up project workspaces (main split out) + up confined workspaces ----------
+# Workspaces whose agent is not a LOCAL claude (AGENTS="claude-remote" etc.) are excluded: their auth
+# lives on the remote box, so an account swap is meaningless — bouncing them just kills the remote
+# agent mid-work (bug observed 2026-07-04: ws-remote needlessly bounced during failover).
+mapfile -t PROJ < <(agentctl status --json 2>/dev/null | python3 -c "import json,sys;[print(w['name']) for w in json.load(sys.stdin) if w['status']=='up' and w['kind']=='project']")
+mapfile -t CONFINED_WS < <(agentctl status --json 2>/dev/null | python3 -c "import json,sys;[print(w['name']) for w in json.load(sys.stdin) if w['status']=='up' and w['kind']=='confined']")
+others=(); skipped=(); has_main=0
+for w in "${PROJ[@]}"; do
+  ag=$(grep -oP '^AGENTS="?\K[^"]+' "$A/projects/$w.env" 2>/dev/null | head -1)
+  if [ -n "$ag" ] && [ "$ag" != claude ]; then skipped+=("$w($ag)"); continue; fi
+  [ "$w" = main ] && has_main=1 || others+=("$w")
+done
+[ -n "$ONLYCONFINED" ] && [ "$NOCONFINED" = 1 ] && { echo "--only-confined cannot be combined with --no-confined" >&2; exit 2; }
+[ "$NOCONFINED" = 1 ] && CONFINED_WS=()
+# A confined workspace-only route is deliberately narrow: it must never rewrite fleet-active, bounce a
+# project, or send fleet-resume prompts.  It exists for pinned confined workspace accounts such as EXAMPLE-CONFINED.
+if [ -n "$ONLYCONFINED" ]; then
+  _keep=()
+  for _c in "${CONFINED_WS[@]}"; do [ "$_c" = "$ONLYCONFINED" ] && _keep+=("$_c"); done
+  [ "${#_keep[@]}" -gt 0 ] || { echo "confined workspace '$ONLYCONFINED' is not currently up" >&2; exit 2; }
+  CONFINED_WS=("${_keep[@]}")
+  others=(); has_main=0
+fi
+# --confined-optin (proactive rotation): keep only confined workspaces that opted in via confined-cfg/<c>/.rotate
+# (the operator 2026-07-10: example-confined follows rotation). Hard-cap failovers still swap ALL stash-bearing confined workspaces.
+if [ "$OPTIN" = 1 ] && [ -z "$ONLYCONFINED" ]; then
+  _keep=()
+  for _c in "${CONFINED_WS[@]}"; do [ -f "$A/confined-cfg/$_c/.rotate" ] && _keep+=("$_c"); done
+  CONFINED_WS=("${_keep[@]}")
+fi
+# A confined workspace can be permanently pinned to one account.  Honor that pin on every fleet failover,
+# including hard-cap moves, so a confined workspace never silently crosses a separately-owned account boundary.
+if [ -z "$ONLYCONFINED" ]; then
+  _keep=()
+  for _c in "${CONFINED_WS[@]}"; do
+    _pin=$(cat "$A/confined-cfg/$_c/.pinned-account" 2>/dev/null || true)
+    if [ -n "$_pin" ] && [ "$_pin" != "$ACCT" ]; then
+      echo "  pinned confined workspace: $_c stays on $_pin"
+      continue
+    fi
+    _keep+=("$_c")
+  done
+  CONFINED_WS=("${_keep[@]}")
+fi
+
+echo "swap-fleet → $ACCT  (email: ${TEMAIL:-?})"
+echo "  A. others  : ${others[*]:-(none)}"
+echo "  B. self    : $([ "$has_main" = 1 ] && echo 'main (detached; this pane drops & resumes under '"$ACCT"')' || echo '(main not up)')"
+echo "  C. confined workspaces : ${CONFINED_WS[*]:-(none)}"
+[ "${#skipped[@]}" -gt 0 ] && echo "  skipped    : ${skipped[*]} (remote/own-auth — account swap doesn't apply)"
+if [ "$DRY" = 1 ]; then echo "(dry run — nothing changed)"; exit 0; fi
+
+# --- verify helpers -------------------------------------------------------
+verify_ws(){ # <ws> → 0 if the live claude proc for this workspace runs under $TCFG.
+  local ws="$1" sid pid cd want arg0; want="$(readlink -f "$TCFG")"
+  sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$A/projects/$ws.env" | head -1)
+  [ -n "$sid" ] || return 1
+  for _ in $(seq 1 10); do
+    for pid in $(pgrep -f -- "$sid" 2>/dev/null); do
+      arg0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
+      case "$(basename "$arg0")" in claude|claude-bin) ;; *) continue;; esac
+      cd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -1)
+      [ -n "$cd" ] || continue
+      cd="$(readlink -f "$cd")"
+      [ "$cd" = "$want" ] && return 0
+    done
+    sleep 2
+  done
+  return 1
+}
+verify_confined(){ # <confined workspace> → 0 if its .claude.json login email == target account email
+  local c="$1" e
+  for _ in $(seq 1 30); do   # bwrap confined workspace boot + first .claude.json write can exceed 20s (13:30 swap)
+    e=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$A/confined-cfg/$c/.claude.json" 2>/dev/null)
+    [ -n "$TEMAIL" ] && [ "$e" = "$TEMAIL" ] && return 0
+    sleep 2
+  done
+  log "C: verify_confined $c: observed email '$e' != target '$TEMAIL' after 60s (email is stale metadata until an interactive login — diagnostic, see runbook)"
+  return 1
+}
+
+# --- Phase A: others (inline, verified) — skipped when we ARE the tail unit -
+if [ "$TAILONLY" = 0 ] && [ -z "$ONLYCONFINED" ]; then
+  # Commit the intended account up-front so account-watch + bashrc claude() reflect it immediately,
+  # and the watchdog's own probe sees the target we're moving to (not the account we're leaving).
+  echo "$ACCT" > "$ACCTS/.active"
+  log "=== swap-fleet → $ACCT START (others=${#others[@]} confined workspaces=${#CONFINED_WS[@]} main=$has_main) ==="
+  a_ok=0; a_moved=0; a_fail=()
+  rm -f "$LEFT_BEHIND_F" "$RC_MOVED_F"   # fresh swap → fresh cross-phase notes (read by the tail)
+  for w in "${others[@]}"; do
+    # per-model gate: a Fable-pinned workspace never boards a Fable-blocked account — leave it
+    # UNTOUCHED (not even bounced) on its current account; the tail reports the exception to main.
+    if model_gate_skip "$w"; then
+      log "A: ⊘ $w is Fable-pinned and $ACCT is Fable-blocked — LEFT on current account (per-model gate)"
+      echo "$w" >> "$LEFT_BEHIND_F"; a_ok=$((a_ok+1)); continue
+    fi
+    log "A: swapping $w → $ACCT"
+    aout=$("$A/bin/swap-account" "$w" "$ACCT" 2>&1); rc=$?; printf '%s\n' "$aout" >>"$LOG"
+    if [ "$rc" = 0 ] && verify_ws "$w"; then
+      if printf '%s' "$aout" | grep -q "already on"; then
+        log "A: = $w already on $ACCT (verified)"
+      else
+        log "A: ✓ $w verified on $ACCT"; a_moved=$((a_moved+1))
+        ws_rc_on "$w" && echo "$w" >> "$RC_MOVED_F"   # RC bridge on the OLD account is now orphaned
+      fi
+      a_ok=$((a_ok+1))
+    else
+      log "A: ⚠ $w NOT verified on $ACCT (continuing)"; a_fail+=("$w")
+    fi
+  done
+  log "A: done — $a_ok/${#others[@]} verified ($a_moved moved)${a_fail:+; unverified: ${a_fail[*]}}"
+fi
+
+# --- Phase B + C: run detached so they survive main's self-bounce ---------
+run_tail(){
+  local changed="$NUDGE" main_moved=0   # Phase A passes --nudge when it actually moved workspaces
+  # B: main last
+  if [ "$has_main" = 1 ] && model_gate_skip main; then
+    log "B: ⊘ main is Fable-pinned and $ACCT is Fable-blocked — LEFT on current account (per-model gate)"
+    echo "main" >> "$LEFT_BEHIND_F"
+  elif [ "$has_main" = 1 ]; then
+    log "B: swapping main → $ACCT (detached)"
+    local bout brc; bout=$("$A/bin/swap-account" main "$ACCT" 2>&1); brc=$?; printf '%s\n' "$bout" >>"$LOG"
+    if [ "$brc" = 0 ] && verify_ws main; then
+      if printf '%s' "$bout" | grep -q "already on"; then log "B: = main already on $ACCT (verified)"
+      else
+        changed=1; main_moved=1; log "B: ✓ main verified on $ACCT"
+        ws_rc_on main && echo "main" >> "$RC_MOVED_F"
+      fi
+    else
+      log "B: ⚠ main NOT verified on $ACCT"
+    fi
+  fi
+  # C: confined workspaces, each with their own per-account credential (never a fleet profile's live one).
+  #    confined-cfg/<c>/.account records which label the confined workspace is on (written here on every swap).
+  #    Already on target (marker + email verified) → SKIP, no bounce (don't interrupt confined-workspace work).
+  #    Before switching away, refresh the DEPARTING label's stash from the live credential — the live
+  #    file holds the freshest refreshToken rotation (stale stashes are how restores go bad).
+  for c in "${CONFINED_WS[@]}"; do
+    local ccfg="$A/confined-cfg/$c" cred cur
+    cred="$ccfg/.credentials.$ACCT.json"
+    cur=$(cat "$ccfg/.account" 2>/dev/null || true)
+    if [ "$cur" = "$ACCT" ] && verify_confined "$c"; then log "C: = $c already on $ACCT (verified) — skipping"; continue; fi
+    # per-model gate BEFORE any stop: a Fable-pinned confined workspace (example-confined) must never board a Fable-blocked
+    # account — the exact 2026-07-12 stranding ("reached your Fable 5 limit" for ~6h). Left running.
+    if model_gate_skip "$c"; then
+      log "C: ⊘ $c is Fable-pinned and $ACCT is Fable-blocked — LEFT on current account (per-model gate)"
+      echo "$c" >> "$LEFT_BEHIND_F"; continue
+    fi
+    if [ ! -f "$cred" ]; then log "C: ⚠ $c has no pre-staged credential for '$ACCT' ($(basename "$cred")) — LEFT on current account"; continue; fi
+    # GUARD (2026-07-10 example-confined misfire): a stash without a real refreshToken is a DUD — deploying it
+    # gives the confined workspace a credential the CLI zeroes on first refresh (dead confined workspace, zeroed live file).
+    # A 60h-stale stash caused exactly that; empty duds then propagated via the departing-refresh.
+    if ! grep -q '"refreshToken":"sk-' "$cred"; then
+      log "C: ⚠ $c stash for '$ACCT' has NO refresh token (dud/empty) — LEFT on current account; re-stash needed"; continue
+    fi
+    log "C: swapping confined workspace $c → $ACCT"
+    "$AGENTCTL" stop "$c" >>"$LOG" 2>&1 || true; sleep 1   # transient (not retire) — confined workspace relaunches in place
+    if [ -n "$cur" ] && [ "$cur" != "$ACCT" ]; then
+      # GUARD: never refresh a stash from an EMPTY live file (CLI zeroes live on failed refresh —
+      # copying that over a good stash is how the account-c dud was minted at 13:32 on 2026-07-10)
+      if grep -q '"refreshToken":"sk-' "$ccfg/.credentials.json"; then
+        cp -f "$ccfg/.credentials.json" "$ccfg/.credentials.$cur.json" && chmod 600 "$ccfg/.credentials.$cur.json" \
+          && log "C: refreshed $c stash .credentials.$cur.json from live (latest rotation)"
+      else
+        log "C: ⚠ $c live credential is EMPTY/zeroed — NOT refreshing stash .credentials.$cur.json (kept prior good copy)"
+      fi
+    else
+      cp -a "$ccfg/.credentials.json" "$ccfg/backups/.credentials.prev-$(date -u +%Y%m%dT%H%M%SZ).bak" 2>/dev/null || true
+    fi
+    cp -f "$cred" "$ccfg/.credentials.json"; chmod 600 "$ccfg/.credentials.json"
+    "$AGENTCTL" up "$c" >>"$LOG" 2>&1 || true
+    # The copied named cache is the credential source of truth. Claude may retain the prior
+    # oauthAccount.emailAddress in .claude.json until a future interactive /login, so that display
+    # field cannot decide whether this cache switch happened. Record the selected cache label now;
+    # retain the email check as useful diagnostics only.
+    printf '%s\n' "$ACCT" > "$ccfg/.account"
+    changed=1
+    ws_rc_on "$c" && echo "$c" >> "$RC_MOVED_F"   # RC bridge on the OLD account is now orphaned
+    if verify_confined "$c"; then
+      log "C: ✓ $c verified on $ACCT ($TEMAIL)"
+    else
+      log "C: ~ $c credential staged on $ACCT; login metadata remains stale (diagnostic only)"
+    fi
+  done
+  # nudge AUTOCONTINUE project workspaces — only if something actually moved (a no-op sweep must not
+  # inject "you were moved" prompts into agents that never bounced)
+  if [ "${changed:-0}" = 1 ] && [ -n "$ONLYCONFINED" ]; then
+    log "confined workspace-only: $ONLYCONFINED switched; project fleet and prompts left untouched"
+  elif [ "${changed:-0}" = 1 ]; then
+    sleep 20
+    # HOLD-AWARE nudges (incident 2026-07-13): resume nudges fired DURING a fleet-wide hold told
+    # agents to "keep going"; tempo rules obliged and main had to re-broadcast the hold. Under an
+    # active fleet-hold the nudge still explains the move (agents must know why they bounced) but
+    # says STAY IDLE. Queued messages still flush — delivery-of-record is not gated by tempo.
+    local hold_active=0 hold_line=""
+    if "$A/bin/fleet-hold" --active 2>/dev/null; then
+      hold_active=1; hold_line=$("$A/bin/fleet-hold" status 2>/dev/null || echo "HOLD ACTIVE")
+      log "fleet-hold active — post-swap nudges will say STAY IDLE ($hold_line)"
+    fi
+    for f in "$A"/projects/*.env; do
+      grep -qE '^AUTOCONTINUE="?yes' "$f" || continue; local ws; ws=$(basename "$f" .env)
+      if [ "$hold_active" = 1 ]; then
+        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT. A FLEET HOLD is ACTIVE ($hold_line) — do NOT resume work; checkpoint if needed and stay idle until the hold is lifted." >>"$LOG" 2>&1 && log "nudged $ws (hold-aware: stay idle)"
+      else
+        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT. Your work is checkpointed on disk — continue exactly where you left off from your on-disk notes/checkpoints. Keep going." >>"$LOG" 2>&1 && log "nudged $ws"
+      fi
+      # redeliver any inter-agent messages that were queued while this agent was bounced — they get
+      # SUBMITTED into its conversation now (active redelivery; not a poll). See docs/MESSAGING.md.
+      "$AGENTCTL" flush "$ws" >>"$LOG" 2>&1 || true
+    done
+    # main ALWAYS gets a resume nudge when it was bounced: a --resume'd session sits idle at the prompt
+    # until spoken to, so without this the fleet-operator conversation stalls after every swap
+    # (the operator observed exactly this, 2026-07-09). Tailored text — main resumes its own interrupted turn.
+    if [ "${main_moved:-0}" = 1 ]; then
+      if [ "$hold_active" = 1 ]; then
+        "$AGENTCTL" send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. A FLEET HOLD is ACTIVE ($hold_line) — verify the swap completed cleanly (swap-fleet.log), then stay idle; do not resume fleet work or re-nudge agents until the hold lifts." >>"$LOG" 2>&1 && log "nudged main (hold-aware resume-after-bounce)"
+      else
+        "$AGENTCTL" send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. Resume autonomously: re-read your own last message, verify this swap completed cleanly (swap-fleet.log phases + fleet/model state), then continue executing whatever you were doing. Do not wait for the operator." >>"$LOG" 2>&1 && log "nudged main (resume-after-bounce)"
+      fi
+      "$AGENTCTL" flush main >>"$LOG" 2>&1 || true
+    fi
+  else
+    log "no workspace actually moved — skipping nudges"
+  fi
+  # --- exception report: per-model-gate leftovers + orphaned RC bridges (cross-phase notes) -------
+  # LEFT_BEHIND: Fable-pinned workspaces that stayed on their old account because the target cannot
+  # serve Fable — visible state divergence a human should know about (fleet split until Fable resets).
+  if [ -s "$LEFT_BEHIND_F" ]; then
+    lb=$(tr '\n' ' ' < "$LEFT_BEHIND_F")
+    log "per-model gate summary: left behind on their previous account: $lb"
+    "$AGENTCTL" send main "[swap-fleet] PER-MODEL GATE: fleet moved to $ACCT but these Fable-pinned workspaces were LEFT on their previous account because $ACCT is Fable-capped: $lb— they keep working there; they rejoin on a future swap once $ACCT can serve Fable. No action required unless you want them moved by hand." >>"$LOG" 2>&1 || true
+  fi
+  rm -f "$LEFT_BEHIND_F"
+  # RC ORPHANS (the operator hard rule 2026-07-13: ONE RC session per workspace; stop-then-up is enforced by
+  # swap-account/agentctl ordering): bridges are registered server-side per account+device and there
+  # is NO CLI deregistration, so every account move of an RC-enabled workspace leaves a stale entry
+  # in the Claude app under the OLD account. Surface it — silent orphans read as broken agents.
+  if [ -s "$RC_MOVED_F" ]; then
+    rcws=$(tr '\n' ' ' < "$RC_MOVED_F")
+    log "RC bridges: moved RC-enabled workspaces: $rcws— old-account app entries are now ORPHANED (manual removal in the Claude app)"
+    "$AGENTCTL" send main "[swap-fleet] RC BRIDGE REMINDER: these Remote-Control workspaces moved accounts: $rcws— each leaves an orphaned session entry in the Claude app under the OLD account (server-side registration, no CLI dereg). When convenient, remove the stale entries in the app so every workspace shows exactly ONE live RC session." >>"$LOG" 2>&1 || true
+  fi
+  rm -f "$RC_MOVED_F"
+  log "=== swap-fleet → $ACCT COMPLETE ==="
+}
+
+# If we ARE the detached tail unit, just run B+C and exit (roster recomputed above: main still up on the
+# old account, confined workspaces still up). This runs in its OWN cgroup so it survives the caller (pane or service).
+if [ "$TAILONLY" = 1 ]; then run_tail; exit 0; fi
+
+if [ "$has_main" = 1 ] || [ "${#CONFINED_WS[@]}" -gt 0 ]; then
+  # Detach B+C so they survive main tearing down the caller's pane AND survive account-watch.service's
+  # cgroup being reaped (setsid does NOT escape a systemd cgroup — that was the 2026-07-04 stall). Prefer a
+  # transient systemd --user unit (own cgroup); fall back to a setsid re-exec if systemd-run is unavailable.
+  tailargs=("$ACCT" --tail-only); [ "$NOCONFINED" = 1 ] && tailargs+=(--no-confined); [ "$OPTIN" = 1 ] && tailargs+=(--confined-optin); [ -n "$ONLYCONFINED" ] && tailargs+=(--only-confined "$ONLYCONFINED")
+  [ "${a_moved:-0}" -gt 0 ] && tailargs+=(--nudge)
+  if command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --collect --quiet --unit="swapfleet-tail-$(date -u +%s)" -- bash "$0" "${tailargs[@]}"; then
+    echo "  → phases B+C running as transient systemd unit (log: $LOG)"
+  else
+    # note: no >>$LOG here — log() already appends; a second redirect double-writes every line
+    log "systemd-run unavailable/failed — falling back to setsid re-exec for B+C"
+    setsid bash "$0" "${tailargs[@]}" >/dev/null 2>&1 </dev/null &
+    echo "  → phases B+C running detached via setsid (log: $LOG)"
+  fi
+else
+  log "no main / no confined workspaces up — A-only swap complete"
+fi
+echo "✓ fleet swap to $ACCT initiated (order: others → main → confined workspaces)"

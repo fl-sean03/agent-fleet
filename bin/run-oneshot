@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# run-oneshot <prompt|@file> [--model M] — deploy a fresh, headless, one-shot fleet Claude agent (a NEW
+# session id each call, NOT any live workspace session). The unconfined analogue of run-confined-oneshot:
+# no bwrap wall. Runs `claude -p`, prints the final reply on stdout, exits.
+# Uses the CURRENTLY-ACTIVE account's config. Used by the brain engine (formerly memory-harvest) and any batch host job.
+set -uo pipefail
+MODEL="opus"; PROMPT=""; SKIP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model) MODEL="${2:?}"; shift 2;;
+    --allow-tools) SKIP="--dangerously-skip-permissions"; shift;;
+    *) PROMPT="$1"; shift;;
+  esac
+done
+[ "${PROMPT:0:1}" = "@" ] && { f="${PROMPT:1}"; [ -f "$f" ] || { echo "no file $f" >&2; exit 2; }; PROMPT="$(cat "$f")"; }
+[ -n "$PROMPT" ] || { echo "usage: run-oneshot <prompt|@file> [--model M] [--allow-tools]" >&2; exit 2; }
+
+CFG="$("$HOME/.agents/bin/account-profile" --active)" || exit 1
+
+# never inherit a parent Claude session's nesting env (would break the child's persistence).
+# prompt via STDIN so large prompts (@file) don't hit ARG_MAX/E2BIG.
+printf '%s' "$PROMPT" | env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDE_CODE_ENTRYPOINT -u CLAUDE_CODE_EXECPATH \
+  CLAUDE_CONFIG_DIR="$CFG" \
+  claude -p --model "$MODEL" --session-id "$(cat /proc/sys/kernel/random/uuid)" $SKIP

@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# fleet-hold — a WORK-TEMPO hold for the fleet's agents. NOT the removed rotation hold.
+#
+# WHAT IT GATES (and the only things it gates):
+#   - swap-fleet's post-swap resume nudges: under a hold they say "stay idle" instead of "keep going"
+#     (incident 2026-07-13: nudges told agents to resume DURING a fleet-wide HOLD; several tempo
+#     rules auto-resumed and main had to re-broadcast the hold).
+#   - agent tempo rules: AGENTS.md instructs agents to consult `fleet-hold status` before
+#     auto-resuming work on session start.
+# WHAT IT DOES NOT GATE — deliberately (the operator 2026-07-10 "no more hold": a freeze file silently
+# disarmed rotation twice; the mechanism was REMOVED): account-watch ticks, failover, swaps,
+# credential moves all run normally under a hold. Rotation is ALWAYS on. To quiet the watchdog for
+# maintenance use `watch-freeze <duration>` (visible unit stop + guaranteed scheduled restart).
+#
+# Marker: ~/.agents/.fleet-hold  line1 = until-epoch (0 = until lifted), line2 = reason.
+# An expired marker is removed on ANY read — a hold can never silently outlive its window.
+#
+#   fleet-hold on --for 6h [reason...]     hold for a duration
+#   fleet-hold on --until "2026-07-13 09:00" [reason...]
+#   fleet-hold on [reason...]              indefinite (until `fleet-hold off`)
+#   fleet-hold off                         lift now
+#   fleet-hold status                      human line; rc 0 = hold active, 1 = not
+#   fleet-hold --active                    quiet rc-only check (for scripts: swap-fleet, tempo rules)
+set -uo pipefail
+A="${A:-$HOME/.agents}"
+F="${FLEET_HOLD_F:-$A/.fleet-hold}"
+
+now(){ date -u +%s; }
+
+# read marker → globals UNTIL/REASON; expired marker removed. rc 0 = active.
+read_marker(){
+  [ -f "$F" ] || return 1
+  UNTIL=$(sed -n 1p "$F" 2>/dev/null | tr -cd '0-9'); REASON=$(sed -n 2p "$F" 2>/dev/null)
+  [ -n "$UNTIL" ] || UNTIL=0
+  if [ "$UNTIL" != 0 ] && [ "$(now)" -ge "$UNTIL" ]; then rm -f "$F"; return 1; fi
+  return 0
+}
+
+dur_to_secs(){ # 45m / 6h / 2d → seconds; rc 1 on garbage
+  local d="$1" n unit
+  n="${d%[smhd]}"; unit="${d##*[0-9]}"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  case "$unit" in
+    s) echo "$n" ;; m) echo $((n*60)) ;; h) echo $((n*3600)) ;; d) echo $((n*86400)) ;;
+    *) return 1 ;;
+  esac
+}
+
+case "${1:-status}" in
+  on)
+    shift; until_epoch=0; reason=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --for)   shift; s=$(dur_to_secs "${1:?--for needs a duration like 45m/6h/2d}") || { echo "bad duration: $1" >&2; exit 2; }
+                 until_epoch=$(( $(now) + s )) ;;
+        --until) shift; until_epoch=$(date -u -d "${1:?--until needs a date}" +%s 2>/dev/null) || { echo "bad date: $1" >&2; exit 2; } ;;
+        *) reason="${reason:+$reason }$1" ;;
+      esac; shift
+    done
+    mkdir -p "$(dirname "$F")"
+    printf '%s\n%s\n' "$until_epoch" "${reason:-manual hold}" > "$F"
+    if [ "$until_epoch" = 0 ]; then
+      echo "✓ fleet hold ON (until lifted) — ${reason:-manual hold}"
+    else
+      echo "✓ fleet hold ON until $(date -u -d @"$until_epoch" +%FT%TZ) — ${reason:-manual hold}"
+    fi
+    echo "  gates: swap nudges say stay-idle; tempo rules pause. Rotation/failover UNAFFECTED." ;;
+  off)
+    if [ -f "$F" ]; then rm -f "$F"; echo "✓ fleet hold LIFTED"; else echo "no hold was active"; fi ;;
+  --active)
+    read_marker ;;   # quiet: rc only
+  status)
+    if read_marker; then
+      if [ "$UNTIL" = 0 ]; then echo "HOLD ACTIVE (until lifted) — ${REASON:-?}"
+      else echo "HOLD ACTIVE until $(date -u -d @"$UNTIL" +%FT%TZ) — ${REASON:-?}"; fi
+      exit 0
+    fi
+    echo "no fleet hold"; exit 1 ;;
+  *) echo "usage: fleet-hold on [--for 6h|--until DATE] [reason] | off | status | --active" >&2; exit 2 ;;
+esac

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# swap-account <workspace> <account> — move a tmux workspace to a different Claude account WITHOUT
+# losing its conversation. Profiles share one physical session store through their `projects/` symlinks,
+# so an account change carries credentials, not a copied transcript.
+#
+# Order matters and is the fix for the divergent-copy ("two sessions") bug:
+#   1. STOP the workspace first  → its session jsonl is flushed and no writer is left running.
+#   2. Carry the canonical session SRC→DST, OVERWRITING any older copy in the destination (cp, never
+#      cp -n) so the workspace always resumes the LATEST conversation — but back the destination copy up
+#      first so nothing is ever destroyed, and shout if the dest copy was somehow longer (divergence).
+#   3. Point the descriptor at the new account, then bring it back up.
+#
+#   swap-account ws-gamma account-b
+set -euo pipefail
+# Resolve tools by absolute path — this script runs from systemd-run --user transient units whose PATH
+# does NOT include ~/.local/bin (the 2026-07-04 "agentctl: command not found" failure that stranded main).
+AGENTCTL="$HOME/.local/bin/agentctl"; [ -x "$AGENTCTL" ] || AGENTCTL="$(command -v agentctl || echo agentctl)"
+export PATH="$HOME/.local/bin:$PATH"
+WS="${1:?usage: swap-account <workspace> <account>}"
+ACCT="${2:?usage: swap-account <workspace> <account>}"
+DESC="$HOME/.agents/projects/$WS.env"; [ -f "$DESC" ] || { echo "no workspace '$WS'"; exit 1; }
+ROOT=$(grep -oP 'ROOT="?\K[^"]+' "$DESC" | head -1); ROOT="${ROOT/\$HOME/$HOME}"; ROOT="${ROOT/#\~/$HOME}"
+enc=$(printf '%s' "$ROOT" | sed 's#[^a-zA-Z0-9]#-#g')
+
+cur=$(grep -oP 'ACCOUNT="?\K[^"]+' "$DESC" | head -1 || true)
+[ -n "$cur" ] || cur=$(cat "$HOME/.agents/accounts/.active" 2>/dev/null || true)
+[ -n "$cur" ] || { echo "workspace '$WS' has no ACCOUNT and fleet-active is unset" >&2; exit 1; }
+srcbase="$("$HOME/.agents/bin/account-profile" "$cur")" || exit 1
+destbase="$("$HOME/.agents/bin/account-profile" "$ACCT")" || exit 1
+[ "$srcbase" = "$destbase" ] && { echo "✓ $WS already on $ACCT — nothing to do"; exit 0; }
+
+# 1. STOP FIRST — flush the source session and guarantee no writer survives (transient stop, NOT retire:
+# a swap must not archive the descriptor — it relaunches in place under the new account)
+"$AGENTCTL" stop "$WS" >/dev/null 2>&1 || true; sleep 1
+
+# 2. carry the conversation across — UNLESS the two accounts share one underlying session store (the
+#    profiles symlink projects/ → ~/.claude/projects). In the shared-store world the session already
+#    lives in exactly one place, so a switch is just a credential change — nothing to copy or diverge.
+if [ "$(readlink -f "$srcbase/projects" 2>/dev/null)" = "$(readlink -f "$destbase/projects" 2>/dev/null)" ]; then
+  echo "→ shared session store — no copy needed (session continues in place)"
+else
+  # non-shared (e.g. a profile not symlinked): carry the canonical session, overwriting any stale copy
+  # in the destination after backing it up (never cp -n, never keep a stale fork).
+  sid=$(~/.agents/bin/resolve-session "$ROOT" "$srcbase/projects" 2>/dev/null || true)
+  src="$srcbase/projects/$enc/$sid.jsonl"; dst="$destbase/projects/$enc/$sid.jsonl"
+  if [ -n "$sid" ] && [ -f "$src" ]; then
+    mkdir -p "$destbase/projects/$enc"
+    if [ -f "$dst" ]; then
+      sl=$(wc -l <"$src"); dl=$(wc -l <"$dst")
+      cp -p "$dst" "$dst.stale-$(stat -c %Y "$dst")" 2>/dev/null || true
+      [ "$dl" -gt "$sl" ] 2>/dev/null && echo "⚠ destination copy was LONGER ($dl>$sl L) — backed up; carrying source (last-run wins)"
+    fi
+    cp -f "$src" "$dst" && echo "→ carried session ${sid:0:8} ($(wc -l <"$src")L) → $ACCT (backup kept)"
+  else echo "→ no prior session to migrate (fresh under $ACCT)"; fi
+fi
+
+# 3. point the descriptor at the new account — descriptors ALWAYS carry ACCOUNT= now
+# (no-line means fleet-active at launch)
+sed -i '/^ACCOUNT=/d' "$DESC"
+printf 'ACCOUNT="%s"\n' "$ACCT" >> "$DESC"
+
+# 4. bring it back up on the new account
+"$AGENTCTL" up "$WS"
+echo "✓ $WS now on account: $ACCT"

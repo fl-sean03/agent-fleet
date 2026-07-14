@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# run-claude-confined — launch Claude inside a bubblewrap namespace that can see ONLY the confined workspace
+# workspace ($PWD) + that confined workspace's isolated config. Everything else on the host (your home, other
+# confined workspaces, ~/.claude.json, /etc/passwd) is NOT MOUNTED → genuinely unreadable, not just denied.
+# Because the namespace IS the wall, --dangerously-skip-permissions is safe here.
+set -euo pipefail
+# CRITICAL persistence fix: when this launcher is invoked from WITHIN another Claude Code session (e.g. an
+# agent running agentctl), the spawned claude inherits CLAUDE_CODE_CHILD_SESSION=1 + CLAUDE_CODE_SESSION_ID,
+# which makes Claude Code treat it as a NESTED child session and NOT persist its transcript to disk (the
+# example-confined history-loss root cause, 2026-06). Clear them so this is a clean, top-level, persisting session.
+unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH 2>/dev/null || true
+WORK="$PWD"
+WS="$(basename "$WORK")"
+CFG="$HOME/.agents/confined-cfg/$WS"
+CLBIN="$(readlink -f "$HOME/.local/bin/claude")"
+
+[ -x "$(command -v bwrap)" ] || { echo "bwrap not installed — refusing to run unconfined for a confined workspace."; exec bash; }
+[ -n "$CLBIN" ] && [ -e "$CLBIN" ] || { echo "claude binary not found"; exec bash; }
+# (re)build the isolated config (stripped .claude.json + trust) if missing — NO credential copy
+[ -f "$CFG/.claude.json" ] || "$HOME/.agents/bin/confined-cfg-sync" "$WS" || true
+
+# AUTH — two independent modes, both isolated from the host login (precedence: interactive login wins):
+#   1. interactive /login  → real account session in /config/.credentials.json → Opus/Max + Remote Control
+#   2. setup-token         → a dedicated CLAUDE_CODE_OAUTH_TOKEN (agentctl login) → "Claude API" mode,
+#                            Sonnet only, NO Remote Control. Headless; no /login step needed.
+AUTH_ENV=()
+if [ -f "$CFG/.credentials.json" ]; then
+  :   # interactive login present → use it (don't inject a token; let it self-refresh)
+elif [ -s "$CFG/oauth-token" ]; then
+  AUTH_ENV=(--setenv CLAUDE_CODE_OAUTH_TOKEN "$(tr -d '[:space:]' < "$CFG/oauth-token")")
+  echo "→ auth: setup-token (headless; 'Claude API' mode — Sonnet, no Remote Control)"
+else
+  echo "ℹ '$WS' has no auth yet → do /login once inside (Opus/Max + RC), or: agentctl login <name>"
+fi
+
+# RC flags arrive via env from agentctl (REMOTE_CONTROL / RC_NAME / RESUME / SESSION_ID)
+CL_ARGS=(--dangerously-skip-permissions)
+# SESSION_ID (preferred, same mechanism as run-claude since 2026-07-04): the descriptor pins a FIXED
+# session UUID — resume it if it exists in the confined workspace's ISOLATED store, else create it with that exact
+# id. Store path: $CFG/projects/-work/<id>.jsonl (cwd inside the sandbox is always /work → enc "-work").
+# One deterministic conversation per confined workspace, across restarts/reboots. RESUME= is the legacy fallback.
+if [ -n "${SESSION_ID:-}" ]; then
+  if [ -f "$CFG/projects/-work/$SESSION_ID.jsonl" ]; then
+    CL_ARGS+=(--resume "$SESSION_ID"); echo "→ resuming session ${SESSION_ID:0:8} (fixed id, isolated store)"
+  else
+    CL_ARGS+=(--session-id "$SESSION_ID"); echo "→ creating session ${SESSION_ID:0:8} (first run, fixed id)"
+  fi
+elif [ -n "${RESUME:-}" ]; then
+  if [ "$RESUME" = "continue" ]; then CL_ARGS+=(--continue); else CL_ARGS+=(--resume "$RESUME"); fi
+  echo "→ resuming session: $RESUME (legacy RESUME= pin — migrate to SESSION_ID)"
+fi
+# MODEL: descriptor pin, same durability rationale as run-claude — a per-process /model reverts on any
+# bounce, so the descriptor is the source of truth. Unset (most legacy confined workspaces) → account default.
+[ -n "${MODEL:-}" ] && { CL_ARGS+=(--model "$MODEL"); echo "→ model: $MODEL (descriptor pin)"; }
+RC_ENV=()
+if [ "${REMOTE_CONTROL:-}" = "on" ]; then
+  RCNAME="${RC_NAME:-$WS}"
+  CL_ARGS+=(--remote-control "$RCNAME")
+  # also set the session-name PREFIX env — this is what actually drives the displayed name
+  # (default is the hostname); --setenv it into the sandbox
+  RC_ENV=(--setenv CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX "$RCNAME")
+  echo "→ Remote Control: ON (mobile session '$RCNAME')"
+fi
+
+echo "→ confined claude  (sees only: $WORK  + isolated config; host filesystem walled off)"
+bwrap \
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind /etc/hosts /etc/hosts --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+  --ro-bind-try /etc/ca-certificates.conf /etc/ca-certificates.conf \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind "$CLBIN" /opt/claude-bin \
+  --bind "$WORK" /work --bind "$CFG" /config \
+  --setenv HOME /config --setenv CLAUDE_CONFIG_DIR /config \
+  "${RC_ENV[@]}" "${AUTH_ENV[@]}" \
+  --setenv CLAUDE_CODE_RESUME_TOKEN_THRESHOLD 1000000000 \
+  --setenv CLAUDE_CODE_RESUME_THRESHOLD_MINUTES 52560000 \
+  --setenv TERM "${TERM:-xterm-256color}" --setenv LANG "${LANG:-C.UTF-8}" \
+  --chdir /work --unshare-all --share-net --die-with-parent \
+  /opt/claude-bin "${CL_ARGS[@]}" || true
+echo; echo "[confined claude exited — this pane is now a HOST shell. 'cd $WORK' + 'run-claude-confined' to restart]"
+exec bash

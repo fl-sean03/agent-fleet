@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""fleet-msg — inter-agent messaging: DIRECT delivery into the recipient's conversation + a durable,
+provenance-linked audit trail.
+
+DELIVERY (the operator, 2026-07-11 rebuild): a message from agent A to agent B is submitted straight into B's
+Claude session as a real turn — the way a user prompt is — so B actually processes and acts on it. No
+side-channel inbox to poll (that failed: messages sat unread/invisible; `ws-epsilon` idled on an unread
+kickoff, and the operator never saw replies that only reached his inbox). Delivery = paste into B's claude
+pane + Enter. If B is down, the message is queued and flushed into B's conversation on its next launch
+(active redelivery, never a poll).
+
+PROVENANCE (the operator addendum): every message is ALSO recorded durably for later analysis — append-only
+`log.jsonl` (source of truth) + a queryable SQLite `messages.db`. Each record captures from, to, ts,
+full body, and the links to trace it in both conversations: the sender's and each recipient's session
+id, delivery status/time, and the msg_id — which is embedded in the delivered turn text, so grepping
+the msg_id in the recipient's transcript finds the exact turn where it was processed.
+
+Pane model: each `agent-<name>` tmux session has pane 1 = control shell, pane 2 = claude. Target pane
+2. (The earlier bug pasted into the *active* pane = the pane-1 shell — delivered nowhere visible.)
+"""
+import argparse
+import datetime
+import fcntl
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+ROOT = os.environ.get("FLEET_MSG_ROOT", f"{HOME}/.agents/messages")
+LOG = f"{ROOT}/log.jsonl"
+DB = f"{ROOT}/messages.db"
+PENDING = f"{ROOT}/pending"
+DESC = f"{HOME}/.agents/projects"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    msg_id TEXT, ts TEXT, sender TEXT, sender_session TEXT,
+    recipient TEXT, recipient_session TEXT, status TEXT, delivered_ts TEXT, body TEXT,
+    PRIMARY KEY (msg_id, recipient)
+);
+CREATE INDEX IF NOT EXISTS ix_msg_sender ON messages(sender);
+CREATE INDEX IF NOT EXISTS ix_msg_recipient ON messages(recipient);
+CREATE INDEX IF NOT EXISTS ix_msg_ts ON messages(ts);
+"""
+
+
+def _now():
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _new_id():
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rand = open("/proc/sys/kernel/random/uuid").read().strip().replace("-", "")[:4]
+    return f"msg-{stamp}-{rand}"
+
+
+def _append_log(obj):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def _db():
+    os.makedirs(ROOT, exist_ok=True)
+    db = sqlite3.connect(DB)
+    db.executescript(SCHEMA)
+    return db
+
+
+def _session_of(name):
+    """The workspace's fixed conversation/session id (SESSION_ID, or legacy RESUME=) — the provenance
+    link into that agent's transcript. None for non-workspace senders (system timers)."""
+    f = f"{DESC}/{name}.env"
+    try:
+        txt = open(f).read()
+    except OSError:
+        return None
+    m = re.search(r'SESSION_ID="?([^"\n]+)', txt) or re.search(r'RESUME="?([^"\n]+)', txt)
+    return m.group(1) if m else None
+
+
+def _all_workspaces():
+    return sorted(re.split(r"\.env", os.path.basename(f))[0] for f in glob.glob(f"{DESC}/*.env"))
+
+
+def _resolve(to_raw, sender):
+    out = []
+    for tok in re.split(r"[,\s]+", to_raw.strip()):
+        if not tok:
+            continue
+        t = tok.lstrip("@").lower()
+        if t in ("all", "fleet", "everyone"):
+            out += [w for w in _all_workspaces() if w != sender]
+        elif t in ("human", "operator", "owner"):
+            out.append("main")
+        else:
+            out.append(tok)
+    seen, uniq = set(), []
+    for r in out:
+        if r not in seen:
+            seen.add(r); uniq.append(r)
+    return uniq
+
+
+def _claude_pane(name):
+    r = subprocess.run(["tmux", "list-panes", "-t", f"agent-{name}:main", "-F", "#{pane_id}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    panes = [p for p in r.stdout.split() if p]
+    if not panes:
+        return None
+    return panes[1] if len(panes) > 1 else panes[0]
+
+
+def _pane_text(pane):
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-J", "-t", pane], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _input_leftover(pane, needle):
+    """True if `needle` (a prefix of the pasted text) is still sitting in the ❯ input line — i.e. the
+    message was pasted but NOT submitted (the stuck-input bug). Empty input line → submitted/clear."""
+    for line in reversed(_pane_text(pane).splitlines()):
+        if "❯" in line:
+            after = line.split("❯", 1)[1].strip()
+            return bool(after) and needle[:20].strip() in after
+    return False
+
+
+def _current_input(pane):
+    """Text currently sitting in the ❯ input line (empty string if clear)."""
+    for line in reversed(_pane_text(pane).splitlines()):
+        if "❯" in line:
+            return line.split("❯", 1)[1].strip()
+    return ""
+
+
+def _submit(pane, text):
+    """Inject text as a SUBMITTED turn. The ONE load-bearing mechanic (found empirically 2026-07-11):
+    a bracketed paste, a short SETTLE DELAY, then Enter. Without the delay the Enter fires before the
+    paste settles and is swallowed — that was the entire stranding bug. Everything else the earlier
+    version did was unnecessary: NO idle-wait (a busy agent queues the paste as a mid-turn message —
+    verified live, idle and busy), NO input-clear (reliable delivery means nothing stale accumulates
+    to concatenate onto). One verify + re-Enter as cheap insurance against a rare swallowed Enter."""
+    try:
+        subprocess.run(["tmux", "load-buffer", "-b", "fmsg", "-"], input=text.encode(), check=True)
+        subprocess.run(["tmux", "paste-buffer", "-p", "-b", "fmsg", "-t", pane], check=True)
+        subprocess.run(["tmux", "delete-buffer", "-b", "fmsg"], capture_output=True)
+    except subprocess.CalledProcessError:
+        return False
+    time.sleep(0.8)                                       # let the bracketed paste settle — ESSENTIAL
+    subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], capture_output=True)
+    time.sleep(0.8)
+    if _input_leftover(pane, text.lstrip()[:20]):         # rare swallow → one more Enter
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], capture_output=True)
+    return True
+
+
+def _wire(env):
+    """The text submitted into the recipient's conversation: attribution + the msg_id (so this exact
+    turn is greppable back to the log/DB for provenance) + the message verbatim."""
+    return f"[message from {env['from']} | {env['id']}]\n{env['body'].rstrip()}"
+
+
+def _deliver(name, env, no_submit=False):
+    pane = None if no_submit else _claude_pane(name)
+    if pane and _submit(pane, _wire(env)):
+        return "delivered"
+    os.makedirs(PENDING, exist_ok=True)
+    with open(f"{PENDING}/{name}.jsonl", "a") as fh:
+        fh.write(json.dumps(env, ensure_ascii=False) + "\n")
+    return "queued"
+
+
+def cmd_send(a):
+    sender = a.get("from") or os.environ.get("WS_NAME") or "system"
+    body = _body(a)
+    if not body.strip():
+        sys.exit("fleet-msg: empty message")
+    recipients = _resolve(a["to"], sender)
+    if not recipients:
+        sys.exit("fleet-msg: no recipients")
+    mid, ts = _new_id(), _now()
+    sender_session = _session_of(sender)
+    db = _db()
+    rec = {"id": mid, "ts": ts, "from": sender, "to": recipients, "body": body.rstrip(),
+           "sender_session": sender_session, "event": "send", "recipients": {}}
+    for r in recipients:
+        env = {"id": mid, "ts": ts, "from": sender, "body": body.rstrip()}
+        status = _deliver(r, env, no_submit=a.get("no_submit"))
+        dts = ts if status == "delivered" else None
+        rsess = _session_of(r)
+        rec["recipients"][r] = {"status": status, "session": rsess, "delivered_ts": dts}
+        db.execute("INSERT OR REPLACE INTO messages(msg_id,ts,sender,sender_session,recipient,"
+                   "recipient_session,status,delivered_ts,body) VALUES(?,?,?,?,?,?,?,?,?)",
+                   (mid, ts, sender, sender_session, r, rsess, status, dts, body.rstrip()))
+    db.commit(); db.close()
+    _append_log(rec)
+    dv = [r for r, v in rec["recipients"].items() if v["status"] == "delivered"]
+    q = [r for r, v in rec["recipients"].items() if v["status"] == "queued"]
+    out = f"{mid}  delivered→ {', '.join(dv) or 'none'}"
+    if q:
+        out += f"  |  QUEUED (down, flush on resume)→ {', '.join(q)}"
+    print(out)
+    return mid
+
+
+def _body(a):
+    b = a.get("body")
+    if b is None or b == "":
+        return sys.stdin.read() if not sys.stdin.isatty() else ""
+    if b.startswith("@"):
+        with open(b[1:]) as fh:
+            return fh.read()
+    return b
+
+
+def cmd_flush(a):
+    name = a.get("name") or os.environ.get("WS_NAME")
+    if not name:
+        sys.exit("fleet-msg: flush needs a name (or WS_NAME)")
+    p = f"{PENDING}/{name}.jsonl"
+    if not os.path.exists(p):
+        print(f"({name}: nothing queued)")
+        return
+    pane = _claude_pane(name)
+    if not pane:
+        print(f"({name}: still down — leaving {sum(1 for _ in open(p))} message(s) queued)")
+        return
+    msgs = [json.loads(l) for l in open(p) if l.strip()]
+    db = _db()
+    for m in msgs:
+        _submit(pane, _wire(m))
+        dts = _now()
+        db.execute("UPDATE messages SET status='delivered', delivered_ts=? WHERE msg_id=? AND recipient=?",
+                   (dts, m["id"], name))
+        _append_log({"id": m["id"], "ts": dts, "from": m["from"], "to": [name],
+                     "body": m["body"], "event": "flush-delivered", "recipient_session": _session_of(name)})
+        time.sleep(0.5)
+    db.commit(); db.close()
+    os.remove(p)
+    print(f"flushed {len(msgs)} queued message(s) into {name}'s conversation")
+
+
+def cmd_kick(a):
+    """Recover an agent stranded with UNSUBMITTED text in its input (pasted but never submitted —
+    the stuck-input bug). Submits whatever is already in the box, reliably. Does not paste anything
+    new. Prints what it submitted so a sensitive/wrong stuck directive is visible, not blindly fired."""
+    name = a.get("name") or os.environ.get("WS_NAME")
+    if not name:
+        sys.exit("fleet-msg: kick needs a name")
+    pane = _claude_pane(name)
+    if not pane:
+        print(f"({name}: down — nothing to kick)"); return
+    cur = _current_input(pane)
+    if not cur:
+        print(f"({name}: input already clear — nothing stuck)"); return
+    if a.get("dry"):
+        print(f"{name}: WOULD submit stuck input: {cur!r}"); return
+    subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], capture_output=True)  # clear the stranded
+    time.sleep(0.4)                                                                # text, then re-submit
+    ok = _submit(pane, cur)
+    print(f"{name}: {'submitted' if ok else 'FAILED to submit'} stuck input: {cur!r}")
+
+
+def _since_iso(v):
+    """--since accepts an ISO timestamp OR a duration like 90m / 2h / 7d (what the docs promise)."""
+    if not v:
+        return None
+    m = re.fullmatch(r"(\d+)([mhd])", v.strip())
+    if not m:
+        return v                      # assume ISO; string compare works for ISO-8601
+    n, unit = int(m.group(1)), m.group(2)
+    secs = n * {"m": 60, "h": 3600, "d": 86400}[unit]
+    return (datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(seconds=secs)).replace(tzinfo=None).isoformat() + "Z"
+
+
+def cmd_log(a):
+    """Query the durable store. Filter by --from/--to/--since; default tails the most recent."""
+    if not os.path.exists(DB):
+        print("(no messages yet)")
+        return
+    db = _db()
+    where, params = [], []
+    if a.get("from"):
+        where.append("sender=?"); params.append(a["from"])
+    if a.get("to"):
+        where.append("recipient=?"); params.append(a["to"])
+    if a.get("since"):
+        where.append("ts>=?"); params.append(_since_iso(a["since"]))
+    q = "SELECT ts,sender,recipient,status,msg_id,body FROM messages"
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY ts DESC LIMIT ?"; params.append(a.get("n") or 20)
+    rows = db.execute(q, params).fetchall()
+    if a.get("json"):
+        cols = ["ts", "sender", "recipient", "status", "msg_id", "body"]
+        print(json.dumps([dict(zip(cols, r)) for r in rows], ensure_ascii=False, indent=1))
+    else:
+        for ts, s, r, st, mid, body in reversed(rows):
+            print(f"{ts}  {s:12}→{r:14} {st:9} {mid}  {body[:50].replace(chr(10),' ')}")
+    db.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="fleet-msg")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("send")
+    s.add_argument("--to", required=True); s.add_argument("--from", dest="from")
+    s.add_argument("--no-submit", dest="no_submit", action="store_true")
+    s.add_argument("body", nargs="?")
+    f = sub.add_parser("flush"); f.add_argument("name", nargs="?")
+    k = sub.add_parser("kick"); k.add_argument("name", nargs="?"); k.add_argument("--dry", action="store_true")
+    lg = sub.add_parser("log")
+    lg.add_argument("n", nargs="?", type=int); lg.add_argument("--from", dest="from")
+    lg.add_argument("--to"); lg.add_argument("--since"); lg.add_argument("--json", action="store_true")
+    a = vars(ap.parse_args())
+    cmd = a.pop("cmd")
+    {"send": lambda: cmd_send(a), "flush": lambda: cmd_flush(a), "kick": lambda: cmd_kick(a),
+     "log": lambda: cmd_log(a)}[cmd]()
+
+
+if __name__ == "__main__":
+    main()

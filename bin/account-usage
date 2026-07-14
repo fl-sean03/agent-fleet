@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""account-usage [--json|--table] [--mock FILE] [label ...] — per-account OAuth usage snapshot.
+
+Read-only. For each named rotation account, resolves its isolated config dir, reads the accessToken
+from .credentials.json, and GETs the Claude OAuth usage endpoint. Emits one JSON object
+per line:
+    {"label": L, "five_hour": {...}, "seven_day": {...}, "fable": {"utilization": %, "resets_at": ISO}|null}
+or  {"label": L, "error": "..."}          (401 / network / parse / missing credential — per-account,
+                                           never a crash)
+"fable" = the per-model Fable weekly cap (limits[] weekly_scoped); null when absent. "scoped" =
+ALL per-model weekly caps keyed by lowercased model name (empty object when none) — additive, so
+new scoped models (e.g. a future Opus cap) surface without a code change. account-watch consumes
+five_hour/seven_day for rotation and fable for per-model cap gating (MODEL-divergent workspaces).
+Default labels = every .rotation entry (deduped).
+
+Flags:
+  --json         JSONL output (default)
+  --table        human table: label, 5h%, 5h-reset-in, 7d%, 7d-reset-in, fable%, fable-reset-in, status
+  --mock FILE    read canned endpoint JSON per label from FILE instead of calling the endpoint.
+                 FILE = {"<label>": <endpoint-response-body> | {"error": "<msg>"}, ...}
+
+NEVER prints tokens. Exit 0 unless ALL accounts errored (then 1).
+Consumed by account-watch (rotation decisions) and account-status --usage.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+ACCTS = os.path.join(HOME, ".agents", "accounts")
+ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
+TIMEOUT = 8
+
+
+def cfg_of(label):
+    """Named profile label -> its isolated config directory; no global fallback."""
+    return os.path.join(ACCTS, label)
+
+
+def default_labels():
+    labels = []
+    rot = os.path.join(ACCTS, ".rotation")
+    try:
+        with open(rot) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line not in labels:
+                    labels.append(line)
+    except OSError:
+        pass
+    return labels
+
+
+def read_token(label):
+    """Return accessToken or raise ValueError with a safe (token-free) message."""
+    path = os.path.join(cfg_of(label), ".credentials.json")
+    if not os.path.isfile(path):
+        raise ValueError("no credential (%s missing)" % path)
+    try:
+        with open(path) as f:
+            tok = json.load(f).get("claudeAiOauth", {}).get("accessToken")
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError("credential unreadable: %s" % e.__class__.__name__)
+    if not tok:
+        raise ValueError("no accessToken in credential file")
+    return tok
+
+
+def fetch_usage(label):
+    """GET the usage endpoint for one label. Returns the parsed response body (dict)."""
+    tok = read_token(label)
+    req = urllib.request.Request(
+        ENDPOINT,
+        headers={"Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as e:
+        raise ValueError("http %s %s" % (e.code, e.reason))
+    except urllib.error.URLError as e:
+        raise ValueError("network: %s" % getattr(e, "reason", e))
+    except (json.JSONDecodeError, TimeoutError) as e:
+        raise ValueError("parse/timeout: %s" % e.__class__.__name__)
+
+
+def scoped_caps(body):
+    """ALL per-model weekly caps from limits[] (kind == weekly_scoped), robust to schema drift.
+
+    Live schema (verified against the endpoint 2026-07-13): limits[] entries look like
+      {"kind":"weekly_scoped","percent":18,"resets_at":ISO,"scope":{"model":{"id":null,
+       "display_name":"Fable"},"surface":null},...}
+    — scope.model.id is NULL in practice, so the display_name is the primary identity; both are
+    checked. Tolerated deviations: body/limits/entry/scope of the wrong type, percent missing or
+    under an alternate key ("utilization"), resets_at absent, duplicate entries for one model
+    (worst utilization wins). Returns {key: {"utilization": float|None, "resets_at": ISO|None,
+    "model": str}} keyed by the lowercased display_name (or id); {} when nothing parses.
+    """
+    out = {}
+    limits = body.get("limits") if isinstance(body, dict) else None
+    if not isinstance(limits, list):
+        return out
+    for e in limits:
+        if not isinstance(e, dict) or e.get("kind") != "weekly_scoped":
+            continue
+        scope = e.get("scope") if isinstance(e.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        name = model.get("display_name") or model.get("id") or ""
+        if not isinstance(name, str) or not name.strip():
+            continue                       # unidentifiable scope — nothing to key it by
+        key = name.strip().lower()
+        util = e.get("percent", e.get("utilization"))
+        try:
+            util = float(util) if util is not None else None
+        except (TypeError, ValueError):
+            util = None
+        rec = {"utilization": util, "resets_at": e.get("resets_at") or None, "model": name.strip()}
+        prev = out.get(key)
+        if prev is None or (util or 0) > (prev["utilization"] or 0):
+            out[key] = rec                 # duplicates: keep the WORST (highest) utilization
+    return out
+
+
+def fable_cap(body):
+    """The per-model 'Fable' weekly cap: worst-utilization scoped entry whose model matches
+    'fable' (case-insensitive; display_name or id). {"utilization": %, "resets_at": ISO} or None."""
+    best = None
+    for key, rec in scoped_caps(body).items():
+        if "fable" not in key:
+            continue
+        if best is None or (rec["utilization"] or 0) > (best["utilization"] or 0):
+            best = rec
+    return {"utilization": best["utilization"], "resets_at": best["resets_at"]} if best else None
+
+
+def to_record(label, body):
+    """Endpoint body -> our per-line record. Raises ValueError on unexpected shape."""
+    try:
+        rec = {
+            "label": label,
+            "five_hour": {
+                "utilization": body["five_hour"]["utilization"],
+                "resets_at": body["five_hour"]["resets_at"],
+            },
+            "seven_day": {
+                "utilization": body["seven_day"]["utilization"],
+                "resets_at": body["seven_day"]["resets_at"],
+            },
+        }
+    except (KeyError, TypeError):
+        raise ValueError("parse: unexpected response shape (no five_hour/seven_day)")
+    rec["fable"] = fable_cap(body)   # additive; None when no Fable cap on this account
+    rec["scoped"] = scoped_caps(body)  # additive: ALL per-model weekly caps (future models land free)
+    return rec
+
+
+def reset_in(iso):
+    """ISO resets_at -> compact human delta like '2h14m' (or '-' if past/unparseable)."""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        secs = int((dt - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError):
+        return "?"
+    if secs <= 0:
+        return "now"
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return "%dd%dh" % (d, h)
+    if h:
+        return "%dh%02dm" % (h, m)
+    return "%dm" % m
+
+
+def print_table(records):
+    hdr = ("ACCOUNT", "5H%", "5H-RESET", "7D%", "7D-RESET", "FABLE%", "FABLE-RESET", "STATUS")
+    rows = [hdr]
+    for r in records:
+        if "error" in r:
+            rows.append((r["label"], "-", "-", "-", "-", "-", "-", "ERROR: " + r["error"]))
+            continue
+        u5, u7 = r["five_hour"]["utilization"], r["seven_day"]["utilization"]
+        fb = r.get("fable")
+        fb_pct = "-" if not fb or fb.get("utilization") is None else "%.0f" % fb["utilization"]
+        fb_reset = "-" if not fb or not fb.get("resets_at") else reset_in(fb["resets_at"])
+        status = "ok"
+        if u5 >= 90:
+            status = "HIGH-5H (rotate zone)"
+        elif u7 >= 95:
+            status = "HIGH-7D (rotate zone)"
+        elif fb and (fb.get("utilization") or 0) >= 100:
+            status = "FABLE-CAPPED"
+        rows.append((r["label"], "%.1f" % u5, reset_in(r["five_hour"]["resets_at"]),
+                     "%.1f" % u7, reset_in(r["seven_day"]["resets_at"]),
+                     fb_pct, fb_reset, status))
+    widths = [max(len(row[i]) for row in rows) for i in range(len(hdr))]
+    for row in rows:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+
+
+def main(argv):
+    mode = "json"
+    mock_file = None
+    labels = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            mode = "json"
+        elif a == "--table":
+            mode = "table"
+        elif a == "--mock":
+            i += 1
+            if i >= len(argv):
+                print("--mock requires a file argument", file=sys.stderr)
+                return 2
+            mock_file = argv[i]
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a.startswith("-"):
+            print("unknown flag: %s" % a, file=sys.stderr)
+            return 2
+        else:
+            if a not in labels:
+                labels.append(a)
+        i += 1
+
+    if not labels:
+        labels = default_labels()
+    if not labels:
+        print("no rotation accounts configured", file=sys.stderr)
+        return 2
+    if "host" in labels:
+        print("invalid account label 'host' (use a named rotation profile)", file=sys.stderr)
+        return 2
+
+    mock = None
+    if mock_file is not None:
+        try:
+            with open(mock_file) as f:
+                mock = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            print("cannot read mock file: %s" % e, file=sys.stderr)
+            return 2
+
+    records = []
+    for label in labels:
+        try:
+            if mock is not None:
+                body = mock.get(label)
+                if body is None:
+                    raise ValueError("mock: no entry for label")
+                if isinstance(body, dict) and set(body) == {"error"}:
+                    raise ValueError(str(body["error"]))
+            else:
+                body = fetch_usage(label)
+            records.append(to_record(label, body))
+        except ValueError as e:
+            records.append({"label": label, "error": str(e)})
+
+    if mode == "table":
+        print_table(records)
+    else:
+        for r in records:
+            print(json.dumps(r))
+
+    return 1 if records and all("error" in r for r in records) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

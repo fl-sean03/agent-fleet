@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# provision-profile <account-label> — make an account profile SAFE FOR HEADLESS/AUTOSTART use.
+#
+# Why this exists (2026-07-10): the account-a profile was created by copying ~/.claude's
+# credential + .claude.json, but the copy lacked hasCompletedOnboarding / bypassPermissionsModeAccepted
+# and had no pre-trusted workspace roots — so the first fresh relaunch under it stopped at an
+# INTERACTIVE dialog. Any autostart or rotation onto an unprovisioned profile can hang there,
+# invisible inside a tmux pane. Main patched it by hand; this codifies the fix, idempotently.
+#
+# Does: (1) sets hasCompletedOnboarding + bypassPermissionsModeAccepted in the profile's .claude.json
+# (backup kept); (2) pre-trusts every fleet workspace ROOT (live descriptors) via trust-dir under this
+# profile. Run it for EVERY new profile before it can receive a swap; safe to re-run anytime.
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+A="$HOME/.agents"; ACCTS="$A/accounts"
+L="${1:?usage: provision-profile <account-label>}"
+CFG="$("$A/bin/account-profile" "$L")" || exit 1
+CJ="$CFG/.claude.json"
+[ -f "$CJ" ] || { echo "profile has no .claude.json yet (needs one login first): $CJ"; exit 1; }
+
+cp -p "$CJ" "$CJ.bak-provision-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 - "$CJ" <<'EOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+changed = []
+for k in ("hasCompletedOnboarding", "bypassPermissionsModeAccepted"):
+    if d.get(k) is not True:
+        d[k] = True
+        changed.append(k)
+if changed:
+    json.dump(d, open(p, "w"), indent=2)
+print(f"flags: {'set ' + ', '.join(changed) if changed else 'already set'}")
+EOF
+
+# pre-trust every live fleet root under THIS profile (trust-dir writes into $CLAUDE_CONFIG_DIR)
+n=0
+for envf in "$A"/projects/*.env; do
+  root=$(grep -oP '^ROOT="?\K[^"]+' "$envf" 2>/dev/null | head -1 | sed "s|\$HOME|$HOME|; s|^~|$HOME|")
+  [ -n "$root" ] && [ -d "$root" ] || continue
+  CLAUDE_CONFIG_DIR="$CFG" "$A/bin/trust-dir" "$root" 2>/dev/null && n=$((n+1)) || true
+done
+echo "trusted roots: $n (profile $L)"
+echo "✓ $L provisioned for headless/autostart use"

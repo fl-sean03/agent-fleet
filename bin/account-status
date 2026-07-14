@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# account-status [--probe] [--usage] — one glance at "who is on which Claude account".
+#
+# Read-only. Shows: active label + hold/rotation state, each account's login email, and every UP
+# workspace's ACTUAL account (projects: live claude proc's CLAUDE_CONFIG_DIR — ground truth, not the
+# descriptor; confined workspaces: confined-cfg/<c>/.account marker + .claude.json login email).
+# --probe additionally live-probes each account for a usage-limit wall (~15s per account).
+# --usage additionally appends the per-account OAuth usage table (account-usage --table:
+#         5h/7d utilization + reset countdowns — the rotation-policy signal, cheap HTTP).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+A="$HOME/.agents"; ACCTS="$A/accounts"
+CAP_RE='usage limit|rate limit|reached your|limit reached|quota (exceeded|reached)|out of (usage|tokens)'
+PROBE=0; USAGE=0
+for arg in "$@"; do case "$arg" in --probe) PROBE=1;; --usage) USAGE=1;; esac; done
+
+cfg_of(){ "$A/bin/account-profile" "$1"; }
+email_of(){ python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress','?'))" "$(cfg_of "$1")/.claude.json" 2>/dev/null || echo '?'; }
+label_of_cfg(){ # config dir path → rotation label
+  local d="$1" label cfg; d="$(readlink -f "$d")"
+  while IFS= read -r label; do
+    cfg="$(cfg_of "$label" 2>/dev/null || true)"
+    [ -n "$cfg" ] && [ "$d" = "$(readlink -f "$cfg")" ] && { echo "$label"; return; }
+  done < <(grep -vE '^\s*(#|$)' "$ACCTS/.rotation" 2>/dev/null)
+  echo '?'
+}
+is_claude_proc(){ # PID → exact Claude CLI process, not a shell whose text happens to mention Claude
+  local arg0
+  arg0=$(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | head -1)
+  case "$(basename "$arg0")" in claude|claude-bin) return 0;; esac
+  return 1
+}
+
+echo "CHAIN  : $(grep -vE '^\s*(#|$)' "$ACCTS/.rotation" 2>/dev/null | awk 'NR>1{printf " -> "}{printf "%s",$0}END{print ""}')"
+echo
+echo "ACCOUNTS"
+for acct in $(grep -vE '^\s*(#|$)' "$ACCTS/.rotation" 2>/dev/null); do
+  line="  $acct → $(email_of "$acct")"
+  if [ "$PROBE" = 1 ]; then
+    out=$(cd /tmp && CLAUDE_CONFIG_DIR="$(cfg_of "$acct")" timeout 90 claude -p "reply with: ok" --no-session-persistence 2>&1 </dev/null || true)
+    if echo "$out" | grep -qiE "$CAP_RE"; then line="$line   [CAPPED: ${out:0:60}]"; else line="$line   [healthy]"; fi
+  fi
+  echo "$line"
+done
+echo
+printf "%-8s %-15s %-10s %s\n" "KIND" "WORKSPACE" "ACCOUNT" "SOURCE"
+agentctl status --json 2>/dev/null | python3 -c "
+import json,sys
+for w in sorted(json.load(sys.stdin), key=lambda x: (x['kind'], x['name'])):
+    if w['status'] == 'up': print(w['kind'], w['name'])
+" | while read -r kind name; do
+  if [ "$kind" = confined ]; then
+    lbl=$(cat "$A/confined-cfg/$name/.account" 2>/dev/null || echo '?')
+    em=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress','?'))" "$A/confined-cfg/$name/.claude.json" 2>/dev/null || echo '?')
+    printf "%-8s %-15s %-10s %s\n" "$kind" "$name" "$lbl" "login: $em"
+  else
+    ag=$(grep -oP '^AGENTS="?\K[^"]+' "$A/projects/$name.env" 2>/dev/null | head -1)
+    if [ -n "$ag" ] && [ "$ag" != claude ]; then
+      printf "%-8s %-15s %-10s %s\n" "$kind" "$name" "n/a" "remote agent ($ag) — own auth on remote box"
+      continue
+    fi
+    sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$A/projects/$name.env" 2>/dev/null | head -1)
+    lbl="?"; src="(no live proc found)"
+    for pid in $(pgrep -f -- "$sid" 2>/dev/null); do
+      is_claude_proc "$pid" || continue
+      cd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -1)
+      [ -n "$cd" ] || { lbl="?"; src="live proc $pid (no named profile)"; break; }
+      lbl="$(label_of_cfg "$cd")"; src="live proc $pid"
+      break
+    done
+    printf "%-8s %-15s %-10s %s\n" "$kind" "$name" "$lbl" "$src"
+  fi
+done
+
+if [ "$USAGE" = 1 ]; then
+  echo
+  echo "USAGE (OAuth endpoint — rotation signal: rotate at 5h>=90% or 7d>=95%)"
+  "$(dirname "$(readlink -f "$0")")/account-usage" --table 2>&1 | sed 's/^/  /'
+fi

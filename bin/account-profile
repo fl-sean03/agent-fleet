@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# account-profile <label|--active> — resolve ONE configured fleet account profile.
+#
+# The rotation file is the sole account allow-list.  There is no implicit/global
+# Claude login target: every launch must resolve to a credentialed named profile.
+set -euo pipefail
+
+A="${A:-$HOME/.agents}"
+ACCTS="${ACCTS:-$A/accounts}"
+ROT="${ROT:-$ACCTS/.rotation}"
+
+die(){ echo "account-profile: $*" >&2; exit 1; }
+
+[ "$#" = 1 ] || die "usage: account-profile <label|--active>"
+label="$1"
+if [ "$label" = --active ]; then
+  [ -f "$ACCTS/.active" ] || die "active-account pointer is missing"
+  label="$(tr -d '\r\n' < "$ACCTS/.active")"
+fi
+
+case "$label" in
+  ''|host|*/*|.*) die "invalid account label '$label' (use a named rotation profile)" ;;
+esac
+[ -f "$ROT" ] || die "rotation allow-list is missing: $ROT"
+grep -Fxq -- "$label" "$ROT" || die "'$label' is not in the rotation allow-list"
+
+cfg="$ACCTS/$label"
+[ -d "$cfg" ] || die "profile directory is missing: $cfg"
+[ -f "$cfg/.credentials.json" ] || die "profile has no credential: $cfg"
+[ -f "$cfg/.claude.json" ] || die "profile has no Claude config: $cfg"
+printf '%s\n' "$cfg"

@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily rolling idle-workspace cleanup
+[Timer]
+OnCalendar=*-*-* 13:00:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target

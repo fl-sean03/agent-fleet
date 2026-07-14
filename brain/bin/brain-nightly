@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# brain-nightly — the one nightly tick (systemd: brain-nightly.timer).
+# Deliberately NO `|| true` anywhere: a failing stage exits nonzero → systemd OnFailure → an alert to
+# the coordinator (on top of the engine's own health.json). Silence is structurally impossible.
+set -u
+export PATH="$HOME/.local/bin:$PATH"   # a systemd user unit's PATH lacks ~/.local/bin (agent CLI, agentctl)
+
+# The kit root resolves from CONFIG (env > ~/.agents/fleet.conf > default) — never a hardcoded path,
+# so this works on any machine. install.sh writes FLEET_KIT_ROOT for you.
+A="${FLEET_AGENTS_DIR:-$HOME/.agents}"
+CONF="$A/fleet.conf"
+KIT="${FLEET_KIT_ROOT:-}"
+[ -z "$KIT" ] && [ -f "$CONF" ] && KIT=$(sed -n 's/^FLEET_KIT_ROOT=//p' "$CONF" | head -1)
+KIT="${KIT:-$HOME/agent-fleet}"; KIT="${KIT/#\~/$HOME}"
+[ -x "$KIT/brain/bin/brain" ] || { echo "brain-nightly: no brain at '$KIT' — set FLEET_KIT_ROOT in $CONF" >&2; exit 1; }
+
+# Exclusive pipeline lock: two engine processes must never share the ledgers/staged pool.
+mkdir -p "$KIT/brain/state"
+flock "$KIT/brain/state/.pipeline.lock" "$KIT/brain/bin/brain" nightly
+rc=$?
+
+# OPTIONAL: version tonight's knowledge state in git so memory changes are reviewable and revertible.
+# OFF by default. In this kit brain/state, brain/staged, brain/reviews and memory/<ws>/ are GITIGNORED
+# — they are your fleet's private knowledge, and auto-committing them from a public fork would publish
+# it. To enable: make sure your checkout is a PRIVATE repo, un-ignore those paths, then set
+# BRAIN_GIT_COMMIT=1 in ~/.agents/fleet.conf.
+GIT_COMMIT="${BRAIN_GIT_COMMIT:-}"
+[ -z "$GIT_COMMIT" ] && [ -f "$CONF" ] && GIT_COMMIT=$(sed -n 's/^BRAIN_GIT_COMMIT=//p' "$CONF" | head -1)
+if [ "${GIT_COMMIT:-0}" = 1 ] && [ -d "$KIT/.git" ]; then
+  cd "$KIT" || exit $rc
+  # PATHSPEC commit — a bare `git commit` would also sweep whatever a human had staged at run time.
+  paths=(brain/staged brain/state brain/reviews memory)
+  if ! git diff --quiet -- "${paths[@]}" 2>/dev/null \
+     || [ -n "$(git ls-files --others --exclude-standard -- "${paths[@]}")" ]; then
+    git add -- "${paths[@]}" 2>/dev/null
+    git commit -q -m "brain nightly $(date -u +%F): knowledge-state auto-commit" \
+      -m "Automated by brain-nightly; run records in brain/state/runs/." -- "${paths[@]}"
+    crc=$?
+    [ $rc -eq 0 ] && rc=$crc
+  fi
+fi
+exit $rc

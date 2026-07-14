@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+# CRITICAL persistence fix: if launched from WITHIN another Claude Code session (an agent running agentctl),
+# the spawned claude inherits CLAUDE_CODE_CHILD_SESSION=1 + CLAUDE_CODE_SESSION_ID → Claude Code treats it as
+# a nested child session and does NOT persist its transcript. Clear them so it's a clean top-level session.
+unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH 2>/dev/null || true
+# RESUME GATE SUPPRESSION (fleet fix, 2026-07-12): on `--resume`, Claude Code shows an INTERACTIVE
+# "Resume from summary (recommended) / Resume full session as-is" prompt when a session is both
+# >=70 min old AND >=100k tokens (CLI 2.1.207 defaults CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=70,
+# CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=100000). Every account swap relaunches with --resume, so any
+# large fleet session lands on that modal — input BLOCKED, swap nudges swallowed, agent stranded
+# until a human answers (three workspaces, observed 2026-07). Push BOTH thresholds past any real
+# session so resume ALWAYS proceeds full-session, silently, straight to the input box. Both are raised
+# (the gate is an AND today; setting both survives an AND→OR change). Session bloat is handled
+# separately (proactive compaction), not by blocking the resume.
+export CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000     # 1e9 tokens — no session approaches this (1M ctx max)
+export CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=52560000     # ~100 yr — age can never cross it
+# REMOTE_CONTROL / RC_NAME / RESUME / WS_NAME / ACCOUNT are passed in by agentctl (from the workspace .env)
+CL_ARGS=(--dangerously-skip-permissions)
+# ACCOUNT: run this workspace under a named account profile (~/.agents/accounts/<name>).
+# DEPLOY DEFAULT RULE: no ACCOUNT in the descriptor means the fleet-active profile.  The rotation
+# allow-list is authoritative; an unknown label must fail before Claude starts.
+if [ -z "${ACCOUNT:-}" ]; then
+  ACCT_DIR="$("$HOME/.agents/bin/account-profile" --active)" || exit 1
+  ACCOUNT="$(basename "$ACCT_DIR")"
+  echo "→ no ACCOUNT in descriptor: using fleet-active '$ACCOUNT'"
+else
+  ACCT_DIR="$("$HOME/.agents/bin/account-profile" "$ACCOUNT")" || exit 1
+fi
+export CLAUDE_CONFIG_DIR="$ACCT_DIR"
+echo "→ account: $ACCOUNT (named profile $ACCT_DIR)"
+SESS_BASE="$ACCT_DIR/projects"   # all profiles point this at the one shared physical session store
+~/.agents/bin/trust-dir "$PWD" 2>/dev/null || true        # preseed trust in the active named profile
+# SESSION_ID (the single, deterministic resume mode): every project workspace pins a FIXED session UUID,
+# assigned once in its descriptor. Always use that id — resume it if it already exists in the active
+# store, else CREATE the session with that exact id (--session-id). Same workspace ⇒ same session,
+# forever: no "continue" heuristic, no most-turns guessing, no stale-fork risk. With the shared session
+# store (account profiles symlink projects/ → ~/.claude/projects), the id resolves to the SAME file
+# regardless of which account is active, so an account switch never copies or diverges anything.
+enc=$(printf '%s' "$PWD" | sed 's#[^a-zA-Z0-9]#-#g')
+if [ -n "${SESSION_ID:-}" ]; then
+  if [ -f "$SESS_BASE/$enc/$SESSION_ID.jsonl" ]; then
+    CL_ARGS+=(--resume "$SESSION_ID"); echo "→ resuming session ${SESSION_ID:0:8}"
+  else
+    CL_ARGS+=(--session-id "$SESSION_ID"); echo "→ creating session ${SESSION_ID:0:8} (first run, fixed id)"
+  fi
+elif [ -n "${RESUME:-}" ]; then            # legacy fallback for any pre-SESSION_ID descriptor
+  if [ "$RESUME" = "continue" ]; then
+    sid="$("$HOME/.agents/bin/resolve-session" "$PWD" "$SESS_BASE" 2>/dev/null || true)"
+    [ -n "$sid" ] && { CL_ARGS+=(--resume "$sid"); echo "→ resuming canonical session ${sid:0:8}"; } || echo "→ fresh session"
+  else CL_ARGS+=(--resume "$RESUME"); echo "→ resuming pinned session ${RESUME:0:8}"; fi
+fi
+if [ "${REMOTE_CONTROL:-}" = "on" ]; then
+  RCNAME="${RC_NAME:-${WS_NAME:-$(basename "$PWD")}}"
+  CL_ARGS+=(--remote-control "$RCNAME")
+  export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$RCNAME"   # the real source of the displayed name
+  echo "→ Remote Control: ON (mobile session '$RCNAME')"
+fi
+# MODEL: pin the workspace's model in the DESCRIPTOR so it survives every relaunch. An in-session
+# /model choice is per-process and silently reverts to the default on any bounce (account swaps reset
+# the whole fleet's models to Opus, 2026-07-09). Descriptor MODEL= is the durable source of truth.
+if [ -n "${MODEL:-}" ]; then
+  CL_ARGS+=(--model "$MODEL"); echo "→ model: $MODEL (descriptor pin)"
+fi
+claude "${CL_ARGS[@]}" || true
+echo; echo "[claude exited — this pane is now a shell. 'run-claude' to restart]"; exec bash

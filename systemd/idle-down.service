@@ -1,0 +1,6 @@
+[Unit]
+Description=Spin down agent workspaces idle (no user turn) >=7 days
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.agents/bin/idle-down --days 7

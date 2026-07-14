@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# session-guard — defends against Claude Code transcript loss (known issues: #59248 silent cleanup,
+# #49903 account-switch deletion, #29096 no graceful flush, #63015 100%-context stall). Run on a timer.
+#
+#  1) ARCHIVE — durable rsync snapshot of every account's session transcripts, so a silent retention
+#     cleanup or an account-switch deletion can't take the on-disk history with it. (ZFS snapshots only
+#     capture what's flushed; this is a second, transcript-scoped copy.)
+#  2) STUCK-SESSION ALERT — flag any live workspace at >=95% context or visibly mid-turn for a long
+#     time. Those are exactly the sessions whose in-memory transcript would be lost on a hard kill
+#     (the example-confined failure). Logged so we can intervene (manual /compact or fresh session) BEFORE a bounce.
+set -uo pipefail
+A="$HOME/.agents"; ARCH="$A/session-archive"; LOG="$A/session-guard.log"
+log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+mkdir -p "$ARCH"
+
+# 0) shared-store integrity preflight (rebase 2026-07-01): every ACCOUNT profile's projects/ must
+# resolve to the shared host store — a diverged copy silently forks sessions on account swap.
+# (confined-cfg profiles are deliberately isolated and are NOT checked.)
+HOST_STORE="$(readlink -f "$HOME/.claude/projects" 2>/dev/null || true)"
+for p in "$A"/accounts/*/projects; do
+  [ -e "$p" ] || continue
+  [ "$(readlink -f "$p" 2>/dev/null || true)" = "$HOST_STORE" ] || \
+    log "!!! SHARED-STORE VIOLATION: $p does not resolve to ~/.claude/projects — sessions will fork on swap"
+done
+
+# 1) archive transcripts from host + every account profile + every confined workspace
+for base in "$HOME/.claude" "$A"/accounts/* "$A"/confined-cfg/*; do
+  [ -d "$base/projects" ] || continue
+  name=$(basename "$base")
+  rsync -a --prune-empty-dirs --include='*/' --include='*.jsonl' --exclude='*' \
+        "$base/projects/" "$ARCH/$name/" 2>/dev/null || true
+done
+find "$ARCH" -name '*.jsonl' -mtime +90 -delete 2>/dev/null || true   # bound archive size
+
+# 2) scrollback capture + stuck-session scan across live workspaces.
+# The tmux pane scrollback holds the recent VISIBLE conversation — including turns that have NOT been
+# flushed to the JSONL yet. Capturing it continuously is our recovery source for a stuck session: even
+# if we later must hard-kill it, the recent conversation survives as text here.
+command -v tmux >/dev/null || exit 0
+SB="$ARCH/_scrollback"; mkdir -p "$SB"
+for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-' || true); do
+  ws="${s#agent-}"
+  pane=$(tmux list-panes -t "$s:main" -F '#{pane_id}' 2>/dev/null | sed -n 2p)
+  [ -n "$pane" ] || continue
+  tmux capture-pane -p -J -S - -t "$pane" 2>/dev/null > "$SB/$ws.txt" || true   # full scrollback → latest snapshot
+  ctx=$(tail -40 "$SB/$ws.txt" 2>/dev/null | grep -oE '[0-9]+% context used' | grep -oE '^[0-9]+' | head -1)
+  if [ -n "${ctx:-}" ] && [ "$ctx" -ge 95 ]; then
+    cp "$SB/$ws.txt" "$SB/$ws.STUCK.$(date -u +%Y%m%dT%H%M).txt" 2>/dev/null || true   # preserve a stuck snapshot
+    log "STUCK-RISK: $ws at ${ctx}% context — scrollback preserved in $SB/$ws.STUCK.* ; /compact or fresh-session BEFORE any bounce/swap/reboot"
+  fi
+done
+find "$SB" -name '*.STUCK.*' -mtime +30 -delete 2>/dev/null || true

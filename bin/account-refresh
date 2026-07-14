@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# account-refresh <label> — refresh an IDLE account's OAuth access token from its stored refreshToken.
+#
+# Idle accounts are never run through the CLI, so their ~8h access token expires and nothing renews it.
+# The OAuth usage endpoint then returns 401 → account-watch sees the account as usage-blind → it drops
+# out of the eligible-target set and failover silently dies when the active account caps (found
+# 2026-07-11: account-b + account-c both 401'd for hours). The refreshToken is long-lived (~27d) and
+# present; a single `claude -p` call makes the CLI exercise it and atomically persist the new access
+# token to .credentials.json. No re-login. rc 0 = the credential's expiresAt is now in the future.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ACCOUNT_PROFILE="${ACCOUNT_PROFILE:-$SELF_DIR/account-profile}"
+LABEL="${1:?usage: account-refresh <account-label>}"
+
+CFG="$("$ACCOUNT_PROFILE" "$LABEL" 2>/dev/null)" || { echo "account-refresh: unknown/invalid label '$LABEL'" >&2; exit 1; }
+[ -f "$CFG/.credentials.json" ] || { echo "account-refresh: no .credentials.json for $LABEL" >&2; exit 1; }
+
+# Minimal one-shot: the CLI refreshes an expired access token (using the valid refresh token) BEFORE
+# it sends the request, and writes the rotated token back atomically. A cap wall doesn't matter — the
+# token refresh happens regardless of the model/limit outcome.
+cd /tmp && CLAUDE_CONFIG_DIR="$CFG" timeout 90 claude -p "ok" --model claude-opus-4-8 \
+  --no-session-persistence >/dev/null 2>&1 </dev/null || true
+
+python3 - "$CFG" "$LABEL" <<'PY'
+import json, sys, datetime
+cfg, label = sys.argv[1], sys.argv[2]
+try:
+    c = json.load(open(cfg + "/.credentials.json")).get("claudeAiOauth", {})
+except Exception as e:
+    print(f"account-refresh: {label}: cannot read credential ({e})"); sys.exit(1)
+exp = (c.get("expiresAt") or 0) / 1000
+if exp > datetime.datetime.now().timestamp():
+    print(f"account-refresh: {label}: OK — access token valid until "
+          f"{datetime.datetime.utcfromtimestamp(exp).strftime('%H:%MZ')}"); sys.exit(0)
+print(f"account-refresh: {label}: still expired after refresh attempt"); sys.exit(2)
+PY

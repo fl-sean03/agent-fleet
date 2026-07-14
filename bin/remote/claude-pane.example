@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# claude-pane — the REMOTE half of the remote workspace tier. Install this ON THE REMOTE BOX at
+# ~/.local/bin/claude-pane (chmod +x). `bin/run-claude-remote` ssh's in and runs it, handing over
+# SESSION_ID / MODEL / REMOTE_CONTROL / RC_NAME as environment.
+#
+#     scp bin/remote/claude-pane.example user@remote-host:~/.local/bin/claude-pane
+#     ssh user@remote-host 'chmod +x ~/.local/bin/claude-pane'
+#
+# This machine owns its OWN auth (log in here once, normally) — no credential is sent from the fleet
+# host. Adjust WORKDIR and the CLI invocation to taste; the only contract that matters is:
+# RESUME the session id you are given, or CREATE it with that exact id on first run.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+
+WORKDIR="${REMOTE_WORKDIR:-$HOME/work}"     # where the remote agent works
+cd "$WORKDIR" || { echo "no such dir: $WORKDIR"; exec bash; }
+
+ARGS=(--dangerously-skip-permissions)
+
+# Fixed-session semantics, identical to the local launcher: same workspace ⇒ same conversation,
+# forever. Resume it if the session already exists here; otherwise create it with that exact id.
+if [ -n "${SESSION_ID:-}" ]; then
+  enc=$(printf '%s' "$PWD" | sed 's#[^a-zA-Z0-9]#-#g')
+  if [ -f "$HOME/.claude/projects/$enc/$SESSION_ID.jsonl" ]; then
+    ARGS+=(--resume "$SESSION_ID"); echo "→ resuming ${SESSION_ID:0:8}…"
+  else
+    ARGS+=(--session-id "$SESSION_ID"); echo "→ creating ${SESSION_ID:0:8}… (first run)"
+  fi
+fi
+[ -n "${MODEL:-}" ] && ARGS+=(--model "$MODEL")
+if [ "${REMOTE_CONTROL:-}" = "on" ]; then
+  ARGS+=(--remote-control "${RC_NAME:-$(hostname)}")
+  export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="${RC_NAME:-$(hostname)}"
+fi
+
+claude "${ARGS[@]}" || true
+echo; echo "[agent exited on $(hostname) — this pane is now a shell]"
+exec bash

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# watch-freeze — quiet the account-watch watchdog for maintenance, SAFELY.
+#
+# Policy (the operator 2026-07-10 "no more hold"): there is no freeze FILE — a marker silently disarmed
+# rotation twice and was removed. Maintenance stops the UNIT, visibly. But a bare `systemctl stop
+# account-watch.timer` has its own failure mode: nothing guarantees the restart (2026-07-13: main
+# improvised a transient "aw-reenable" unit by hand to schedule one). This tool formalizes exactly
+# that pattern and nothing more:
+#   freeze  = stop account-watch.timer  +  schedule a transient systemd restart at now+<duration>
+#   thaw    = start the timer now       +  cancel any pending scheduled restart
+# A DURATION IS MANDATORY — freeze-forever is the footgun this tool exists to prevent. Both actions
+# log to accounts/watch.log so the freeze is visible exactly where rotation is watched.
+#
+#   watch-freeze 45m [reason...]     freeze; auto-thaw in 45m (units: s/m/h/d; max 24h)
+#   watch-freeze thaw                thaw now (also cancels the scheduled auto-thaw)
+#   watch-freeze status              timer + pending-thaw state; rc 0 = frozen
+#
+# WATCH_FREEZE_DRY=1 prints the systemctl/systemd-run commands instead of running them (tests).
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"
+LOG="${LOG:-$ACCTS/watch.log}"
+TIMER="account-watch.timer"
+THAW_UNIT="watch-thaw"           # transient systemd-run unit name (creates watch-thaw.timer)
+MAX_SECS=$((24*3600))            # hard ceiling — a "maintenance" freeze may not span days
+
+log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+run(){ if [ "${WATCH_FREEZE_DRY:-}" = 1 ]; then echo "DRY: $*"; else "$@"; fi; }
+
+dur_to_secs(){ local d="$1" n unit; n="${d%[smhd]}"; unit="${d##*[0-9]}"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  case "$unit" in s) echo "$n";; m) echo $((n*60));; h) echo $((n*3600));; d) echo $((n*86400));; *) return 1;; esac; }
+
+case "${1:-status}" in
+  thaw)
+    run systemctl --user stop "$THAW_UNIT.timer" 2>/dev/null || true
+    run systemctl --user start "$TIMER"
+    log "watch-freeze: THAWED (timer restarted; pending auto-thaw cancelled)"
+    echo "✓ account-watch.timer running again" ;;
+  status)
+    frozen=1
+    if systemctl --user is-active --quiet "$TIMER"; then echo "account-watch.timer: ACTIVE (not frozen)"; frozen=0
+    else echo "account-watch.timer: STOPPED (frozen)"; fi
+    if systemctl --user is-active --quiet "$THAW_UNIT.timer" 2>/dev/null; then
+      systemctl --user list-timers "$THAW_UNIT.timer" --no-pager 2>/dev/null | sed -n 2p
+    else
+      [ "$frozen" = 1 ] && echo "WARNING: frozen with NO scheduled thaw — run 'watch-freeze thaw' or freeze again with a duration"
+    fi
+    exit "$([ "$frozen" = 1 ] && echo 0 || echo 1)" ;;
+  *)
+    dur="$1"; shift || true; reason="${*:-maintenance}"
+    secs=$(dur_to_secs "$dur") || { echo "usage: watch-freeze <duration e.g. 45m|3h> [reason] | thaw | status" >&2; exit 2; }
+    [ "$secs" -le "$MAX_SECS" ] || { echo "refusing a freeze > 24h (got $dur) — that's an outage, not maintenance" >&2; exit 2; }
+    [ "$secs" -ge 60 ] || { echo "refusing a freeze < 60s — pointless (a tick is 5min)" >&2; exit 2; }
+    # order matters: schedule the guaranteed restart FIRST, then stop. If scheduling fails we have
+    # not touched the timer and the watchdog keeps running — never frozen without a thaw booked.
+    run systemctl --user stop "$THAW_UNIT.timer" 2>/dev/null || true   # replace any prior schedule
+    if ! run systemd-run --user --collect --quiet --unit="$THAW_UNIT" \
+         --on-active="${secs}s" systemctl --user start "$TIMER"; then
+      echo "could not schedule the auto-thaw — NOT freezing (watchdog left running)" >&2
+      log "watch-freeze: REFUSED — auto-thaw scheduling failed; timer left running"
+      exit 1
+    fi
+    run systemctl --user stop "$TIMER"
+    log "watch-freeze: FROZEN for $dur ($reason) — auto-thaw booked at $(date -u -d "+${secs} seconds" +%FT%TZ)"
+    echo "✓ account-watch frozen for $dur ($reason); auto-thaw booked — 'watch-freeze thaw' to end early" ;;
+esac

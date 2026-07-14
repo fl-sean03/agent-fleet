@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# runtime state — never commit a real fleet's knowledge or logs
+brain/state/
+brain/staged/
+brain/reviews/
+memory/*/
+!memory/README.md

@@ -1,0 +1,7 @@
+[Unit]
+Description=Autonomous Claude account failover watcher (probe + swap-fleet)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.agents/bin/account-watch

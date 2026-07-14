@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+d="${1:-$PWD}"
+if [ -z "${CLAUDE_CONFIG_DIR:-}" ]; then
+  export CLAUDE_CONFIG_DIR="$("$HOME/.agents/bin/account-profile" --active)"
+fi
+python3 - "$d" <<'PY'
+import json,os,sys
+d=os.path.abspath(sys.argv[1])
+cfg=os.environ["CLAUDE_CONFIG_DIR"]              # account-aware: trust in the named active profile
+f=os.path.join(cfg,".claude.json")
+try: c=json.load(open(f))
+except Exception: c={}
+c.setdefault("projects",{}).setdefault(d,{})
+c["projects"][d]["hasTrustDialogAccepted"]=True
+c["projects"][d]["hasCompletedProjectOnboarding"]=True
+json.dump(c,open(f,"w"),indent=2)
+PY

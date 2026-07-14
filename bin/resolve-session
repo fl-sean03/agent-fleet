@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# resolve-session <cwd> [projects_base]
+#
+# Print the session-id of the CANONICAL Claude conversation for <cwd> — defined as the
+# session with the MOST user turns (the largest real conversation), tiebroken by most-recent.
+# Empty output => no real conversation here yet => caller should start a fresh session.
+#
+# WHY turn-count, not mtime:  `claude --continue` resumes the newest session BY MTIME. That is
+# fragile — a fresh spin-up, or a harness that writes a 2-turn probe session (e.g. ws-gamma), leaves
+# a near-empty jsonl that can be newer than the real conversation and hijack --continue. Ranking by
+# user turns picks the substantive conversation regardless of which tiny shell was touched last.
+# (This is exactly the rule the operator asked for: "the one with the larger # of turns.")
+#
+# Session storage:  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl   where the dir name is the
+# absolute cwd with every non-alphanumeric char replaced by '-'.  Pass projects_base to point at a
+# confined workspace's isolated config dir instead of the host's ~/.claude.
+set -euo pipefail
+cwd="${1:-$PWD}"
+base="${2:-$HOME/.claude/projects}"
+enc=$(printf '%s' "$cwd" | sed 's#[^a-zA-Z0-9]#-#g')
+dir="$base/$enc"
+[ -d "$dir" ] || exit 0
+
+best=""; best_turns=-1; best_mtime=0
+for f in "$dir"/*.jsonl; do
+  [ -e "$f" ] || continue
+  turns=$(grep -cE '"type":"user"' "$f" 2>/dev/null || true); turns=${turns:-0}
+  [ "$turns" -eq 0 ] && continue                       # skip empty shells outright
+  mtime=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  if [ "$turns" -gt "$best_turns" ] || { [ "$turns" -eq "$best_turns" ] && [ "$mtime" -gt "$best_mtime" ]; }; then
+    best="$f"; best_turns="$turns"; best_mtime="$mtime"
+  fi
+done
+[ -n "$best" ] && basename "$best" .jsonl || true

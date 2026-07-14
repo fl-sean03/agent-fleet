@@ -1,0 +1,7 @@
+[Unit]
+Description=Claude session-guard — archive transcripts + flag stuck (100%-context) sessions
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.agents/bin/session-guard

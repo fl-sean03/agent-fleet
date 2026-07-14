@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# agentctl — the single control surface for persistent agent workspaces.
+#
+# PRIMARY CONSUMER IS AN AI AGENT (Claude / Claude Code sessions), not a human. Optimized for
+# AGENTIC operation:
+#   • ONE tool, descriptor-driven (~/.agents/projects/<name>.env). `agentctl` is just an alias.
+#   • Machine-readable state: `agentctl status --json` (never scrape `tmux capture-pane` by hand).
+#   • High-level commands that ENCAPSULATE the fragile manual rituals so an agent calls one thing:
+#       new      — create a project OR confined workspace, fully configured
+#       send     — deliver a prompt to the agent pane (bracketed paste; no manual send-keys)
+#       read     — return the agent pane output cleanly (no manual capture-pane/grep)
+#       login    — drive the confined workspace OAuth dance (begin → URL to relay; --code → finish + RC)
+#   • Robust-by-default: idempotent, fail-closed, RC always named by the launcher (never bare /rc),
+#     confined workspaces never touch a fleet-project credential, reboot honors AUTOSTART.
+# Operating manual (for agents): the `agent-workspaces` skill.
+set -euo pipefail
+A="$HOME/.agents"; P="$A/projects"; BIN="$A/bin"; CONFINED_ROOT="${FLEET_CONFINED_ROOT:-$HOME/confined}"; TPL="$CONFINED_ROOT/_template"
+mkdir -p "$P"
+sock(){ tmux start-server 2>/dev/null || true; }
+die(){ echo "agentctl: $*" >&2; exit 1; }
+have(){ tmux has-session -t "agent-$1" 2>/dev/null; }
+proctree(){ local p=$1; echo "$p"; local c; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }  # recursive PID tree
+
+load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspace '$PROJECT' (try: agentctl ls)"
+  ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""
+  # shellcheck disable=SC1090
+  source "$f"; SESSION="agent-$PROJECT"; [ -n "$ROOT" ] || die "$PROJECT: ROOT unset"
+  # auto-derive kind for legacy descriptors: anything rooted under $CONFINED_ROOT is a confined workspace
+  [ "$KIND" = project ] && case "$ROOT" in "$CONFINED_ROOT"/*) KIND=confined;; esac; }
+
+firstpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | head -1; }
+agentpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | sed -n 2p; }   # control=pane1, claude=pane2
+
+addpane(){ local a="$1"
+  [ "$a" = "claude" ] && [ "${SANDBOX:-}" = "bwrap" ] && a="claude-confined"
+  local envp="env REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' WS_NAME='$PROJECT' RESUME='${RESUME:-}' ACCOUNT='${ACCOUNT:-}' SESSION_ID='${SESSION_ID:-}' SSH='${SSH:-}' MODEL='${MODEL:-}'"
+  if [ -x "$BIN/run-$a" ]; then tmux split-window -t "$SESSION:main" -c "$ROOT" "exec $envp $BIN/run-$a"
+  else tmux split-window -t "$SESSION:main" -c "$ROOT" "exec bash"; fi
+}
+addssh(){ local t="$1"; tmux split-window -t "$SESSION:main" -c "$ROOT" \
+  "exec bash -lc 'echo \"→ ssh $t\"; ssh $t; echo; echo \"[ssh $t closed — shell. ssh $t to reconnect]\"; exec bash'"; }
+
+# ---- lifecycle -------------------------------------------------------------
+do_up(){ load "$1"; sock
+  if have "$1"; then echo "• $SESSION already up"; return 0; fi
+  mkdir -p "$ROOT"
+  tmux new-session -d -s "$SESSION" -n main -c "$ROOT"
+  local ctrl; ctrl="$(firstpane)"
+  tmux send-keys -t "$ctrl" "clear; echo '=== $PROJECT ($KIND) — $ROOT ==='; echo 'agent ops: agentctl send|read|status|attach $PROJECT'" C-m
+  for ag in $AGENTS; do addpane "$ag"; done
+  [ -n "$SSH" ] && addssh "$SSH"
+  tmux select-layout -t "$SESSION:main" tiled >/dev/null
+  tmux select-pane -t "$ctrl" 2>/dev/null || true
+  echo "✓ up: $SESSION  (kind:$KIND agents:$AGENTS${SANDBOX:+ sandbox:$SANDBOX}${REMOTE_CONTROL:+ rc:'${RC_NAME:-$PROJECT}'}${RESUME:+ resume:${RESUME:0:8}})"
+}
+
+# ---- agentic primitives ----------------------------------------------------
+# send = deliver text DIRECTLY into another agent's conversation as a submitted turn (the way a user
+# prompt is), so the recipient actually processes and acts on it — not a side-channel inbox to poll.
+# Just text — the recipient interprets it. fleet-msg submits it into the target's claude pane, records
+# it in the durable provenance store (messages.db + log.jsonl), and queues+flushes-on-resume if the
+# target is down. <to>: name | a,b | @all | @human (→ the operator via main). Body may be @file.
+do_send(){ local to="$1"; shift
+  [ -n "$to" ] || die "usage: agentctl send <name|@all|@human> <text|@file>"
+  local txt="$*"; [ -n "$txt" ] || die "nothing to send"
+  "$BIN/fleet-msg" send --to "$to" --from "${WS_NAME:-system}" "$txt"
+}
+do_read(){ load "$1"; have "$1" || die "$1 not up"; local n="${2:-40}"
+  tmux capture-pane -p -J -t "$(agentpane)" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n "$n"
+}
+
+# ---- status (human + --json) ----------------------------------------------
+ws_state(){ # echoes: up panes rc_active model auth   for $SESSION (must be loaded)
+  if ! have "$PROJECT"; then echo "down 0 - - -"; return; fi
+  local np body rc model auth
+  np=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
+  body=$(tmux capture-pane -p -J -t "$(agentpane)" 2>/dev/null || true)
+  # RC indicator: the CLI footer shows a bare "/rc" when Remote Control is live (older builds said
+  # "/rc active"; the launch banner says "/remote-control is active") — match all three (drift fix 2026-07-04)
+  echo "$body" | grep -qE '(^|[[:space:]])/rc([[:space:]]|$)|/rc active|/remote-control is active' && rc=yes || rc=no
+  # model TRUTH = the live claude process's --model arg (matched by this workspace's SESSION_ID);
+  # pane-text scrape is only a fallback — scrollback lies (stale "Opus 4.8" strings caused false
+  # model readings fleet-wide, 2026-07-09)
+  model=""
+  if [ -n "${SESSION_ID:-}" ]; then
+    model=$(ps -eo args 2>/dev/null | grep -F -- "$SESSION_ID" | grep -v grep \
+            | sed -n 's/.*--model  *\([^ ]*\).*/\1/p' | head -1)
+    [ -n "$model" ] && model=$(printf '%s' "$model" | sed 's/^claude-//' | tr '-' '_')
+  fi
+  [ -n "$model" ] || model=$(echo "$body" | grep -oiE '(Fable|Opus|Sonnet|Haiku) [0-9]+(\.[0-9]+)?' | head -1 | tr ' ' '_'); model=${model:-?}
+  auth=$(echo "$body" | grep -oiE 'Claude Max|Claude API|Claude Pro' | head -1 | tr ' ' '_'); auth=${auth:-?}
+  echo "up $np $rc $model $auth"
+}
+do_status(){ sock
+  local json="${1:-}"
+  if [ "$json" = "--json" ]; then
+    local first=1; echo "["
+    for f in "$P"/*.env; do [ -e "$f" ] || continue; local n; n=$(basename "${f%.env}")
+      load "$n"; read -r up panes rc model auth <<<"$(ws_state)"
+      [ $first -eq 1 ] && first=0 || echo ","
+      python3 - "$n" "$KIND" "$ROOT" "$up" "$panes" "${SANDBOX:-none}" "${REMOTE_CONTROL:-off}" "${RC_NAME:-}" "$rc" "$model" "$auth" "${AUTOSTART:-yes}" "${RESUME:-}" <<'PY'
+import json,sys
+k=["name","kind","root","status","panes","sandbox","rc_enabled","rc_name","rc_active","model","auth","autostart","resume"]
+v=sys.argv[1:]; v[4]=int(v[4]) if v[4].isdigit() else v[4]
+sys.stdout.write(json.dumps(dict(zip(k,v))))
+PY
+    done; echo; echo "]"
+  else
+    printf "%-18s %-7s %-6s %-7s %-4s %-9s %-10s %s\n" WORKSPACE KIND STATUS PANES RC MODEL AUTH ROOT
+    for f in "$P"/*.env; do [ -e "$f" ] || continue; local n; n=$(basename "${f%.env}")
+      load "$n"; read -r up panes rc model auth <<<"$(ws_state)"
+      printf "%-18s %-7s %-6s %-7s %-4s %-9s %-10s %s\n" "$n" "$KIND" "$up" "$panes" "$rc" "$model" "$auth" "$ROOT"
+    done
+  fi
+}
+
+# ---- new (project OR confined workspace) -------------------------------------
+do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0
+  name="$1"; shift || true
+  while [ $# -gt 0 ]; do case "$1" in
+    --confined) confined=1; full="${2:-}"; shift 2;;
+    --root) root="${2:-}"; shift 2;;
+    --rc) rc="${2:-}"; shift 2;;
+    --no-rc) norc=1; shift;;
+    --up) up=1; shift;;
+    *) die "new: unknown arg '$1'";; esac; done
+  [ -n "$name" ] || die "usage: agentctl new <name> [--confined \"Full Name\"] [--root PATH] [--rc NAME|--no-rc] [--up]"
+  case "$name" in _*|*/*|*' '*) die "bad name '$name'";; esac
+  [ -f "$P/$name.env" ] && die "workspace '$name' already exists"
+  local kind=project sandbox="" remote=on rcname
+  if [ $confined -eq 1 ]; then
+    kind=confined; sandbox=bwrap; root="$CONFINED_ROOT/$name"
+    [ -d "$root" ] && die "$root already exists"
+    [ -d "$TPL" ] || die "confined workspace template missing ($TPL)"
+    cp -a "$TPL" "$root"
+    local date; date=$(date -u +%Y-%m-%d)
+    sed -i "s/{{WS_FULL_NAME}}/${full//\//\\/}/g; s/{{WS}}/$name/g; s/{{DATE}}/$date/g" "$root/WORKSPACE.md" "$root/AGENTS.md" 2>/dev/null || true
+    # git-init the workspace so its work is versioned. Best-effort: a machine with no git identity
+    # configured must not fail workspace creation (it did — "Author identity unknown" killed `new`).
+    ( cd "$root" && git init -q 2>/dev/null && git add -A 2>/dev/null \
+        && git -c user.name="agent-fleet" -c user.email="agent-fleet@localhost" \
+               commit -qm "scaffold confined workspace: $name" 2>/dev/null ) \
+      || echo "  (note: git scaffold commit skipped — configure git user.name/user.email to version this workspace)"
+    rcname="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]') Workspace"
+    "$BIN/confined-cfg-sync" "$name" >/dev/null 2>&1 || true
+  else
+    [ -n "$root" ] || die "project needs --root PATH"
+    case "$root" in '~'*) root="$HOME${root#\~}";; esac
+    rcname="$(printf '%s' "$name" | sed 's/-/ /g; s/.*/\u&/') Workspace"
+  fi
+  [ -n "$rc" ] && rcname="$rc"
+  [ $norc -eq 1 ] && remote=""
+  { echo "# $kind workspace — created $(date -u +%Y-%m-%d) by agentctl new"
+    echo "KIND=\"$kind\""
+    echo "ROOT=\"${root/#$HOME/\$HOME}\""
+    echo "AGENTS=\"claude\""
+    # NEW-AGENT DEFAULT (the operator 2026-07-10): pin Opus 4.8 so a new workspace never lands on Fable.
+    # Explicit descriptor pin (not the account default) so it survives every relaunch/swap. To change
+    # a workspace's model later, edit MODEL= in its ~/.agents/projects/<name>.env and relaunch.
+    echo "MODEL=\"claude-opus-4-8\""
+    [ -n "$sandbox" ] && echo "SANDBOX=\"$sandbox\""
+    [ -n "$remote" ] && { echo "REMOTE_CONTROL=\"on\""; echo "RC_NAME=\"$rcname\""; }
+    # Assign a FIXED session id now. run-claude creates the session with this id on first launch and
+    # resumes that exact id forever after — across restarts, reboots, and account switches (one
+    # deterministic conversation per workspace; never a fresh/stale session).
+    echo "SESSION_ID=\"$(cat /proc/sys/kernel/random/uuid)\""
+  } > "$P/$name.env"
+  echo "✓ created $kind '$name' → $root"
+  [ $confined -eq 1 ] && echo "  workspace is CONFINED (bwrap) — needs one login: agentctl login $name"
+  [ -n "$remote" ] && echo "  RC name: \"$rcname\" (auto-registered on first connect — never run /rc manually)"
+  [ $up -eq 1 ] && do_up "$name"
+}
+
+# ---- confined workspace identity bookkeeping -------------------------------------------
+confined_login_label(){ # <confined workspace> → matching named rotation label for its just-completed OAuth login
+  local ws="$1" cfg="$A/confined-cfg/$1" email label pemail matched=""
+  email=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$cfg/.claude.json" 2>/dev/null || true)
+  [ -n "$email" ] || return 1
+  while IFS= read -r label; do
+    [ -n "$label" ] && [ "${label:0:1}" != "#" ] || continue
+    pemail=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$A/accounts/$label/.claude.json" 2>/dev/null || true)
+    [ "$email" = "$pemail" ] || continue
+    [ -z "$matched" ] || { echo "multiple rotation profiles match confined-workspace login '$email'" >&2; return 1; }
+    matched="$label"
+  done < "$A/accounts/.rotation"
+  [ -n "$matched" ] || return 1
+  printf '%s\n' "$matched"
+}
+
+record_confined_login(){ # <confined workspace> — atomically refresh its label + target-account credential stash
+  local ws="$1" cfg="$A/confined-cfg/$1" label stash tmp mark
+  label="$(confined_login_label "$ws")" || die "$ws login completed but does not match a named rotation profile"
+  stash="$cfg/.credentials.$label.json"; tmp="$stash.tmp.$$"; mark="$cfg/.account.tmp.$$"
+  cp -f "$cfg/.credentials.json" "$tmp" || die "could not stage $ws credential stash"
+  chmod 600 "$tmp"; mv -f "$tmp" "$stash"
+  printf '%s\n' "$label" > "$mark"; mv -f "$mark" "$cfg/.account"
+  echo "✓ $ws OAuth mapped to named account '$label'; marker and rotation stash refreshed"
+}
+
+# ---- login (drive confined workspace OAuth; encapsulates the manual dance) ------------
+do_login(){ load "$1"; local code=""; [ "${2:-}" = "--code" ] && code="${3:-}"
+  have "$1" || do_up "$1" >/dev/null; sleep 6
+  local pane; pane="$(agentpane)"
+  if [ -z "$code" ]; then
+    tmux send-keys -t "$pane" "/login"; sleep 1; tmux send-keys -t "$pane" Enter; sleep 6
+    tmux send-keys -t "$pane" Enter; sleep 7                 # select option 1 (Claude subscription)
+    local url; url=$(tmux capture-pane -p -J -t "$pane" | grep -oE 'https://claude\.com/cai/oauth/authorize\S+' | head -1)
+    [ -n "$url" ] || die "login URL not found (pane state: $(tmux capture-pane -p -t "$pane" | tail -2))"
+    echo "RELAY THIS URL TO THE HUMAN (only they can authorize):"; echo "$url"
+    echo "then: agentctl login $1 --code <CODE>"
+  else
+    printf '%s' "$code" | tmux load-buffer -b actl-code -; tmux paste-buffer -p -b actl-code -t "$pane"
+    tmux delete-buffer -b actl-code 2>/dev/null || true; sleep 1; tmux send-keys -t "$pane" Enter; sleep 9
+    tmux send-keys -t "$pane" Enter; sleep 3                 # dismiss "press enter to continue"
+    if [ -f "$HOME/.agents/confined-cfg/$1/.credentials.json" ]; then
+      record_confined_login "$1"
+      echo "✓ logged in; restarting so RC registers with the correct name…"
+      do_down "$1" >/dev/null 2>&1; rm -f "$HOME/.agents/confined-cfg/$1/sessions/"*.json 2>/dev/null || true; do_up "$1" >/dev/null
+      sleep 8; echo "✓ $1 ready: $(do_read "$1" 1 2>/dev/null | tail -1)"
+    else die "login did not complete (no credential saved) — re-run agentctl login $1"; fi
+  fi
+}
+
+do_down(){ load "$1"
+  # GRACEFUL stop: Claude Code buffers its transcript and only flushes at turn boundaries, with NO
+  # flush on SIGHUP (what 'tmux kill-session' sends) — so a hard kill mid-turn drops unsaved history
+  # (anthropics/claude-code #29096). Interrupt the active turn (Esc) and wait for it to settle at a
+  # writable boundary, THEN kill. Best-effort: a turn blocked on a long subagent still can't fully flush.
+  if ! have "$1"; then echo "$SESSION not running"; return 0; fi
+  local p; p="$(agentpane 2>/dev/null || true)"
+  if [ -n "$p" ]; then
+    tmux send-keys -t "$p" Escape 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      tmux capture-pane -p -t "$p" 2>/dev/null | grep -qiE 'esc to interrupt|Compacting|Combobulat|Whisking|✻|✽|✢' || break
+      sleep 1
+    done
+  fi
+  # Capture each pane's FULL process tree, kill the session, then SIGKILL any survivor. claude re-execs a
+  # shell on exit (run-claude) and can outlive `tmux kill-session`, orphaning a writer that keeps
+  # appending its session jsonl — which is what caused the split-brain / divergent-copy bug.
+  local pids all="" pp; pids=$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null || true)
+  for pp in $pids; do all="$all $(proctree "$pp")"; done
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  for pp in $all; do kill "$pp" 2>/dev/null || true; done; sleep 1
+  for pp in $all; do kill -9 "$pp" 2>/dev/null || true; done
+  echo "✓ down: $SESSION (graceful; terminated $(echo $all | wc -w) procs)"; }
+
+if [ "${AGENTCTL_TEST:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+case "${1:-help}" in
+  up)        n="${2:-}"; [ -n "$n" ] || die "usage: agentctl up <name>"
+             if [ ! -f "$P/$n.env" ]; then    # a retired workspace? bring it back automatically, then start
+               src="$(ls -t "$A"/attic/retired-descriptors/"$n".env.retired-* 2>/dev/null | head -1)"
+               [ -n "$src" ] && { mv "$src" "$P/$n.env"; echo "↺ restored retired workspace $n"; }
+             fi
+             do_up "$n" ;;
+  down)      n="${2:-}"; [ -n "$n" ] || die "usage: agentctl down <name>"
+             do_down "$n"                          # down IS retire: stop + archive the descriptor
+             mkdir -p "$A/attic/retired-descriptors"
+             [ -f "$P/$n.env" ] && mv "$P/$n.env" "$A/attic/retired-descriptors/$n.env.retired-$(date -u +%Y-%m-%d)"
+             echo "  ✓ $n retired (stopped + delisted, no autostart). bring back: agentctl up $n — resumes the SAME session" ;;
+  stop)      n="${2:-}"; [ -n "$n" ] || die "usage: agentctl stop <name>"; do_down "$n" ;;   # TRANSIENT stop (keep descriptor listed); plumbing for swap/idle — not the user verb
+  attach)    load "$2"; exec tmux attach -t "$SESSION" ;;
+  new)       shift; do_new "$@" ;;
+  send)      shift; do_send "$@" ;;
+  read)      do_read "$2" "${3:-40}" ;;
+  # --- inter-agent messaging (spec: docs/MESSAGING.md) ------------------------------------
+  # `send` (above) delivers text DIRECTLY into the recipient's conversation as a submitted turn.
+  # `flush` redelivers messages queued while an agent was down (called on resume). `msglog` queries
+  # the durable provenance store (messages.db + log.jsonl).
+  flush)     shift; exec "$BIN/fleet-msg" flush "$@" ;;
+  kick)      shift; exec "$BIN/fleet-msg" kick "$@" ;;   # submit an agent's stranded/unsubmitted input
+  msglog)    shift; exec "$BIN/fleet-msg" log "$@" ;;
+  login)     shift; do_login "$@" ;;
+  status|ls) do_status "${2:-}" ;;
+  up-all)    for f in "$P"/*.env; do [ -e "$f" ] || continue; grep -q '^AUTOSTART="no"' "$f" && continue; do_up "$(basename "${f%.env}")"; done ;;
+  down-all)  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-'); do tmux kill-session -t "$s"; echo "down: $s"; done ;;
+  add)       load "$2"; have "$2" || die "$2 not up"; a="${3:-claude}"
+             if [ "$a" = shell ]; then tmux split-window -t "$SESSION:main" -c "$ROOT" "exec bash"
+             elif [ "$a" = ssh ]; then [ -n "$SSH" ] || die "no SSH= in $2"; addssh "$SSH"
+             else addpane "$a"; fi; tmux select-layout -t "$SESSION:main" tiled >/dev/null; echo "✓ added $a to $2" ;;
+  projects)  ls "$P" 2>/dev/null | sed 's/\.env$//' ;;
+  accounts)  shift; exec "$BIN/account-status" "$@" ;;   # who is on which Claude account (--probe = live cap check)
+  idle)      shift; exec "$BIN/idle-down" "$@" ;;         # spin down workspaces idle >=N days ([--days N] [--dry])
+  help|*)    cat <<'H'
+agentctl — persistent agent workspaces (one tool; agent-first)
+  LIFECYCLE   up <n>                  bring up (auto-restores a retired one) — always resumes the SAME session
+              down <n>                retire: stop + archive descriptor (delist, no autostart)
+              attach <n> · up-all · down-all · stop <n> (transient stop, stays listed — plumbing for swap/idle)
+              idle [--days N] [--dry]   spin down workspaces with no user turn in N days (auto: daily timer)
+  CREATE      new <n> --root PATH [--rc NAME|--no-rc] [--up]          (project, fleet-active account)
+              new <n> --confined "Full Name" [--up]                     (CONFINED; then: login)
+  OPERATE     send <to> <text|@file>    message an agent — delivered INTO its conversation as a turn
+                                        (<to>: name | a,b | @all | @human)
+              msglog [N] [--from|--to|--since]   query the durable message store (messages.db)
+              flush [<n>]               redeliver messages queued while <n> was down (on resume)
+              read <n> [lines]          return agent pane output (default 40)
+              status [--json] | ls      fleet state (use --json from agents)
+              add  <n> [claude|shell|ssh]
+  AUTH        login <n>                 begin confined workspace OAuth → prints URL to relay
+              login <n> --code <CODE>   finish login + restart so RC registers named
+  ACCOUNTS    accounts [--probe]        who is on which Claude account (live truth)
+              (swap: ~/.agents/bin/swap-fleet <acct> · swap-account <ws> <acct>
+               watchdog auto-failover: account-watch.timer (OPT-IN — see docs/ACCOUNTS.md; no hold file)
+               maintenance quiet: watch-freeze <dur> — visible timer stop + guaranteed auto-thaw
+               work-tempo hold: fleet-hold on|off|status — gates nudges + agent tempo, NEVER rotation)
+Descriptors: ~/.agents/projects/<name>.env  ·  manual: the `agent-workspaces` skill
+H
+    ;;
+esac

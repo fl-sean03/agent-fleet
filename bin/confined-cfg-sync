@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# confined-cfg-sync <confined workspace> — build/refresh an ISOLATED Claude config dir for a confined workspace agent.
+# Holds only a stripped .claude.json (NO projects map → the agent can't see any other confined workspace's
+# name/path; /work is pre-trusted) + the self-install symlink. It does NOT copy a fleet profile's
+# login credential — auth comes from a DEDICATED long-lived token per confined workspace (claude setup-token), set via
+# `agentctl login <confined workspace> <TOKEN>` and injected as CLAUDE_CODE_OAUTH_TOKEN by run-claude-confined.
+# Copying a rotating project credential into a confined workspace config is what caused prior lockouts — never again.
+set -euo pipefail
+WS="${1:?usage: confined-cfg-sync <confined workspace>}"
+base="$HOME/.agents/confined-cfg"; CFG="$base/$WS"
+mkdir -p "$CFG"; chmod 700 "$base" "$CFG"
+SOURCE_CFG="$("$HOME/.agents/bin/account-profile" --active)" || exit 1
+python3 - "$SOURCE_CFG/.claude.json" "$CFG/.claude.json" <<'PY'
+import json,os,sys
+src=json.load(open(sys.argv[1]))
+# carry over ALL flags/account-meta (so no first-run prompts), DROP only the sensitive bits:
+out=dict(src)
+out.pop("mcpServers", None)        # may hold MCP server tokens — don't leak into the sandbox
+out.pop("githubRepoPaths", None)   # host paths
+out["bypassPermissionsModeAccepted"]=True       # sandbox IS the wall → no in-app prompt needed
+# replace the projects map: ONLY /work is visible+trusted; no other confined workspace path/name leaks in
+out["projects"]={"/work":{"hasTrustDialogAccepted":True,"hasCompletedProjectOnboarding":True,
+                          "hasCompletedProjectOnboardingForClaudeMd":True}}
+json.dump(out,open(sys.argv[2],"w"),indent=2)
+PY
+chmod 600 "$CFG/.claude.json"
+# satisfy claude's self-install check inside the sandbox (HOME=/config → /config/.local/bin/claude)
+mkdir -p "$CFG/.local/bin"; ln -sfn /opt/claude-bin "$CFG/.local/bin/claude"
+if [ -s "$CFG/oauth-token" ]; then echo "✓ isolated config ready: $CFG  (dedicated token present)"
+else echo "✓ isolated config ready: $CFG  — ⚠ no token yet: agentctl login <name>"; fi

@@ -1,0 +1,555 @@
+#!/usr/bin/env bash
+# account-watch — AUTONOMOUS account failover + usage-optimized proactive rotation (the operator, 2026-07-10).
+# Detects when the ACTIVE Claude account is capped (probe backstop) OR approaching its caps (OAuth usage
+# endpoint via bin/account-usage) and, if an eligible target exists, hands off to `swap-fleet` to migrate
+# the fleet (ordered + verified + nudged). If NO account is eligible it HOLDS in place (never bounces onto
+# another capped account) and alerts main (throttled 1/hr). Run every few minutes by account-watch.timer
+# (systemd user), OUTSIDE any tmux pane, so it survives the bounce a swap triggers. account-watch owns
+# only WHEN + WHICH target; `swap-fleet` owns the HOW (see that script).
+#
+# ROTATION POLICY (docs/ACCOUNTS.md):
+#   trigger  : active five_hour >= 90% OR seven_day >= 95% (2 consecutive ticks), OR hard-cap probe
+#              (existing CAP_RE backstop, also 2 ticks; hard-cap OVERRIDES the dwell guard).
+#   dwell    : no proactive (usage-triggered) rotation within 30 min of the last swap (.active mtime).
+#   eligible : credential exists AND 5h<90 AND 7d<95 AND (improvement guard) target <= active - 20 pts
+#              ON THE TRIGGERING AXIS — a 5h trigger compares 5h, a 7d trigger compares 7d. Guarding a
+#              7d trigger on 5h made the 95%-7d trigger inert whenever the active 5h was low (active
+#              7d=95/5h=1 → every target needed 5h <= -19, impossible; fleet stranded with two idle
+#              targets, main hand-swapped, 2026-07-12). Under a hard cap the guard is waived entirely.
+#   per-model: accounts can be per-model capped (Fable weekly_scoped) while 5h/7d read healthy. When
+#              any ROTATING workspace's MODEL diverges to Fable (descriptor MODEL=claude-fable-5;
+#              example-confined/ws-arc 2026-07-13), prefer targets that are Fable-healthy (usage fable% < 99 and no
+#              fresh marker); if every target is Fable-blocked the fleet still moves and swap-fleet
+#              LEAVES the Fable-pinned workspaces on their current account (its per-model gate).
+#   choose   : soonest five_hour resets_at; tie-break soonest seven_day resets_at (tokens burned on the
+#              soonest-resetting account come back first — drain it before its reset).
+#   pre-flight: probe the chosen target (claude -p) before swapping — endpoint says eligible, probe confirms.
+#   scope    : proactive rotation is projects+main only (swap-fleet --confined-optin); confined workspaces have separate
+#              login lineages and only move on a hard cap (swap-fleet's per-confined-workspace credential rule).
+#              Remote/own-auth workspaces excluded by swap-fleet as today.
+#   degraded : usage endpoint unavailable for the ACTIVE account -> probe-only legacy behavior that tick.
+#   no target: hold in place, log loudly, alert main via agentctl send (throttle: 1/hr, .watch-alert-ts).
+#
+# Debounce is scoped to the active account (.watch-state = "<acct> <capcnt> <usagecnt>").
+# Rotation chain: ~/.agents/accounts/.rotation. No hold/freeze mechanism (removed 2026-07-10):
+# maintenance = stop the timer unit, visibly.
+# Revert to primary is manual: `swap-fleet account-a` (or the dormant .return-after branch below).
+#
+# Probe detail: health probes run on Opus 4.8 explicitly (--model), NOT the account default — probing the
+# default (or scraping panes) matched the Fable wall and flapped the fleet (2026-07-06 bug).
+#
+# TESTING: decision logic lives in aw_* functions below. `WATCH_TEST=1 source account-watch` loads ONLY
+# the functions/vars (no side effects) — tests/test-rotation.sh drives them against account-usage --mock.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"   # agentctl et al. — robust under any systemd/env caller
+A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"
+ROT="${ROT:-$ACCTS/.rotation}"; ACTIVE_F="${ACTIVE_F:-$ACCTS/.active}"; STATE="${STATE:-$ACCTS/.watch-state}"
+LOG="${LOG:-$ACCTS/watch.log}"
+ALERT_TS="${ALERT_TS:-$ACCTS/.watch-alert-ts}"   # last no-eligible-target alert (epoch) — 1/hr throttle
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ACCOUNT_USAGE="${ACCOUNT_USAGE:-$SELF_DIR/account-usage}"
+ACCOUNT_PROFILE="${ACCOUNT_PROFILE:-$SELF_DIR/account-profile}"
+ACCOUNT_REFRESH="${ACCOUNT_REFRESH:-$SELF_DIR/account-refresh}"   # 401 self-heal (env-overridable for tests)
+PROBE_MODEL="opus"   # auth-health probes stay on Opus: cheap, and never blocked by the Fable MODEL cap
+FABLE_MODEL="claude-fable-5"   # pre-flight model-availability probe (fable-cap machinery, 2026-07-10)
+# The FLEET's model decides whether a Fable MODEL-cap matters for ROTATION. The fable-cap machinery
+# (2026-07-10) assumed a Fable fleet; the fleet is OPUS since 2026-07-11 (only example-confined=Fable, handled
+# separately + opted out of rotation). For an Opus fleet, .fable-cap.* markers must NOT block rotation
+# — Opus works on every account, so an account that is merely Fable-dead (e.g. marked by example-confined's Fable
+# use) is still a perfectly good Opus target. This was the 2026-07-11 bug: stale account-a/account-b
+# markers stranded the Opus fleet on a 94%-5h account while refusing two 0%-5h Opus-healthy accounts.
+# Read from accounts/.fleet-model (default opus-4-8); set it to claude-fable-5 to re-arm Fable gating.
+FLEET_MODEL="$(cat "$ACCTS/.fleet-model" 2>/dev/null || echo claude-opus-4-8)"
+CAP_RE='usage limit|rate limit|reached your|limit reached|quota (exceeded|reached)|out of (usage|tokens)'
+TRIG_5H="${TRIG_5H:-90}"; TRIG_7D="${TRIG_7D:-95}"     # trigger thresholds (also eligibility ceilings)
+IMPROVE_PTS="${IMPROVE_PTS:-20}"                        # target 5h must be >= this many points below active
+DWELL_SECS="${DWELL_SECS:-1800}"                        # min dwell after any swap before proactive rotation
+ALERT_SECS="${ALERT_SECS:-3600}"                        # no-eligible-target alert throttle
+# Deadline-aware backoff (the operator, 2026-07-10): in the NO-ELIGIBLE state nothing can change until a
+# known reset, so skip ticks until the earliest reset across all accounts — but never longer than a
+# slow safety floor, so an EARLY free (manual /login, benchmark finishing, .active changed, a 5h
+# window rolling) is still caught. This is a POLL-CADENCE backoff, NOT the removed maintenance freeze.
+SAFETY_POLL_SECS="${SAFETY_POLL_SECS:-1800}"            # max skip while holding (30 min) — the floor
+BACKOFF_MARGIN="${BACKOFF_MARGIN:-60}"                  # recheck this many secs AFTER a reset (let it land)
+BACKOFF_F="${BACKOFF_F:-$ACCTS/.watch-backoff}"         # "<active-acct> <deadline-epoch>"
+log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+# probe <config-dir> → echo `claude -p` output, explicitly on Opus (--model), NOT the account default.
+# `--no-session-persistence` means NO session jsonl is created at all, so health-probes can never litter a
+# session store (the bug that flooded ~/.claude/projects/-home-operator with hundreds of "reply ok" sessions).
+probe(){ local o; o=$(cd /tmp && CLAUDE_CONFIG_DIR="$1" timeout 90 claude -p "reply with: ok" --model "$PROBE_MODEL" --no-session-persistence 2>&1 </dev/null || true); printf '%s' "$o"; }
+# fable_probe <config-dir> — same, on Fable 5. Used ONLY pre-failover (not every tick: a per-tick
+# Fable call would spend the very budget being protected). Fable enforces a PER-MODEL cap invisible
+# to the usage endpoint (72%/5h accounts walling "reached your Fable 5 limit", 2026-07-10).
+fable_probe(){ local o; o=$(cd /tmp && CLAUDE_CONFIG_DIR="$1" timeout 90 claude -p "reply with: ok" --model "$FABLE_MODEL" --no-session-persistence 2>&1 </dev/null || true); printf '%s' "$o"; }
+
+# =========================================================================
+# aw_* decision functions — pure(ish), sourceable under WATCH_TEST=1
+# =========================================================================
+# Account labels resolve only through the configured named-profile allow-list.
+aw_cfg_of(){ "$ACCOUNT_PROFILE" "$1"; }
+aw_cred_exists(){ [ -f "$(aw_cfg_of "$1")/.credentials.json" ]; }
+
+# aw_fable_capped <label> → rc 0 while a FRESH fable-cap marker exists ($ACCTS/.fable-cap.<label>,
+# content = expiry epoch; written by bin/fable-cap-mark from whichever component hit the wall —
+# agentcall, example-confined-nightly, or our own pre-flight). Expired/garbled markers are removed on read.
+# This is how the MODEL-specific Fable cap (invisible to the usage endpoint) reaches rotation.
+aw_fable_capped(){
+  local f="$ACCTS/.fable-cap.$1" exp
+  [ -f "$f" ] || return 1
+  exp=$(head -1 "$f" 2>/dev/null | tr -cd '0-9')
+  if [ -z "$exp" ] || [ "$(date +%s)" -ge "$exp" ]; then rm -f "$f"; return 1; fi
+  return 0
+}
+
+# fable_cap_relevant <label> → rc 0 only when a Fable-cap on <label> should affect ROTATION: i.e. the
+# FLEET runs Fable AND <label> is fable-capped. On an Opus fleet this is always false, so Fable
+# markers never block/trigger rotation (Opus works everywhere). The single gate for all cap logic.
+fable_cap_relevant(){ [ "$FLEET_MODEL" = "claude-fable-5" ] && aw_fable_capped "$1"; }
+
+# Per-label usage tables, filled by aw_load_usage from account-usage --json (JSONL on stdin):
+#   U5/U7 = utilization %, R5/R7 = resets_at ISO, R5E/R7E = resets_at epoch (sort keys)
+#   FU/FRE = per-model Fable weekly cap utilization % / reset epoch ("" when the account has none —
+#            the additive "fable" field, incident 2026-07-12: example-confined stranded on a Fable-capped account)
+#   UERR = error msg
+declare -A U5 U7 R5 R7 R5E R7E FU FRE UERR
+aw_load_usage(){
+  local label f5 r5 r5e f7 r7 r7e fu fre err
+  U5=(); U7=(); R5=(); R7=(); R5E=(); R7E=(); FU=(); FRE=(); UERR=()
+  # \x1f (unit separator) delimits: unlike tab it is not IFS-whitespace, so EMPTY fields survive.
+  while IFS=$'\x1f' read -r label f5 r5 r5e f7 r7 r7e fu fre err; do
+    [ -n "$label" ] || continue
+    if [ -n "$err" ]; then UERR[$label]="$err"; continue; fi
+    U5[$label]="$f5"; R5[$label]="$r5"; R5E[$label]="$r5e"
+    U7[$label]="$f7"; R7[$label]="$r7"; R7E[$label]="$r7e"
+    FU[$label]="$fu"; FRE[$label]="$fre"
+  done < <(python3 -c '
+import json, sys
+from datetime import datetime, timezone
+def epoch(iso):
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except Exception: return 9999999999
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: r = json.loads(line)
+    except Exception: continue
+    lbl = r.get("label", "?")
+    US = "\x1f"
+    if "error" in r:
+        print(US.join([lbl, "", "", "", "", "", "", "", "", str(r["error"]).replace(US, " ") or "error"])); continue
+    f, s = r["five_hour"], r["seven_day"]
+    # additive per-model Fable cap: absent/null (older mocks, capless accounts) -> empty fields
+    fb = r.get("fable") or {}
+    fu = fb.get("utilization"); fre = fb.get("resets_at")
+    # resets_at is JSON null for a FRESH account (0%, no window open) — join() on None killed the
+    # whole snapshot and silently disabled proactive rotation (2026-07-10 10:5x incident). Empty
+    # string parses fine; epoch(None) already falls back to far-future (fresh accounts sort last).
+    print(US.join([lbl, str(f["utilization"]), f["resets_at"] or "", str(epoch(f["resets_at"])),
+                   str(s["utilization"]), s["resets_at"] or "", str(epoch(s["resets_at"])),
+                   "" if fu is None else str(fu), "" if fre is None else str(epoch(fre)), ""]))
+')
+}
+
+aw_ge(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }   # float >=
+aw_lt(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a<b)}'; }    # float <
+
+# aw_trigger_reason <label> → echo reason ("5h=92.0%>=90" / "7d=96.0%>=95") if over a threshold.
+# rc: 0 = triggered, 1 = under thresholds, 2 = usage unknown (endpoint error / no data).
+aw_trigger_reason(){
+  local l="$1"
+  [ -n "${U5[$l]:-}" ] || return 2
+  if aw_ge "${U5[$l]}" "$TRIG_5H"; then echo "5h=${U5[$l]}%>=$TRIG_5H"; return 0; fi
+  if aw_ge "${U7[$l]}" "$TRIG_7D"; then echo "7d=${U7[$l]}%>=$TRIG_7D"; return 0; fi
+  return 1
+}
+
+# aw_eligible <label> <active_util> [guard01=1] [axis=5h|7d] → rc 0 if label can be a rotation target.
+# eligible = usage known + credential exists + 5h<90 + 7d<95 + (when guard=1) improvement guard ON THE
+# TRIGGERING AXIS: target's <axis> utilization <= active_util - IMPROVE_PTS — never trade 91% for 88%.
+# <active_util> must be the ACTIVE account's utilization on that same axis. Guarding a 7d trigger on
+# the 5h axis made the 7d trigger inert whenever the active 5h was low (7d=95/5h=1 → target needed
+# 5h <= -19, impossible — fleet stranded with two idle targets, 2026-07-12). The guard is WAIVED
+# (guard=0) on a hard cap: the active account is unusable, so any under-threshold target beats
+# staying; requiring a 20-pt drop there could strand the fleet on a dead account.
+aw_eligible(){
+  local l="$1" active_util="$2" guard="${3:-1}" axis="${4:-5h}"
+  [ -n "${U5[$l]:-}" ] || return 1
+  aw_cred_exists "$l" || return 1
+  fable_cap_relevant "$l" && return 1   # Fable-dead AND fleet uses Fable → ineligible (Opus fleet: ignored)
+  aw_lt "${U5[$l]}" "$TRIG_5H" || return 1
+  aw_lt "${U7[$l]}" "$TRIG_7D" || return 1
+  if [ "$guard" = 1 ]; then
+    local tu="${U5[$l]}"
+    [ "$axis" = 7d ] && tu="${U7[$l]}"
+    awk -v t="$tu" -v a="$active_util" -v p="$IMPROVE_PTS" 'BEGIN{exit !(t <= a-p)}' || return 1
+  fi
+  return 0
+}
+
+# aw_select_targets <active_util> <guard01> <axis> <cand>... → echo ELIGIBLE candidates, best first:
+# primary sort soonest five_hour resets_at, tie-break soonest seven_day resets_at. <axis> is the
+# triggering axis (5h|7d) — validated loudly so a stale 2-arg caller can't silently eat a candidate.
+aw_select_targets(){
+  local active_util="$1" guard="$2" axis="$3"; shift 3
+  case "$axis" in 5h|7d) ;; *) echo "aw_select_targets: bad axis '$axis' (5h|7d)" >&2; return 2 ;; esac
+  local c l
+  for c in "$@"; do
+    l="$c"
+    aw_eligible "$l" "$active_util" "$guard" "$axis" || continue
+    printf '%s %s %s\n' "${R5E[$l]}" "${R7E[$l]}" "$l"
+  done | sort -n -k1,1 -k2,2 | awk '{print $3}'
+}
+
+# aw_fable_blocked <label> → rc 0 when <label> cannot serve Fable right now, from EITHER signal:
+# a fresh event-driven .fable-cap marker OR the usage endpoint's per-model fable utilization >=
+# FABLE_BLOCK_PCT (default 99). The two are complementary: markers catch walls the endpoint hasn't
+# reflected yet; the endpoint catches caps nothing has probed (the example-confined 6h stranding, 2026-07-12 —
+# swap-fleet validated only 5h/7d and moved the sole Fable workspace onto a 100%-fable account).
+aw_fable_blocked(){
+  aw_fable_capped "$1" && return 0
+  local u="${FU[$1]:-}"
+  [ -n "$u" ] && aw_ge "$u" "${FABLE_BLOCK_PCT:-99}"
+}
+
+# aw_divergent_fable → echo the names of ROTATING workspaces whose descriptor pins MODEL to Fable
+# while the fleet model is something else (example-confined/ws-arc/infrastructure, 2026-07-13). These move with the
+# fleet but die on a Fable-capped account, so target choice prefers Fable-healthy accounts for them.
+aw_divergent_fable(){
+  local f m
+  for f in "$A"/projects/*.env; do
+    [ -e "$f" ] || continue
+    m=$(grep -oP '^MODEL="?\K[^"# ]+' "$f" 2>/dev/null | head -1)
+    [ "$m" = "claude-fable-5" ] && [ "$m" != "$FLEET_MODEL" ] && basename "$f" .env
+  done
+  return 0
+}
+
+# aw_prefer_fable_ok <cand>... → stable partition: Fable-healthy candidates first (original order
+# preserved within each class), Fable-blocked ones after. Used when divergent-Fable workspaces exist
+# on a non-Fable fleet: prefer a target every workspace can use, but never refuse to move the fleet —
+# if all targets are Fable-blocked the blocked one is still emitted (swap-fleet's per-model gate then
+# leaves the Fable-pinned workspaces behind rather than stranding them).
+aw_prefer_fable_ok(){
+  local l ok="" blocked=""
+  for l in "$@"; do
+    if aw_fable_blocked "$l"; then blocked+="$l"$'\n'; else ok+="$l"$'\n'; fi
+  done
+  printf '%s%s' "$ok" "$blocked"
+}
+
+# aw_debounce <acct> <capped01> <usaged01> → maintains STATE ("<acct> <capcnt> <usagecnt>"),
+# echoes "capcnt usagecnt". Counter resets when the active account changes (manual swap) —
+# a stale count from a previous account must not trigger an instant failover on the new one.
+aw_debounce(){
+  local acct="$1" capped="$2" usaged="$3" sacct scap suse
+  read -r sacct scap suse < <(cat "$STATE" 2>/dev/null || echo "$acct 0 0")
+  scap="${scap:-0}"; suse="${suse:-0}"
+  [ "$sacct" = "$acct" ] || { scap=0; suse=0; }
+  local capcnt=0 usecnt=0
+  [ "$capped" = 1 ] && capcnt=$((scap+1))
+  [ "$usaged" = 1 ] && usecnt=$((suse+1))
+  echo "$acct $capcnt $usecnt" > "$STATE"
+  echo "$capcnt $usecnt"
+}
+
+# aw_dwell_blocked → rc 0 (blocked) if the last swap (.active mtime) is < DWELL_SECS ago.
+aw_dwell_blocked(){
+  local m; m=$(stat -c %Y "$ACTIVE_F" 2>/dev/null || echo 0)
+  [ $(( $(date -u +%s) - m )) -lt "$DWELL_SECS" ]
+}
+
+# aw_snapshot <label>... → one-line full picture: every account's 5h%/7d% + resets (or its error).
+aw_snapshot(){
+  local out="" c l
+  for c in "$@"; do
+    l="$c"
+    if [ -n "${UERR[$l]:-}" ]; then out+="$l ERR:${UERR[$l]:0:60} | "
+    elif [ -n "${U5[$l]:-}" ]; then out+="$l 5h=${U5[$l]}%@${R5[$l]:0:16}Z 7d=${U7[$l]}%@${R7[$l]:0:16}Z | "
+    else out+="$l (no data) | "; fi
+  done
+  printf '%s' "${out% | }"
+}
+
+# aw_alert_main <msg> → agentctl send main, throttled to once per ALERT_SECS via ALERT_TS file.
+aw_alert_main(){
+  local now last; now=$(date -u +%s); last=$(cat "$ALERT_TS" 2>/dev/null || echo 0)
+  [ $((now - last)) -ge "$ALERT_SECS" ] || { log "alert throttled (last $((now-last))s ago)"; return 0; }
+  echo "$now" > "$ALERT_TS"
+  agentctl send main "[account-watch] $1" >/dev/null 2>&1 \
+    && log "alerted main: $1" || log "alert to main FAILED (agentctl send): $1"
+}
+
+# aw_earliest_reset [now] → echo the earliest FUTURE reset epoch across ALL accounts: 5h resets_at
+# (R5E, populated by aw_load_usage) + Fable weekly resets (the .fable-cap.<label> marker expiries).
+# It's a safe lower bound on "when could eligibility next change" — when it passes, something reset,
+# so do a full recheck (which simply re-arms the backoff if still nothing is eligible). Falls back to
+# now+SAFETY_POLL_SECS if no future reset is known (never sleeps blind).
+aw_earliest_reset(){
+  local now="${1:-$(date -u +%s)}" best="" e f l
+  _upd(){ local v="$1"; [[ "$v" =~ ^[0-9]+$ ]] || return; [ "$v" -gt "$now" ] || return
+          [ -z "$best" ] || [ "$v" -lt "$best" ] && best="$v"; }
+  for l in "${!R5E[@]}"; do _upd "${R5E[$l]}"; done
+  for l in "${!FRE[@]}"; do _upd "${FRE[$l]}"; done   # per-model Fable weekly resets (usage endpoint)
+  for f in "$ACCTS"/.fable-cap.*; do
+    [ -e "$f" ] || continue
+    e=$(head -1 "$f" 2>/dev/null | tr -cd '0-9'); _upd "$e"
+  done
+  echo "${best:-$((now + SAFETY_POLL_SECS))}"
+}
+
+# aw_backoff_arm <active> <deadline-epoch> → record the no-eligible backoff for THIS active account.
+aw_backoff_arm(){ printf '%s %s\n' "$1" "$2" > "$BACKOFF_F"; }
+
+# aw_backoff_deadline <now> <earliest-reset> → echo min(reset+margin, now+floor), never <= now.
+aw_backoff_deadline(){
+  local now="$1" er="$2" floor=$(( $1 + SAFETY_POLL_SECS )) d=$(( $2 + BACKOFF_MARGIN ))
+  [ "$d" -gt "$floor" ] && d="$floor"
+  [ "$d" -le "$now" ] && d=$(( now + 300 ))
+  echo "$d"
+}
+
+# aw_heal_401s → for every rotation account whose usage probe 401'd (UERR), run account-refresh to
+# exercise its long-lived refresh token and re-mint the expired ~8h ACCESS token. Echoes the number
+# healed (caller re-loads usage when > 0). Idle accounts are never run through the CLI, so their
+# access token expires with nothing renewing it → usage-blind → silently out of the failover set
+# (account-a + account-b 401'd ~3h twice on 2026-07-12, zeroing headroom). Heals BEFORE the eligibility
+# decision and before any backoff is armed, so a healable 401 self-corrects on the tick that finds
+# it. NEVER a setup-token re-mint — that authenticates in "Claude API" mode (Sonnet-only, no Remote
+# Control) and would DEGRADE the account; setup tokens are the last resort for a DEAD refresh token
+# (interactive /login being the fix). A failed refresh = refresh token dead → logged, left blind,
+# the normal no-eligible path handles it. Non-401 errors (network/429/parse): left alone — a token
+# refresh cannot fix them.
+aw_heal_401s(){
+  local healed=0 l
+  for l in "${!UERR[@]}"; do
+    case "${UERR[$l]}" in
+      *401*|*[Uu]nauthorized*)
+        log "401 self-heal: $l usage-blind [${UERR[$l]:0:48}] — refreshing via refresh token"
+        if "$ACCOUNT_REFRESH" "$l" >>"$LOG" 2>&1; then
+          healed=$((healed+1)); log "401 self-heal: $l access token refreshed OK"
+        else
+          log "401 self-heal: $l refresh FAILED — refresh token likely dead (needs /login; setup-token only as Sonnet-degraded last resort); left blind"
+        fi
+        ;;
+    esac
+  done
+  echo "$healed"
+}
+
+# aw_backoff_skip <active> [now] → rc 0 = SKIP this tick (a fresh backoff for THIS account is still in
+# its window); rc 1 = proceed with a full tick. Removes the marker when it is stale (active changed —
+# a swap happened) or its deadline has passed, so a proceeding tick always starts clean.
+aw_backoff_skip(){
+  local active="$1" now="${2:-$(date -u +%s)}" acct deadline
+  [ -f "$BACKOFF_F" ] || return 1
+  read -r acct deadline < "$BACKOFF_F" 2>/dev/null || { rm -f "$BACKOFF_F"; return 1; }
+  [ "$acct" = "$active" ] && [[ "$deadline" =~ ^[0-9]+$ ]] || { rm -f "$BACKOFF_F"; return 1; }
+  [ "$now" -lt "$deadline" ] && return 0
+  rm -f "$BACKOFF_F"; return 1
+}
+
+# --- test gate: sourcing with WATCH_TEST=1 stops here (functions only, no side effects) -----
+if [ "${WATCH_TEST:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
+
+# =========================================================================
+# main flow
+# =========================================================================
+# --- NO HOLD MECHANISM (the operator, 2026-07-10: "there should be no more hold") -------------
+# A global freeze file silently disarmed rotation twice today (05:25 cap incident; 14:07 fence).
+# Rotation is ALWAYS on. Maintenance that needs the watchdog quiet stops the UNIT, visibly:
+#   systemctl --user stop account-watch.timer   ...work...   systemctl --user start account-watch.timer
+# A leftover .hold file (created by old habits/docs) is IGNORED with a loud log, never honored.
+if [ -f "$ACCTS/.hold" ]; then
+  log "WARNING: stale accounts/.hold found — hold mechanism was REMOVED 2026-07-10 (ignored; rm it)"
+fi
+
+[ -f "$ROT" ] || { log "rotation allow-list missing: $ROT"; aw_alert_main "rotation allow-list is missing; refusing to route agents"; exit 1; }
+active=$(cat "$ACTIVE_F" 2>/dev/null || true)
+cfg=$(aw_cfg_of "$active" 2>/dev/null) || { log "active account '$active' is not a valid named profile — abort"; aw_alert_main "active account '$active' is invalid; refusing to route agents"; exit 1; }
+mapfile -t chain < <(grep -vE '^[[:space:]]*(#|$)' "$ROT")
+for a in "${chain[@]}"; do
+  aw_cfg_of "$a" >/dev/null 2>&1 || { log "rotation account '$a' is invalid — abort"; aw_alert_main "rotation account '$a' is invalid; refusing to route agents"; exit 1; }
+done
+
+# --- dormant auto-return to the preferred named profile ---------------------
+# NOTE (2026-07-03, rebase C-4): DORMANT — no code writes .return-after, so this branch never
+# fires on its own. Policy is manual revert (`swap-fleet account-a`); see accounts/README.md.
+# Stamping .return-after manually with a past/target epoch enables a one-shot auto-return.
+# If we're on a backup and the scheduled primary-reset time has passed, verify account-a recovered and swap
+# the whole fleet back, so account-a is the steady-state default and we only sit on a backup during a real
+# cap. The .return-after timestamp gate prevents ping-pong while account-a is still near its weekly cap.
+RA="$ACCTS/.return-after"
+if [ "$active" != account-a ] && [ -f "$RA" ] && [ "$(date -u +%s)" -ge "$(cat "$RA" 2>/dev/null || echo 9999999999)" ]; then
+  hout=$(probe "$(aw_cfg_of account-a)")
+  if echo "$hout" | grep -qiE "$CAP_RE"; then log "return: account-a still capped past reset — staying on $active"; exit 0; fi
+  log ">>> RETURN: account-a recovered past reset -> swapping fleet back (the default)"
+  "$A/bin/swap-fleet" account-a >> "$LOG" 2>&1   # swap-fleet sets .active + nudges (ordered execution)
+  echo "account-a 0 0" > "$STATE"; rm -f "$RA"
+  log "<<< fleet return to account-a initiated"
+  exit 0
+fi
+
+# --- deadline-aware backoff skip -------------------------------------------
+# If the previous tick found NO eligible target, nothing can change until a known reset. Skip the
+# usage GETs + probe until the armed deadline (earliest reset, capped by the safety floor). A stale
+# marker (active account changed → a swap happened) or a passed deadline falls through to a full tick.
+if aw_backoff_skip "$active"; then
+  log "backoff: no-eligible hold on $active — deadline-aware skip (see prior HOLD line for deadline)"
+  exit 0
+fi
+rm -f "$BACKOFF_F"   # full tick proceeding — clear any stale backoff; re-armed only if still no target
+
+# --- usage snapshot (per tick) ---------------------------------------------
+# One cheap HTTP GET per account via account-usage. Per-account errors land in UERR — never fatal.
+aw_load_usage < <("$ACCOUNT_USAGE" --json 2>>"$LOG" || true)
+
+# --- 401 self-heal (idle-account access-token expiry) ----------------------
+# See aw_heal_401s. Runs before detect/eligibility/backoff so this very tick sees healed usage.
+healed=$(aw_heal_401s)
+if [ "${healed:-0}" -gt 0 ]; then
+  log "401 self-heal: re-loading usage after $healed refresh(es)"
+  aw_load_usage < <("$ACCOUNT_USAGE" --json 2>>"$LOG" || true)
+fi
+
+# --- detect -----------------------------------------------------------------
+# Two signals, both debounced over 2 consecutive ticks (account-scoped):
+#   capped  = active-account Opus probe hits CAP_RE (existing backstop; overrides dwell).
+#   usaged  = active five_hour >= 90% or seven_day >= 95% (the proactive trigger).
+# (The old pane-scrape fallback was removed 2026-07-06: it matched the Fable wall and flapped the fleet.)
+capped=0; why=""
+out=$(probe "$cfg")
+if echo "$out" | grep -qiE "$CAP_RE"; then capped=1; why="probe:${out:0:100}"; fi
+# Fable-model cap: reported event-driven by whichever component hit the wall (fable-cap-mark).
+# The Opus probe above and the usage endpoint are both blind to it — the account answers Opus fine
+# at 72%/5h while every Fable call walls (2026-07-10). Same debounced hard-cap path as a probe cap.
+if [ "$capped" = 0 ] && fable_cap_relevant "$active"; then
+  capped=1; why="fable-cap-marker (model cap; endpoint+opus-probe blind)"
+fi
+
+usaged=0; ureason=""; degraded=0
+if ureason=$(aw_trigger_reason "$active"); then
+  usaged=1
+elif [ $? -eq 2 ]; then
+  degraded=1
+  log "usage endpoint unavailable for active=$active (${UERR[$active]:-no data}) — probe-only fallback this tick"
+fi
+if [ "$degraded" = 0 ]; then
+  log "tick: active=$active 5h=${U5[$active]:-?}% 7d=${U7[$active]:-?}%${ureason:+ TRIGGER($ureason)}${why:+ CAP[$why]}"
+fi
+
+# --- debounce (scoped to the active account) ------------------------------
+read -r capcnt usecnt < <(aw_debounce "$active" "$capped" "$usaged")
+[ "$capped" = 1 ] && log "CAP signal #$capcnt (active=$active) [$why]"
+[ "$usaged" = 1 ] && log "USAGE signal #$usecnt (active=$active) [$ureason]"
+hard_go=0; usage_go=0
+[ "$capcnt" -ge 2 ] && hard_go=1
+[ "$degraded" = 0 ] && [ "$usecnt" -ge 2 ] && usage_go=1
+[ "$hard_go" = 1 ] || [ "$usage_go" = 1 ] || exit 0   # need 2 consecutive (~10 min) before acting
+
+# --- dwell guard (proactive only; a hard cap overrides it) ------------------
+if [ "$hard_go" = 0 ] && aw_dwell_blocked; then
+  log "dwell guard: last swap <${DWELL_SECS}s ago — skipping proactive rotation (usage trigger stands: $ureason)"
+  exit 0
+fi
+
+# --- pick a target -----------------------------------------------------------
+# Candidate list = rotation chain minus the active account.
+cands=()
+for c in "${chain[@]}"; do [ "$c" = "$active" ] || cands+=("$c"); done
+
+reason=""; next=""
+# Divergent-Fable preference (per-model cap incident, 2026-07-12): when Fable-pinned workspaces ride
+# a non-Fable fleet, order candidates Fable-healthy-first so the chosen target serves EVERY workspace
+# when possible. Never blocks the move — swap-fleet's per-model gate protects the divergent ones.
+divergent_fable="$(aw_divergent_fable | tr '\n' ' ')"
+if [ -n "${divergent_fable// /}" ] && [ "$FLEET_MODEL" != "claude-fable-5" ]; then
+  mapfile -t cands < <(aw_prefer_fable_ok "${cands[@]}")
+  log "divergent-Fable workspaces present (${divergent_fable% }) — preferring Fable-healthy targets"
+fi
+if [ "$degraded" = 1 ]; then
+  # LEGACY path (endpoint down for active): chain-order candidates, probe each, first healthy wins.
+  reason="hardcap(probe, usage-endpoint degraded)"
+  for cand in "${cands[@]}"; do
+    tcfg=$(aw_cfg_of "$cand")
+    [ -f "$tcfg/.credentials.json" ] || { log "candidate $cand has no credential — skipping"; continue; }
+    cout=$(probe "$tcfg")
+    if echo "$cout" | grep -qiE "$CAP_RE"; then log "candidate $cand also capped — skipping [${cout:0:60}]"; continue; fi
+    if [ "$FLEET_MODEL" = "claude-fable-5" ]; then   # only a Fable fleet cares whether Fable works there
+      fout=$(fable_probe "$tcfg")
+      if echo "$fout" | grep -qiE "$CAP_RE"; then
+        "$SELF_DIR/fable-cap-mark" "$cand" >>"$LOG" 2>&1 || true
+        log "candidate $cand healthy on Opus but FABLE-capped — marked + skipping [${fout:0:60}]"; continue
+      fi
+    fi
+    next="$cand"; break
+  done
+else
+  # USAGE path: eligibility + improvement guard + soonest-reset sort, then pre-flight probe in order.
+  # On a hard cap the improvement guard is waived (guard=0): the active account is unusable.
+  # The guard compares the TRIGGERING axis (incident 2026-07-12): a 7d trigger measures improvement
+  # in 7d headroom — the old always-5h compare made a 7d trigger unsatisfiable at low active 5h.
+  guard=1; axis=5h
+  if [ "$hard_go" = 1 ]; then
+    reason="hardcap(probe)"; guard=0
+  else
+    reason="usage($ureason)"
+    case "$ureason" in 7d=*) axis=7d ;; esac
+  fi
+  active_util="${U5[$active]:-100}"; [ "$axis" = 7d ] && active_util="${U7[$active]:-100}"
+  mapfile -t ranked < <(aw_select_targets "$active_util" "$guard" "$axis" "${cands[@]}")
+  # re-apply the divergent-Fable preference AFTER ranking (the soonest-reset sort would undo the
+  # earlier partition); stable within each class, so reset-order is preserved among the healthy.
+  if [ -n "${divergent_fable// /}" ] && [ "$FLEET_MODEL" != "claude-fable-5" ] && [ "${#ranked[@]}" -gt 0 ]; then
+    mapfile -t ranked < <(aw_prefer_fable_ok "${ranked[@]}")
+    aw_fable_blocked "${ranked[0]}" && log "WARNING: every eligible target is Fable-blocked — fleet still moves; swap-fleet will leave Fable-pinned ws (${divergent_fable% }) behind"
+  fi
+  for cand in "${ranked[@]}"; do
+    tcfg=$(aw_cfg_of "$cand")
+    cout=$(probe "$tcfg")   # pre-flight: endpoint says eligible, probe confirms
+    if echo "$cout" | grep -qiE "$CAP_RE"; then log "pre-flight: $cand eligible by usage but probe shows capped — skipping [${cout:0:60}]"; continue; fi
+    # pre-flight Fable probe — ONLY for a Fable fleet (don't migrate a Fable-pinned fleet onto a
+    # Fable-dead account). An Opus fleet skips this: Opus works everywhere, and Fable-probing would
+    # waste a Fable call + could false-mark an account that's fine for Opus (the 2026-07-11 bug).
+    if [ "$FLEET_MODEL" = "claude-fable-5" ]; then
+      fout=$(fable_probe "$tcfg")
+      if echo "$fout" | grep -qiE "$CAP_RE"; then
+        "$SELF_DIR/fable-cap-mark" "$cand" >>"$LOG" 2>&1 || true
+        log "pre-flight: $cand healthy on Opus but FABLE-capped — marked + skipping [${fout:0:60}]"; continue
+      fi
+    fi
+    next="$cand"; break
+  done
+fi
+
+if [ -z "$next" ]; then
+  snap=$(aw_snapshot "$active" "${cands[@]}")
+  # arm the deadline-aware backoff: nothing can change until the earliest reset (5h + Fable weekly),
+  # capped by the safety floor so an early free is still caught within SAFETY_POLL_SECS.
+  now=$(date -u +%s); er=$(aw_earliest_reset "$now"); deadline=$(aw_backoff_deadline "$now" "$er")
+  aw_backoff_arm "$active" "$deadline"
+  log "!!! NO ELIGIBLE TARGET — HOLDING on $active (trigger=$reason) usage: $snap — next full check $(date -u -d @"$deadline" +%FT%TZ) (earliest reset $(date -u -d @"$er" +%FT%TZ); floor ${SAFETY_POLL_SECS}s)"
+  aw_alert_main "NO ELIGIBLE rotation target — holding on $active (trigger=$reason). Next check ~$(date -u -d @"$deadline" +%H:%MZ). Usage: $snap"
+  exit 0
+fi
+
+# --- fail over (target confirmed healthy) ---------------------------------
+# Delegate the HOW to swap-fleet: it does the ordered, verified swap (others → main → confined workspaces),
+# writes .active, and nudges AUTOCONTINUE workspaces. account-watch owns only WHEN + WHICH target.
+# Proactive (usage-only) rotations pass --confined-optin: only confined workspaces that opted in via
+# confined-cfg/<c>/.rotate follow rotation (example-confined opted in 2026-07-10); others keep the old rule —
+# move on a hard cap (policy scope rule); swap-fleet's per-confined-workspace credential check governs that case.
+swapargs=("$next"); [ "$hard_go" = 0 ] && swapargs+=(--confined-optin)
+snap=$(aw_snapshot "$active" "${cands[@]}")
+if [ "$degraded" = 1 ]; then
+  log "DECISION active=$active trigger=$reason usage: (unavailable) -> target=$next how=chain-order+probe"
+else
+  imp="${U5[$active]:-?}->${U5[$next]:-?}"; [ "${axis:-5h}" = 7d ] && imp="7d:${U7[$active]:-?}->${U7[$next]:-?}"
+  log "DECISION active=$active trigger=$reason usage: $snap -> target=$next reason=soonest-5h-reset;improvement($imp)${swapargs[1]:+;no-confined}"
+fi
+log ">>> FAILOVER: $active ($reason) -> swapping fleet to $next (probed healthy)"
+"$A/bin/swap-fleet" "${swapargs[@]}" >> "$LOG" 2>&1
+echo "$next 0 0" > "$STATE"    # reset our own debounce counters for the new active account
+log "<<< fleet failover to $next initiated (swap-fleet owns ordered execution + nudges)"

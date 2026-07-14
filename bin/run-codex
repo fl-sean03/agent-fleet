@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+if command -v codex >/dev/null; then codex || true; echo "[codex exited — shell]"; else echo "codex not installed (npm i -g @openai/codex, then auth)"; fi; exec bash

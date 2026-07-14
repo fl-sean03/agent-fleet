@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# run-claude-remote — an agent pane whose agent actually runs ON ANOTHER MACHINE over `ssh -t`, with
+# the same fixed-SESSION_ID resume-or-create semantics as run-claude. Select it from a descriptor:
+#
+#     ROOT="$HOME/work/thing"
+#     AGENTS="claude-remote"
+#     SSH="user@remote-host"          # any ssh target or alias
+#
+# Auth is the REMOTE box's own — no local credential crosses the wire. That is also why account swaps
+# do not apply to these workspaces: swap-fleet skips them by design (bouncing one would just kill a
+# remote agent mid-work). `agentctl send/read/stop` work as usual — this IS the agent's pane, and
+# killing the local ssh session HUPs the remote agent so it stops cleanly.
+#
+# REMOTE-SIDE REQUIREMENT: a launcher on the remote box that starts the agent with the SESSION_ID it
+# is handed. `bin/remote/claude-pane.example` in this repo is a working reference — install it once:
+#
+#     scp bin/remote/claude-pane.example user@remote-host:~/.local/bin/claude-pane
+#     ssh user@remote-host 'chmod +x ~/.local/bin/claude-pane'
+#
+# Keeping the launcher on the remote side (rather than piping a script over ssh) means that machine
+# owns its own auth, model, and flags — which is the entire point of the remote tier.
+set -uo pipefail
+T="${SSH:?SSH target required (set SSH= in the descriptor)}"
+SID="${SESSION_ID:-}"
+LAUNCHER="${REMOTE_LAUNCHER:-~/.local/bin/claude-pane}"
+echo "→ remote agent on '$T' (fixed session ${SID:0:8}…)"
+ssh -t "$T" "SESSION_ID='$SID' REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' MODEL='${MODEL:-}' bash $LAUNCHER" || true
+echo; echo "[remote agent on $T exited — this pane is now a LOCAL shell; 'agentctl up <ws>' to relaunch]"
+exec bash

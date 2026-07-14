@@ -1,0 +1,10 @@
+[Unit]
+Description=brain — second-brain nightly (harvest → review → failures → consult → state; weekly on Sundays)
+After=default.target
+OnFailure=brain-alert.service
+
+[Service]
+Type=oneshot
+# No BRAIN_CFG: the engine resolves the fleet-active account (accounts/.active) — deploy default
+# rule, the operator 2026-07-10. Never route to ~/.claude.
+ExecStart={{FLEET_KIT_ROOT}}/brain/bin/brain-nightly

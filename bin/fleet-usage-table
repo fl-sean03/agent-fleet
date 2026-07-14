@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# fleet-usage-table — pretty fleet account-usage snapshot for the /usage slash command.
+# Wraps `account-usage --table`, marks the active account, prepends fleet model + timestamp.
+# Read-only; never prints tokens.
+set -uo pipefail
+ACCTS="$HOME/.agents/accounts"; BIN="$HOME/.agents/bin"
+active=$(cat "$ACCTS/.active" 2>/dev/null || echo '?')
+model=$(cat "$ACCTS/.fleet-model" 2>/dev/null || echo '?')
+echo "Fleet model: ${model}    Active: ${active}    As of: $(date -u +%FT%TZ)"
+echo
+# mark the active account's row with '*'
+"$BIN/account-usage" --table 2>&1 | awk -v a="$active" '
+  NR==1 { print "   " $0; next }
+  { print (($1==a)?" * ":"   ") $0 }
+'

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# grok-ready [--probe] [--login] — is the grok CLI usable for headless/agentic runs RIGHT NOW?
+#
+# Grok's OAuth (grok login) mints a ~6h access credential (~/.grok/auth.json) and — unlike the
+# Claude CLI — a headless `grok -p` does NOT self-refresh an expired one: it just prints a login
+# hint and fails (bit infrastructure 2026-07-13; would strand any automated an experiment grok run).
+# Re-auth is browser-only (device code). This helper makes that failure mode explicit and cheap:
+#
+#   grok-ready            rc 0 = credential present + unexpired (static check, no model spend)
+#   grok-ready --probe    ALSO fire a 1-token `grok -p` end-to-end confirmation (spends one call)
+#   grok-ready --login    when not ready: start `grok login --device-auth` in a detached tmux
+#                         session and PRINT the URL + code for the human, then exit 3 (pending).
+#                         Approval completes in the background; re-run grok-ready to confirm.
+#
+# rc: 0 ready · 1 not ready (expired/missing) · 2 no grok CLI · 3 login started, awaiting human
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+AUTH="${GROK_AUTH_F:-$HOME/.grok/auth.json}"   # env-overridable for tests
+LOGIN_TMUX="grok-device-login"
+
+command -v grok >/dev/null 2>&1 || { echo "grok-ready: no grok CLI on PATH"; exit 2; }
+
+expiry_state(){ # prints "ok <mins-left>" or "expired"/"missing"; rc 0 only when unexpired
+  python3 - "$AUTH" <<'PY'
+import json, sys, datetime
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("missing"); raise SystemExit(1)
+best = None
+for v in d.values():
+    exp = v.get("expires_at")
+    if not exp:
+        continue
+    try:
+        t = datetime.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+    except ValueError:
+        continue
+    if best is None or t > best:
+        best = t
+if best is None:
+    print("missing"); raise SystemExit(1)
+left = (best - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+if left <= 0:
+    print("expired"); raise SystemExit(1)
+print("ok %d" % (left // 60)); raise SystemExit(0)
+PY
+}
+
+state=$(expiry_state) && ready=1 || ready=0
+
+if [ "$ready" = 1 ]; then
+  mins=${state#ok }
+  if [ "${1:-}" = "--probe" ]; then
+    out=$(timeout 60 grok -p "reply with exactly: ok" 2>&1 | tail -1)
+    if [ "$out" = "ok" ]; then echo "grok-ready: READY (credential ~${mins}m left; live probe ok)"; exit 0
+    else echo "grok-ready: credential looks valid (~${mins}m) but probe FAILED: ${out:0:120}"; exit 1; fi
+  fi
+  echo "grok-ready: READY (credential ~${mins}m left)"
+  [ "$mins" -lt 30 ] && echo "grok-ready: WARNING <30m left — long agentic runs may die mid-flight; consider re-auth first"
+  exit 0
+fi
+
+echo "grok-ready: NOT READY (auth $state — grok's ~6h token does not self-refresh headlessly)"
+if [ "${1:-}" = "--login" ]; then
+  tmux kill-session -t "$LOGIN_TMUX" 2>/dev/null || true
+  tmux new-session -d -s "$LOGIN_TMUX" -x 200 -y 50 \
+    "export PATH=$HOME/.local/bin:\$PATH; grok login --device-auth 2>&1"
+  # the URL renders within a few seconds; scrape it for the human
+  for _ in 1 2 3 4 5 6 7 8; do
+    sleep 2
+    url=$(tmux capture-pane -t "$LOGIN_TMUX" -p 2>/dev/null | grep -oE "https://accounts\.x\.ai/[^ ]+" | head -1)
+    [ -n "$url" ] && break
+  done
+  if [ -n "${url:-}" ]; then
+    echo "grok-ready: device login started — HUMAN STEP: open $url"
+    echo "grok-ready: approval completes in background (tmux session '$LOGIN_TMUX'); re-run grok-ready after"
+    exit 3
+  fi
+  tmux kill-session -t "$LOGIN_TMUX" 2>/dev/null || true
+  echo "grok-ready: could not start device login (no URL rendered)"; exit 1
+fi
+echo "grok-ready: run 'grok-ready --login' to mint a device-code URL for the human"
+exit 1

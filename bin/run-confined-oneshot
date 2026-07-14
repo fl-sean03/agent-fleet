@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# run-confined-oneshot <confined workspace> <prompt> — deploy a FRESH, headless, one-shot Claude agent inside a
+# confined workspace's bubblewrap confinement (it sees ONLY $CONFINED_ROOT/<confined workspace> + that confined workspace's isolated config; the
+# host filesystem, other confined workspaces, ~/.claude are all UNMOUNTED). It runs `claude -p <prompt>`, does the
+# task agentically from the workspace artifacts, prints its final reply, and EXITS — a NEW agent each
+# call with its own fresh session id, so it never touches the confined workspace's persistent interactive/RC session.
+# Used by the nightly meta-analysis. Prints the agent's final output on stdout; exit code = claude's.
+set -uo pipefail
+WS="${1:?usage: run-confined-oneshot <confined workspace> <prompt>}"; PROMPT="${2:?prompt required}"
+WORK="$CONFINED_ROOT/$WS"; CFG="$HOME/.agents/confined-cfg/$WS"
+CLBIN="$(readlink -f "$HOME/.local/bin/claude")"
+[ -d "$WORK" ] && [ -d "$CFG" ] || { echo "no confined workspace '$WS' ($WORK / $CFG)"; exit 2; }
+command -v bwrap >/dev/null || { echo "bwrap not installed"; exit 2; }
+[ -n "$CLBIN" ] && [ -e "$CLBIN" ] || { echo "claude binary not found"; exit 2; }
+
+# never inherit a parent Claude session's nesting env (it would break the child's persistence)
+unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXECPATH 2>/dev/null || true
+
+# auth (isolated from host): interactive login (Opus) preferred, else the confined workspace's setup-token (Sonnet)
+AUTH_ENV=()
+if [ -f "$CFG/.credentials.json" ]; then :
+elif [ -s "$CFG/oauth-token" ]; then AUTH_ENV=(--setenv CLAUDE_CODE_OAUTH_TOKEN "$(tr -d '[:space:]' <"$CFG/oauth-token")")
+fi
+# FLEET-FOLLOW (the operator 2026-07-10: "example-confined-nightly should use the account that the fleet is on"):
+# resolve the fleet-active label and, when the confined workspace has its OWN per-account stash for it
+# (the per-workspace credential rule: never a fleet profile's live credential), align the confined workspace's credential before the run.
+# Never swaps live credentials under a RUNNING confined workspace session (dual-writer refresh-token lockout).
+ACTIVE=$(cat "$HOME/.agents/accounts/.active" 2>/dev/null || true)
+CUR=$(cat "$CFG/.account" 2>/dev/null || true)
+if [ -n "$ACTIVE" ] && [ "$CUR" != "$ACTIVE" ]; then
+  STASH="$CFG/.credentials.$ACTIVE.json"
+  if tmux has-session -t "agent-$WS" 2>/dev/null; then WS_UP=1; else WS_UP=0; fi
+  if [ -f "$STASH" ] && [ "$WS_UP" = 0 ]; then
+    # Phase-C-style aligned switch: refresh the departing label's stash from live first
+    [ -n "$CUR" ] && [ -f "$CFG/.credentials.json" ] \
+      && cp -f "$CFG/.credentials.json" "$CFG/.credentials.$CUR.json" && chmod 600 "$CFG/.credentials.$CUR.json"
+    cp -f "$STASH" "$CFG/.credentials.json"; chmod 600 "$CFG/.credentials.json"
+    echo "$ACTIVE" > "$CFG/.account"
+    echo "→ one-shot follows fleet: $WS aligned to $ACTIVE (its own stash)" >&2
+  elif [ -f "$STASH" ]; then
+    echo "⚠ $WS is UP on '$CUR' — not swapping live credentials under a running session; running pinned" >&2
+  else
+    echo "⚠ $WS has no stash for fleet-active '$ACTIVE' — running pinned on '${CUR:-unknown}'" >&2
+    "$HOME/.local/bin/agentctl" send main "[run-confined-oneshot] $WS cannot follow fleet to $ACTIVE: no per-confined-workspace stash — ran pinned on ${CUR:-unknown}; grant = /login inside the confined workspace under $ACTIVE" 2>/dev/null || true
+  fi
+fi
+
+SID=$(cat /proc/sys/kernel/random/uuid)   # fresh id → a genuinely new agent every run
+
+bwrap \
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind /etc/hosts /etc/hosts --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+  --ro-bind-try /etc/ca-certificates.conf /etc/ca-certificates.conf \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind "$CLBIN" /opt/claude-bin \
+  --bind "$WORK" /work --bind "$CFG" /config \
+  --setenv HOME /config --setenv CLAUDE_CONFIG_DIR /config \
+  "${AUTH_ENV[@]}" \
+  --setenv TERM "${TERM:-xterm-256color}" --setenv LANG "${LANG:-C.UTF-8}" \
+  --chdir /work --unshare-all --share-net --die-with-parent \
+  /opt/claude-bin -p "$PROMPT" --model "${ONESHOT_MODEL:-claude-opus-4-8}" --session-id "$SID" --dangerously-skip-permissions
+# --model pinned EXPLICITLY (unpinned runs drift to the account default). the operator directed Fable 5
+# fleet-wide 2026-07-10 ("no more opus"), and Fable is no longer usage-limited (the operator, same day) —
+# the old credit-exhaustion failure mode (rc=1 "out of usage credits", 07-03/07-06) is retired.
