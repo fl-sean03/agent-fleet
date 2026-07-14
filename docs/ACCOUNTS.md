@@ -1,6 +1,6 @@
 # Multi-account rotation
 
-**This is the one opt-in module with real caveats. Read the last section before enabling it.**
+Optional module — **off by default**.
 
 If you run several accounts (e.g. separate plans for separate purposes), a watchdog can migrate the
 whole fleet off an account that's about to hit a usage wall — before your agents die mid-task.
@@ -73,17 +73,13 @@ completes even though swapping the coordinator tears down the shell that launche
 | `accounts/swap-fleet.log` | Every phase of every swap |
 | `accounts/.watch-backoff` | Deadline-aware backoff while holding |
 
-## Before you enable this — the honest part
+## Before you enable this
 
-1. **Check your provider's terms.** Programmatically rotating work across multiple accounts to extend
-   capacity may violate them. This module exists because the author has multiple legitimate accounts
-   for separate purposes; that is not the same as using it to dodge a rate limit on a plan you're
-   over. **That determination is yours, and it's the reason this is off by default.**
-2. **It's Claude-shaped.** `bin/account-usage` speaks the Claude OAuth usage endpoint. Everything
+1. **It's Claude-shaped.** `bin/account-usage` speaks the Claude OAuth usage endpoint. Everything
    above it (deciding, swapping, verifying) is generic — porting means reimplementing one script.
-3. **It moves your agents.** A swap bounces every workspace (they resume their same conversation, but
+2. **It moves your agents.** A swap bounces every workspace (they resume their same conversation, but
    they *are* interrupted). If that's not acceptable, leave it off and swap by hand:
    `swap-fleet <account>`.
-4. **Remote-Control bridges orphan on every account move** — see [OPERATING.md](OPERATING.md).
+3. **Remote-Control bridges orphan on every account move** — see [OPERATING.md](OPERATING.md).
 
-If any of that gives you pause: don't enable it. The rest of the kit does not depend on it.
+It is off by default. The rest of the kit does not depend on it.

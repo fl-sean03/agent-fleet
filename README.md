@@ -48,7 +48,7 @@ every write is archived with before/after so it can be reversed.
 
 **Multi-account rotation (optional).** If you run several accounts, a watchdog polls usage and
 migrates the whole fleet before you hit a wall — ordered, verified, and aware of per-model caps.
-Opt-in; see [docs/ACCOUNTS.md](docs/ACCOUNTS.md) for what it does and when you shouldn't use it.
+Opt-in; see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
 **249 tests** (195 shell + 54 Python). Every subsystem is tested against sandboxed fixtures — no
 live credentials, no network. `./run-tests.sh` (the Python suite needs `pip install pytest`).
@@ -64,7 +64,7 @@ live credentials, no network. `./run-tests.sh` (the Python suite needs `pip inst
 | [ARCHITECTURE](docs/ARCHITECTURE.md) | How the pieces fit; what each tool owns |
 | [ISOLATION](docs/ISOLATION.md) | The three tiers, the confinement wall, and the leak it prevents |
 | [MESSAGING](docs/MESSAGING.md) | Direct-into-conversation delivery, queueing, the durable log |
-| [ACCOUNTS](docs/ACCOUNTS.md) | Multi-account rotation, failover, per-model caps — and the honest caveats |
+| [ACCOUNTS](docs/ACCOUNTS.md) | Multi-account rotation, failover, per-model caps |
 | [BRAIN](docs/BRAIN.md) | The second brain: pipelines, the anti-fabrication gate, what it writes |
 
 ## Requirements
