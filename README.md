@@ -9,7 +9,7 @@ other when they must, rotate across accounts when one hits a rate limit, and min
 transcripts nightly into durable memory.
 
 ```bash
-git clone https://github.com/<you>/agent-fleet.git ~/agent-fleet && cd ~/agent-fleet
+git clone https://github.com/fl-sean03/agent-fleet.git ~/agent-fleet && cd ~/agent-fleet
 ./install.sh
 agentctl new demo --root ~/work/demo --up
 agentctl send demo "read the repo and tell me what it does"

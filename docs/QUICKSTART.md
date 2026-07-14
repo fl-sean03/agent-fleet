@@ -6,7 +6,7 @@
 ## 1. Install
 
 ```bash
-git clone https://github.com/<you>/agent-fleet.git ~/agent-fleet
+git clone https://github.com/fl-sean03/agent-fleet.git ~/agent-fleet
 cd ~/agent-fleet
 ./install.sh
 ```
