@@ -78,3 +78,5 @@ done < <("$AGENTCTL" status --json 2>/dev/null | python3 -c "import json,sys;[pr
 
 log "=== done: ${downed} $([ "$DRY" = 1 ] && echo would-be) down, ${kept} kept ==="
 [ "$DRY" = 1 ] && echo "(${downed} would be stopped, ${kept} kept)"
+exit 0   # a successful sweep must exit 0 (the trailing `[ "$DRY" = 1 ]` test is
+         # false on a real run and would otherwise become the script's status)

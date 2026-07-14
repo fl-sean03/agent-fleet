@@ -25,8 +25,15 @@ load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspac
   ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""
   # shellcheck disable=SC1090
   source "$f"; SESSION="agent-$PROJECT"; [ -n "$ROOT" ] || die "$PROJECT: ROOT unset"
-  # auto-derive kind for legacy descriptors: anything rooted under $CONFINED_ROOT is a confined workspace
-  [ "$KIND" = project ] && case "$ROOT" in "$CONFINED_ROOT"/*) KIND=confined;; esac; }
+  # auto-derive kind for descriptors that don't declare one: anything rooted under $CONFINED_ROOT is
+  # confined. MUST end `return 0`: under `set -e`, a trailing `&&` test that is false (i.e. any
+  # descriptor whose KIND is already "confined") makes load() return 1 and kills every caller —
+  # `agentctl status` printed a header and died the moment a confined workspace existed.
+  if [ "$KIND" = project ]; then
+    case "$ROOT" in "$CONFINED_ROOT"/*) KIND=confined;; esac
+  fi
+  return 0
+}
 
 firstpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | head -1; }
 agentpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | sed -n 2p; }   # control=pane1, claude=pane2
@@ -169,6 +176,8 @@ do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0
   [ $confined -eq 1 ] && echo "  workspace is CONFINED (bwrap) — needs one login: agentctl login $name"
   [ -n "$remote" ] && echo "  RC name: \"$rcname\" (auto-registered on first connect — never run /rc manually)"
   [ $up -eq 1 ] && do_up "$name"
+  return 0   # a successful create must exit 0 — without this the final `[ $up -eq 1 ]` test
+             # (false whenever --up is omitted) becomes the function's status and `new` "fails"
 }
 
 # ---- confined workspace identity bookkeeping -------------------------------------------
