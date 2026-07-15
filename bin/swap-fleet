@@ -94,6 +94,45 @@ model_gate_skip(){ # <ws> → rc 0 = leave this workspace where it is (Fable-pin
   [ "${TARGET_FABLE_BLOCKED:-0}" = 1 ]
 }
 
+# Defined ABOVE the test gate so the suite can exercise them against real processes — verify_ws is
+# the assertion the whole swap rests on, and it reads /proc, so a mock would test nothing.
+# --- verify helpers -------------------------------------------------------
+verify_ws(){ # <ws> → 0 if the live claude proc for this workspace reads credentials from $TCFG.
+  # The question a swap must answer is "is this workspace on the target ACCOUNT?", and the exact
+  # answer is which credential store its process reads: CLAUDE_SECURESTORAGE_CONFIG_DIR when set,
+  # else CLAUDE_CONFIG_DIR (the CLI's own precedence). One rule, both worlds, no branch:
+  #   legacy ws  → securestorage unset, config dir IS the account dir       → resolves to it
+  #   profile ws → config dir is the composed ~/.agents/cfg/<ws>, and
+  #                securestorage points at the account                      → resolves to it
+  # Checking the config dir alone would silently pass every profile workspace on the WRONG account.
+  local ws="$1" sid pid cd want arg0; want="$(readlink -f "$TCFG")"
+  sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$A/projects/$ws.env" | head -1)
+  [ -n "$sid" ] || return 1
+  for _ in $(seq 1 "${VERIFY_TRIES:-10}"); do
+    for pid in $(pgrep -f -- "$sid" 2>/dev/null); do
+      arg0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
+      case "$(basename "$arg0")" in claude|claude-bin) ;; *) continue;; esac
+      cd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_SECURESTORAGE_CONFIG_DIR=//p' | head -1)
+      [ -n "$cd" ] || cd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -1)
+      [ -n "$cd" ] || continue
+      cd="$(readlink -f "$cd")"
+      [ "$cd" = "$want" ] && return 0
+    done
+    sleep 2
+  done
+  return 1
+}
+verify_confined(){ # <confined workspace> → 0 if its .claude.json login email == target account email
+  local c="$1" e
+  for _ in $(seq 1 30); do   # bwrap confined workspace boot + first .claude.json write can exceed 20s (13:30 swap)
+    e=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$A/confined-cfg/$c/.claude.json" 2>/dev/null)
+    [ -n "$TEMAIL" ] && [ "$e" = "$TEMAIL" ] && return 0
+    sleep 2
+  done
+  log "C: verify_confined $c: observed email '$e' != target '$TEMAIL' after 60s (email is stale metadata until an interactive login — diagnostic, see runbook)"
+  return 1
+}
+
 # --- test gate: SWAP_TEST=1 sourcing stops here (helpers only, no roster/moves) -------------------
 if [ "${SWAP_TEST:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
 
@@ -158,35 +197,6 @@ echo "  B. self    : $([ "$has_main" = 1 ] && echo 'main (detached; this pane dr
 echo "  C. confined workspaces : ${CONFINED_WS[*]:-(none)}"
 [ "${#skipped[@]}" -gt 0 ] && echo "  skipped    : ${skipped[*]} (remote/own-auth — account swap doesn't apply)"
 if [ "$DRY" = 1 ]; then echo "(dry run — nothing changed)"; exit 0; fi
-
-# --- verify helpers -------------------------------------------------------
-verify_ws(){ # <ws> → 0 if the live claude proc for this workspace runs under $TCFG.
-  local ws="$1" sid pid cd want arg0; want="$(readlink -f "$TCFG")"
-  sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$A/projects/$ws.env" | head -1)
-  [ -n "$sid" ] || return 1
-  for _ in $(seq 1 10); do
-    for pid in $(pgrep -f -- "$sid" 2>/dev/null); do
-      arg0=$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -1)
-      case "$(basename "$arg0")" in claude|claude-bin) ;; *) continue;; esac
-      cd=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | sed -n 's/^CLAUDE_CONFIG_DIR=//p' | head -1)
-      [ -n "$cd" ] || continue
-      cd="$(readlink -f "$cd")"
-      [ "$cd" = "$want" ] && return 0
-    done
-    sleep 2
-  done
-  return 1
-}
-verify_confined(){ # <confined workspace> → 0 if its .claude.json login email == target account email
-  local c="$1" e
-  for _ in $(seq 1 30); do   # bwrap confined workspace boot + first .claude.json write can exceed 20s (13:30 swap)
-    e=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$A/confined-cfg/$c/.claude.json" 2>/dev/null)
-    [ -n "$TEMAIL" ] && [ "$e" = "$TEMAIL" ] && return 0
-    sleep 2
-  done
-  log "C: verify_confined $c: observed email '$e' != target '$TEMAIL' after 60s (email is stale metadata until an interactive login — diagnostic, see runbook)"
-  return 1
-}
 
 # --- Phase A: others (inline, verified) — skipped when we ARE the tail unit -
 if [ "$TAILONLY" = 0 ] && [ -z "$ONLYCONFINED" ]; then

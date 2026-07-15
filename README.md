@@ -29,7 +29,7 @@ credentials, its own session store) · *Remote* (the agent runs on another box o
 Confinement is not a nicety: an unsandboxed agent asked for a fact it was never told **will grep
 your other agents' transcripts to find it.**
 
-**Workspace profiles.** `~/.agents/` is the single source of truth; `~/.claude/` (and `~/.codex/`, `~/.grok/`) are projections of it. Categorize a workspace by **profile** — `agentctl new acme --profile client` (confined, restricted toolkit, client instructions) vs `--profile lab` (unconfined, full toolkit) — and its config is composed from `base < profile < descriptor`, while still sharing one session store and rotating across accounts. See [docs/PROFILES.md](docs/PROFILES.md).
+**Workspace profiles.** `~/.agents/` is the single source of truth; `~/.claude/` (and `~/.codex/`, `~/.grok/`) are projections of it. Categorize a workspace by **profile** — `agentctl new acme --profile client` (confined, restricted toolkit, client instructions) vs `--profile lab` (unconfined, full toolkit) — and its config is composed from `base < profile < descriptor`, while still sharing one session store and rotating across accounts (credentials stay in the account — the config dir never holds them). See [docs/PROFILES.md](docs/PROFILES.md).
 
 **Agent-agnostic.** The descriptor's `AGENTS=` field picks the launcher — `claude`, `codex`,
 `opencode`, or your own `bin/run-<name>`. Everything else (workspaces, messaging, holds, idle-down,
@@ -52,7 +52,7 @@ every write is archived with before/after so it can be reversed.
 migrates the whole fleet before you hit a wall — ordered, verified, and aware of per-model caps.
 Opt-in; see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
-**293 tests** (239 shell + 54 Python). Every subsystem is tested against sandboxed fixtures — no
+**331 tests** (269 shell + 62 Python). Every subsystem is tested against sandboxed fixtures — no
 live credentials, no network. `./run-tests.sh` (the Python suite needs `pip install pytest`).
 
 ---

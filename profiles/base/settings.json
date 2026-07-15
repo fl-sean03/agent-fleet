@@ -1,4 +1,8 @@
 {
-  "permissions": { "defaultMode": "auto" },
-  "cleanupPeriodDays": 3650
+  "cleanupPeriodDays": 3650,
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "agentPushNotifEnabled": true
 }

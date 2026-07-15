@@ -28,14 +28,24 @@ else
   ACCT_DIR="$("$HOME/.agents/bin/account-profile" "$ACCOUNT")" || exit 1
 fi
 # PROFILE (opt-in): if the workspace declares PROFILE=, its config comes from a COMPOSED per-workspace
-# dir (base < profile < descriptor) whose credentials + session store are symlinked from the resolved
-# account. So a 'client' and a 'lab' workspace get genuinely different settings/skills/instructions
-# while still sharing one session store and rotating across accounts. Without a PROFILE, behaviour is
-# unchanged (CLAUDE_CONFIG_DIR = the account dir). See docs/PROFILES.md.
+# dir (base < profile < descriptor), so a 'client' and a 'lab' workspace get genuinely different
+# settings/skills/instructions while still sharing one session store and rotating across accounts.
+# Credentials do NOT move with it: CLAUDE_SECURESTORAGE_CONFIG_DIR keeps the credential store pointed
+# at the ACCOUNT, so every workspace on an account reads and refreshes the ONE credential file.
+# (Do not "simplify" this by symlinking credentials into the composed dir: the CLI rename-writes
+# .credentials.json, which REPLACES the symlink with a private copy on the first token refresh and
+# forks the rotating refresh token — see the note at the top of bin/agent-profile.)
+# Without a PROFILE, behaviour is unchanged (CLAUDE_CONFIG_DIR = the account dir). See docs/PROFILES.md.
 if [ -n "${WS_NAME:-}" ] && grep -q '^PROFILE=' "$HOME/.agents/projects/$WS_NAME.env" 2>/dev/null; then
-  CFG="$("$HOME/.agents/bin/agent-profile" compose "$WS_NAME" --account "$ACCOUNT")" || exit 1
+  # Fail CLOSED but VISIBLY: an agent running the wrong instructions/skills is worse than no agent,
+  # yet a bare `exit 1` just makes the tmux pane vanish with the error scrolled away.
+  if ! CFG="$("$HOME/.agents/bin/agent-profile" compose "$WS_NAME" --account "$ACCOUNT")"; then
+    echo; echo "!! profile failed to compose for '$WS_NAME' — NOT launching. Fix it, then: run-claude"
+    exec bash
+  fi
   export CLAUDE_CONFIG_DIR="$CFG"
-  echo "→ profile: $(grep -oP '^PROFILE="?\K[^"]+' "$HOME/.agents/projects/$WS_NAME.env" | head -1) (composed config $CFG; account $ACCOUNT)"
+  export CLAUDE_SECURESTORAGE_CONFIG_DIR="$ACCT_DIR"
+  echo "→ profile: $(grep -oP '^PROFILE="?\K[^"]+' "$HOME/.agents/projects/$WS_NAME.env" | head -1) (composed config $CFG; credentials stay in $ACCOUNT)"
 else
   export CLAUDE_CONFIG_DIR="$ACCT_DIR"
   echo "→ account: $ACCOUNT (named profile $ACCT_DIR)"

@@ -19,6 +19,19 @@ CLBIN="$(readlink -f "$HOME/.local/bin/claude")"
 # (re)build the isolated config (stripped .claude.json + trust) if missing — NO credential copy
 [ -f "$CFG/.claude.json" ] || "$HOME/.agents/bin/confined-cfg-sync" "$WS" || true
 
+# PROFILE (opt-in): compose the shareable surface (instructions, settings, the resolved skill subset)
+# INTO this workspace's isolated config — which is already the dir the namespace mounts at /config.
+# Composition deliberately touches nothing else here: credentials stay this workspace's own isolated
+# stash and its session store stays private. That is the confinement wall; profiles do not cross it.
+# Skills are COPIED, not symlinked (the host FS is not mounted, so a link would dangle inside) — which
+# means a granted skill's TEXT is disclosed to this workspace's owner. Keep the profile's SKILLS list
+# narrow and free of host/fleet detail.
+if [ -n "${PROFILE:-}" ]; then
+  "$HOME/.agents/bin/agent-profile" compose "${WS_NAME:-$WS}" >/dev/null \
+    && echo "→ profile: $PROFILE (composed into the isolated config; creds + store untouched)" \
+    || echo "⚠ profile compose failed — continuing with the existing isolated config"
+fi
+
 # AUTH — two independent modes, both isolated from the host login (precedence: interactive login wins):
 #   1. interactive /login  → real account session in /config/.credentials.json → Opus/Max + Remote Control
 #   2. setup-token         → a dedicated CLAUDE_CODE_OAUTH_TOKEN (agentctl login) → "Claude API" mode,
