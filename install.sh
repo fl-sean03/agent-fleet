@@ -49,6 +49,9 @@ command -v sqlite3 >/dev/null 2>&1 || say "NOTE: sqlite3 CLI absent (python's sq
 # --- 2. directories ------------------------------------------------------------------------
 mkdir -p "$A"/{projects,bin,accounts,confined-cfg,messages,session-archive,attic/retired-descriptors,tokens}
 mkdir -p "$CONFINED_ROOT" "$LOCAL_BIN" "$UNITS"
+# canonical config surface: profiles + subagents (user-editable copies; not overwritten on reinstall)
+[ -d "$A/profiles" ] || cp -a "$KIT/profiles" "$A/profiles"
+[ -d "$A/subagents" ] || cp -a "$KIT/subagents" "$A/subagents"
 # scaffold used by `agentctl new <n> --confined` (yours to customize; not overwritten on re-install)
 [ -d "$CONFINED_ROOT/_template" ] || cp -a "$KIT/templates/confined-template" "$CONFINED_ROOT/_template"
 chmod 700 "$A/accounts" "$A/tokens" 2>/dev/null
@@ -78,11 +81,15 @@ say "linked $(ls "$KIT"/bin | wc -l) tools into $A/bin; agentctl + brain on \$PA
 case ":$PATH:" in *":$LOCAL_BIN:"*) ;; *) say "WARNING: $LOCAL_BIN is not on your PATH — add it to your shell rc";; esac
 
 # --- 5. skills (optional, if you use Claude Code) ---------------------------------------------
-if [ -d "$HOME/.claude" ]; then
-  mkdir -p "$HOME/.claude/skills"
-  for s in "$KIT"/skills/*/; do ln -sfn "$s" "$HOME/.claude/skills/$(basename "$s")"; done
-  say "linked $(ls "$KIT"/skills | wc -l) skills into ~/.claude/skills"
-fi
+# ~/.claude is a PROJECTION of the canonical ~/.agents surface (skills, base instructions, subagents),
+# so ambient (non-fleet) Claude Code use sees the same source of truth. Per-workspace config is composed
+# separately at launch (see docs/PROFILES.md); this is only the base mirror.
+ln -sfn "$KIT/skills" "$A/skills"   # canonical skills live under ~/.agents (backed by the checkout)
+mkdir -p "$HOME/.claude/skills"
+for s in "$A"/skills/*/; do [ -d "$s" ] && ln -sfn "$s" "$HOME/.claude/skills/$(basename "$s")"; done
+ln -sfn "$A/profiles/base/AGENTS.md" "$HOME/.claude/CLAUDE.md"
+[ -d "$A/subagents" ] && ln -sfn "$A/subagents" "$HOME/.claude/agents"
+say "projected canonical surface into ~/.claude (skills, CLAUDE.md→base AGENTS.md, agents)"
 
 # --- 6. systemd units (installed; enabled only with --with-timers) -----------------------------
 for u in "$KIT"/systemd/*; do

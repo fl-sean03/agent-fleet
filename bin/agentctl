@@ -122,18 +122,31 @@ PY
 }
 
 # ---- new (project OR confined workspace) -------------------------------------
-do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0
+do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0 profile="" model="claude-opus-4-8"
   name="$1"; shift || true
   while [ $# -gt 0 ]; do case "$1" in
     --confined) confined=1; full="${2:-}"; shift 2;;
+    --profile) profile="${2:-}"; shift 2;;
     --root) root="${2:-}"; shift 2;;
     --rc) rc="${2:-}"; shift 2;;
     --no-rc) norc=1; shift;;
     --up) up=1; shift;;
     *) die "new: unknown arg '$1'";; esac; done
-  [ -n "$name" ] || die "usage: agentctl new <name> [--confined \"Full Name\"] [--root PATH] [--rc NAME|--no-rc] [--up]"
+  [ -n "$name" ] || die "usage: agentctl new <name> [--profile NAME] [--confined \"Full Name\"] [--root PATH] [--rc NAME|--no-rc] [--up]"
   case "$name" in _*|*/*|*' '*) die "bad name '$name'";; esac
   [ -f "$P/$name.env" ] && die "workspace '$name' already exists"
+  # --profile: adopt the profile's policy at creation. A profile whose KIND=confined provisions a
+  # confined workspace automatically (so `new acme --profile client` = confined + PROFILE=client);
+  # the profile's MODEL becomes the default. Instructions/skills/settings are composed at LAUNCH.
+  local PROFDIR="$A/profiles"; [ -d "$PROFDIR" ] || PROFDIR="${FLEET_KIT_ROOT:-$HOME/agent-fleet}/profiles"
+  if [ -n "$profile" ]; then
+    [ -d "$PROFDIR/$profile" ] || die "unknown profile '$profile' (agent-profile list)"
+    local pk pm; pk=$(grep -oP '^KIND=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
+    pm=$(grep -oP '^MODEL=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
+    [ "$pk" = confined ] && confined=1
+    [ -n "$pm" ] && model="$pm"
+    [ -n "$full" ] || full="$name"
+  fi
   local kind=project sandbox="" remote=on rcname
   if [ $confined -eq 1 ]; then
     kind=confined; sandbox=bwrap; root="$CONFINED_ROOT/$name"
@@ -159,12 +172,12 @@ do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0
   [ $norc -eq 1 ] && remote=""
   { echo "# $kind workspace — created $(date -u +%Y-%m-%d) by agentctl new"
     echo "KIND=\"$kind\""
+    [ -n "$profile" ] && echo "PROFILE=\"$profile\""   # base < profile < descriptor; composed at launch
     echo "ROOT=\"${root/#$HOME/\$HOME}\""
     echo "AGENTS=\"claude\""
-    # NEW-AGENT DEFAULT (the operator 2026-07-10): pin Opus 4.8 so a new workspace never lands on Fable.
-    # Explicit descriptor pin (not the account default) so it survives every relaunch/swap. To change
-    # a workspace's model later, edit MODEL= in its ~/.agents/projects/<name>.env and relaunch.
-    echo "MODEL=\"claude-opus-4-8\""
+    # MODEL pin (from the profile, or the Opus default): explicit so it survives every relaunch/swap.
+    # Edit MODEL= in ~/.agents/projects/<name>.env and relaunch to change a workspace's model later.
+    echo "MODEL=\"$model\""
     [ -n "$sandbox" ] && echo "SANDBOX=\"$sandbox\""
     [ -n "$remote" ] && { echo "REMOTE_CONTROL=\"on\""; echo "RC_NAME=\"$rcname\""; }
     # Assign a FIXED session id now. run-claude creates the session with this id on first launch and

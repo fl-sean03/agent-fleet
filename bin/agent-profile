@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# agent-profile — resolve a workspace's PROFILE into a composed config directory.
+#
+# The config model (docs/PROFILES.md): ~/.agents is the single source of truth. Every workspace
+# resolves through three layers, most-specific wins:
+#
+#     base  <  <profile>  <  workspace-descriptor
+#
+# base always applies; a named profile (client/lab/…) layers on top; the descriptor overrides both.
+# Each layer contributes instructions (AGENTS.md), settings (settings.json), a skill subset, and
+# policy (KIND/SANDBOX/MODEL/REMOTE_CONTROL). This tool COMPOSES those into a per-workspace config
+# dir (~/.agents/cfg/<ws>) that becomes the workspace's CLAUDE_CONFIG_DIR — so two workspaces of
+# different types get genuinely different config while still sharing one session store and rotating
+# across accounts (credentials are symlinked from the active account, not baked in).
+#
+#   agent-profile compose <ws> [--account LABEL]   build/refresh cfg/<ws>; print its path
+#   agent-profile policy  <ws> KEY                 print one resolved policy value (KIND/MODEL/…)
+#   agent-profile list                             available profiles
+#   agent-profile show    <profile|--workspace ws> the resolved config for a profile/workspace
+set -uo pipefail
+A="${FLEET_AGENTS_DIR:-$HOME/.agents}"
+KIT="${FLEET_KIT_ROOT:-}"
+[ -z "$KIT" ] && [ -f "$A/fleet.conf" ] && KIT=$(sed -n 's/^FLEET_KIT_ROOT=//p' "$A/fleet.conf" | head -1)
+KIT="${KIT:-$HOME/agent-fleet}"; KIT="${KIT/#\~/$HOME}"
+PROFILES="$A/profiles"                                   # installed copy of the kit's profiles/ (user-editable)
+[ -d "$PROFILES" ] || PROFILES="$KIT/profiles"          # fall back to the checkout
+SKILLS_SRC="$A/skills"; [ -d "$SKILLS_SRC" ] || SKILLS_SRC="$KIT/skills"
+SUBAGENTS_SRC="$A/subagents"
+SESSION_STORE="${FLEET_SESSION_STORE:-$HOME/.claude/projects}"
+CFG_ROOT="$A/cfg"
+P="$A/projects"
+
+die(){ echo "agent-profile: $*" >&2; exit 1; }
+
+# ---- read one KEY from a layer's profile.conf (echo value or empty) ----
+conf_get(){ grep -oP "^$2=\K.*" "$1/profile.conf" 2>/dev/null | head -1 | sed "s/[[:space:]]*#.*//; s/[[:space:]]*$//"; }
+
+# ---- resolve a workspace's profile name + policy value across layers ----
+ws_profile(){ grep -oP '^PROFILE="?\K[^"]+' "$P/$1.env" 2>/dev/null | head -1; }
+
+# resolve <ws> <KEY>: descriptor > profile > base. Descriptor uses the bare KEY= line.
+resolve(){
+  local ws="$1" key="$2" v prof
+  v=$(grep -oP "^$key=\"?\K[^\"]+" "$P/$ws.env" 2>/dev/null | head -1)   # descriptor wins
+  [ -n "$v" ] && { printf '%s' "$v"; return; }
+  prof=$(ws_profile "$ws")
+  [ -n "$prof" ] && v=$(conf_get "$PROFILES/$prof" "$key")               # then the profile
+  [ -z "$v" ] && v=$(conf_get "$PROFILES/base" "$key")                   # then base
+  printf '%s' "$v"
+}
+
+# ---- the composition ----
+cmd_compose(){
+  local ws="$1" acct=""; shift || true
+  while [ $# -gt 0 ]; do case "$1" in --account) acct="${2:-}"; shift 2;; *) shift;; esac; done
+  [ -f "$P/$ws.env" ] || die "no workspace '$ws'"
+  local prof; prof=$(ws_profile "$ws")
+  [ -z "$prof" ] || [ -d "$PROFILES/$prof" ] || die "workspace '$ws' names unknown profile '$prof'"
+  local layers=("$PROFILES/base"); [ -n "$prof" ] && layers+=("$PROFILES/$prof")
+  local cfg="$CFG_ROOT/$ws"; mkdir -p "$cfg/skills"
+
+  # 1) AGENTS.md — concatenate base -> profile (each layer's overlay), workspace overlay last.
+  { for l in "${layers[@]}"; do [ -f "$l/AGENTS.md" ] && { cat "$l/AGENTS.md"; echo; }; done
+    [ -f "$P/$ws.d/AGENTS.md" ] && cat "$P/$ws.d/AGENTS.md"; } > "$cfg/AGENTS.md"
+  ln -sfn AGENTS.md "$cfg/CLAUDE.md"                     # harness-compat mirror (Claude reads CLAUDE.md)
+
+  # 2) settings.json — shallow JSON merge, later layers win (python: pure stdlib).
+  python3 - "$cfg/settings.json" "${layers[@]}" "$P/$ws.d" <<'PY'
+import json, os, sys
+out = sys.argv[1]; merged = {}
+def deep(a, b):
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict): deep(a[k], v)
+        else: a[k] = v
+for d in sys.argv[2:]:
+    p = os.path.join(d, "settings.json")
+    if os.path.isfile(p):
+        try: deep(merged, json.load(open(p)))
+        except Exception: pass
+json.dump(merged, open(out, "w"), indent=2)
+PY
+
+  # 3) skills — MOST-SPECIFIC SKILLS declaration wins (descriptor > profile > base). A narrow
+  #    profile therefore NARROWS rather than inheriting base's 'all'. 'all' = every canonical skill.
+  find "$cfg/skills" -maxdepth 1 -type l -delete 2>/dev/null
+  local want; want=$(resolve "$ws" SKILLS)
+  if printf '%s' "$want" | grep -qw all; then
+    for s in "$SKILLS_SRC"/*/; do [ -d "$s" ] && ln -sfn "$s" "$cfg/skills/$(basename "$s")"; done
+  else
+    for name in $want; do [ -d "$SKILLS_SRC/$name" ] && ln -sfn "$SKILLS_SRC/$name" "$cfg/skills/$name"; done
+  fi
+
+  # 4) subagents (canonical, shared) — projected if present.
+  [ -d "$SUBAGENTS_SRC" ] && ln -sfn "$SUBAGENTS_SRC" "$cfg/agents"
+
+  # 5) credentials + session store — symlinked from the ACTIVE account (rotation retargets these,
+  #    not CLAUDE_CONFIG_DIR, so a workspace's config dir is stable across swaps).
+  [ -n "$acct" ] || acct=$(resolve "$ws" ACCOUNT)
+  [ -n "$acct" ] || acct=$(cat "$A/accounts/.active" 2>/dev/null || true)
+  if [ -n "$acct" ] && [ -d "$A/accounts/$acct" ]; then
+    ln -sfn "$A/accounts/$acct/.credentials.json" "$cfg/.credentials.json"
+    ln -sfn "$A/accounts/$acct/.claude.json"      "$cfg/.claude.json"
+    printf '%s\n' "$acct" > "$cfg/.account"
+  fi
+  ln -sfn "$SESSION_STORE" "$cfg/projects"
+  printf '%s' "$cfg"
+}
+
+case "${1:-}" in
+  compose) shift; [ $# -ge 1 ] || die "usage: agent-profile compose <ws> [--account L]"; cmd_compose "$@" ;;
+  policy)  shift; [ $# -ge 2 ] || die "usage: agent-profile policy <ws> KEY"; resolve "$1" "$2"; echo ;;
+  list)    ls -1 "$PROFILES" 2>/dev/null | while read -r p; do [ -f "$PROFILES/$p/profile.conf" ] && echo "$p"; done ;;
+  show)    shift
+           if [ "${1:-}" = --workspace ]; then ws="${2:?}"; for k in KIND SANDBOX MODEL REMOTE_CONTROL SKILLS ACCOUNT; do printf '%-15s %s\n' "$k" "$(resolve "$ws" "$k")"; done
+           else pr="${1:?profile name}"; echo "profile: $pr"; cat "$PROFILES/$pr/profile.conf" 2>/dev/null; fi ;;
+  *) echo "usage: agent-profile compose <ws> [--account L] | policy <ws> KEY | list | show <profile|--workspace ws>" >&2; exit 2 ;;
+esac

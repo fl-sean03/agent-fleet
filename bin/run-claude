@@ -27,9 +27,20 @@ if [ -z "${ACCOUNT:-}" ]; then
 else
   ACCT_DIR="$("$HOME/.agents/bin/account-profile" "$ACCOUNT")" || exit 1
 fi
-export CLAUDE_CONFIG_DIR="$ACCT_DIR"
-echo "→ account: $ACCOUNT (named profile $ACCT_DIR)"
-SESS_BASE="$ACCT_DIR/projects"   # all profiles point this at the one shared physical session store
+# PROFILE (opt-in): if the workspace declares PROFILE=, its config comes from a COMPOSED per-workspace
+# dir (base < profile < descriptor) whose credentials + session store are symlinked from the resolved
+# account. So a 'client' and a 'lab' workspace get genuinely different settings/skills/instructions
+# while still sharing one session store and rotating across accounts. Without a PROFILE, behaviour is
+# unchanged (CLAUDE_CONFIG_DIR = the account dir). See docs/PROFILES.md.
+if [ -n "${WS_NAME:-}" ] && grep -q '^PROFILE=' "$HOME/.agents/projects/$WS_NAME.env" 2>/dev/null; then
+  CFG="$("$HOME/.agents/bin/agent-profile" compose "$WS_NAME" --account "$ACCOUNT")" || exit 1
+  export CLAUDE_CONFIG_DIR="$CFG"
+  echo "→ profile: $(grep -oP '^PROFILE="?\K[^"]+' "$HOME/.agents/projects/$WS_NAME.env" | head -1) (composed config $CFG; account $ACCOUNT)"
+else
+  export CLAUDE_CONFIG_DIR="$ACCT_DIR"
+  echo "→ account: $ACCOUNT (named profile $ACCT_DIR)"
+fi
+SESS_BASE="$CLAUDE_CONFIG_DIR/projects"   # symlinked to the one shared physical session store
 ~/.agents/bin/trust-dir "$PWD" 2>/dev/null || true        # preseed trust in the active named profile
 # SESSION_ID (the single, deterministic resume mode): every project workspace pins a FIXED session UUID,
 # assigned once in its descriptor. Always use that id — resume it if it already exists in the active

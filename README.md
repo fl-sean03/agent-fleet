@@ -29,6 +29,8 @@ credentials, its own session store) · *Remote* (the agent runs on another box o
 Confinement is not a nicety: an unsandboxed agent asked for a fact it was never told **will grep
 your other agents' transcripts to find it.**
 
+**Workspace profiles.** `~/.agents/` is the single source of truth; `~/.claude/` (and `~/.codex/`, `~/.grok/`) are projections of it. Categorize a workspace by **profile** — `agentctl new acme --profile client` (confined, restricted toolkit, client instructions) vs `--profile lab` (unconfined, full toolkit) — and its config is composed from `base < profile < descriptor`, while still sharing one session store and rotating across accounts. See [docs/PROFILES.md](docs/PROFILES.md).
+
 **Agent-agnostic.** The descriptor's `AGENTS=` field picks the launcher — `claude`, `codex`,
 `opencode`, or your own `bin/run-<name>`. Everything else (workspaces, messaging, holds, idle-down,
 session protection) works the same regardless of which CLI is inside.
@@ -50,7 +52,7 @@ every write is archived with before/after so it can be reversed.
 migrates the whole fleet before you hit a wall — ordered, verified, and aware of per-model caps.
 Opt-in; see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
-**263 tests** (209 shell + 54 Python). Every subsystem is tested against sandboxed fixtures — no
+**293 tests** (239 shell + 54 Python). Every subsystem is tested against sandboxed fixtures — no
 live credentials, no network. `./run-tests.sh` (the Python suite needs `pip install pytest`).
 
 ---
@@ -63,6 +65,7 @@ live credentials, no network. `./run-tests.sh` (the Python suite needs `pip inst
 | **[OPERATING](docs/OPERATING.md)** | **How to actually live with this**: the coordinator pattern, holds, checkpoints, day-to-day UX |
 | [ARCHITECTURE](docs/ARCHITECTURE.md) | How the pieces fit; what each tool owns |
 | [ISOLATION](docs/ISOLATION.md) | The three tiers, the confinement wall, and the leak it prevents |
+| [PROFILES](docs/PROFILES.md) | One source of truth (`~/.agents`); per-workspace **profiles** (client/lab/…) that compose different config |
 | [MESSAGING](docs/MESSAGING.md) | Direct-into-conversation delivery, queueing, the durable log |
 | [ACCOUNTS](docs/ACCOUNTS.md) | Multi-account rotation, failover, per-model caps |
 | [BRAIN](docs/BRAIN.md) | The second brain: pipelines, the anti-fabrication gate, what it writes |
