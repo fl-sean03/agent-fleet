@@ -70,10 +70,20 @@ first_line(){ grep -n "$2" "$1" | head -1 | cut -d: -f1; }
 sa_stop=$(first_line "$ROOT/bin/swap-account" 'stop ')
 sa_up=$(first_line "$ROOT/bin/swap-account" '" up ')
 check "swap-account: stop precedes up" bash -c "[ -n '$sa_stop' ] && [ -n '$sa_up' ] && [ '$sa_stop' -lt '$sa_up' ]"
-sf_stop=$(first_line "$ROOT/bin/swap-fleet" 'AGENTCTL" stop')
-sf_up=$(first_line "$ROOT/bin/swap-fleet" 'AGENTCTL" up')
-check "swap-fleet confined workspace loop: stop precedes up" bash -c "[ -n '$sf_stop' ] && [ -n '$sf_up' ] && [ '$sf_stop' -lt '$sf_up' ]"
-check "swap-fleet per-model gate runs BEFORE the confined workspace stop" bash -c "g=\$(grep -n 'model_gate_skip \"\$c\"' '$ROOT/bin/swap-fleet' | head -1 | cut -d: -f1); [ -n \"\$g\" ] && [ \"\$g\" -lt '$sf_stop' ]"
+# The confined credential dance has ONE implementation, and it is swap-account (2026-07-15): swap-fleet
+# used to carry a second copy while swap-account had none at all — which is how `swap-account <confined-ws> X`
+# silently moved nothing. So the ordering invariant is pinned INSIDE swap-account (sa_stop < sa_up,
+# above), and what we pin here is that swap-fleet still DELEGATES rather than growing a copy back.
+sf_deleg=$(first_line "$ROOT/bin/swap-fleet" 'swap-account" "\$c" "\$ACCT" --force')
+check "swap-fleet confined loop delegates to swap-account (single implementation)" \
+  bash -c "[ -n '$sf_deleg' ]"
+check "swap-fleet confined loop has NO second copy of the credential dance" \
+  bash -c "! sed -n '/for c in \"\\\${CONFINED_WS/,/^  done/p' '$ROOT/bin/swap-fleet' | grep -q 'credentials\\.\$ACCT\\.json'"
+check "swap-fleet per-model gate runs BEFORE the confined delegation" bash -c "g=\$(grep -n 'model_gate_skip \"\$c\"' '$ROOT/bin/swap-fleet' | head -1 | cut -d: -f1); [ -n \"\$g\" ] && [ \"\$g\" -lt '$sf_deleg' ]"
+# and swap-account's client branch must FAIL LOUDLY rather than leave the old account live
+check "swap-account fails loudly on a missing confined stash" grep -q 'NO credential stash' "$ROOT/bin/swap-account"
+check "swap-account never deploys a host profile credential to a confined workspace" \
+  grep -q "never copy a host profile's credential" "$ROOT/bin/swap-account"
 check "agentctl do_up refuses when already up (no second RC)" grep -q 'already up' "$ROOT/bin/agentctl"
 # the removed .hold must stay removed: ignored loudly, never honored, never written by any tool
 check "account-watch loudly ignores a stale .hold" grep -q 'stale accounts/.hold' "$ROOT/bin/account-watch"

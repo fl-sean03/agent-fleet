@@ -193,6 +193,27 @@ do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0 profile="" 
              # (false whenever --up is omitted) becomes the function's status and `new` "fails"
 }
 
+# ---- set-token: the headless auth mode for a confined workspace ----------------
+# agentctl is the only control surface — there is no separate client tool.
+#
+# Two independent auth modes for a client, and they are NOT equivalent (see docs/ACCOUNTS.md):
+#   agentctl login <c>      → interactive OAuth inside the sandbox → Opus/Max + Remote Control.
+#   agentctl set-token <c>  → a dedicated `claude setup-token` value → "Claude API" mode: SONNET only,
+#                             NO Remote Control. Headless; no interactive step. This is a DOWNGRADE for
+#                             a workspace that had a real login — never use it to "fix" a 401.
+# run-claude-confined prefers /config/.credentials.json over this token, so a workspace with a real login
+# keeps it.
+do_set_token(){
+  local name="${1:?usage: agentctl set-token <client> <TOKEN>}" tok="${2:?usage: agentctl set-token <client> <TOKEN>}"
+  load "$name" >/dev/null
+  [ "$KIND" = confined ] || die "set-token is for confined workspaces only ('$name' is kind:$KIND)"
+  local cfg="$A/confined-cfg/$name"
+  mkdir -p "$cfg"; chmod 700 "$cfg"
+  printf '%s' "$tok" > "$cfg/oauth-token"; chmod 600 "$cfg/oauth-token"
+  echo "✓ set-token $name — headless 'Claude API' mode: Sonnet only, no Remote Control."
+  echo "  For Opus + RC instead, do one interactive login:  agentctl login $name"
+}
+
 # ---- confined workspace identity bookkeeping -------------------------------------------
 confined_login_label(){ # <confined workspace> → matching named rotation label for its just-completed OAuth login
   local ws="$1" cfg="$A/confined-cfg/$1" email label pemail matched=""
