@@ -183,7 +183,13 @@ if [ -z "$ONLYCONFINED" ]; then
   for _c in "${CONFINED_WS[@]}"; do
     _pin=$(cat "$A/confined-cfg/$_c/.pinned-account" 2>/dev/null || true)
     if [ -n "$_pin" ] && [ "$_pin" != "$ACCT" ]; then
-      echo "  pinned confined workspace: $_c stays on $_pin"
+      # log(), not echo: the detached B+C tail's stdout goes to the systemd journal, so an echo here
+      # never reached swap-fleet.log — the skip was invisible in the file anyone actually reads.
+      # Worded as the routine, expected outcome it is: a pin is a standing decision, and a client
+      # sitting out a rotation because of one is NOT a failure. (a workspace pinned to its own account by
+      # design, so this line is expected on every swap; if it read as an error we would learn to
+      # ignore the log.) Deliberately NOT alerted to main: standing policy is not an exception.
+      log "C: ⊘ skipped: $_c is PINNED to '$_pin' — staying there by policy (not a failure; override: swap-account $_c $ACCT --repin)"
       continue
     fi
     _keep+=("$_c")
@@ -272,8 +278,15 @@ run_tail(){
     # confined workspace (found in production, 2026-07-15). Two copies of a rule this scarred will diverge — so: delegate.
     #   --force: we already decided above that this workspace needs to move (its .account may claim the
     #   target while verify_confined disagrees — the repair path), so don't let swap-account no-op.
+    #   NOTE --force does NOT bypass the pin gate (that needs --repin, which we never pass): the
+    #   roster filter above already removed pin-mismatched clients, and this is the second layer.
     cout=$("$A/bin/swap-account" "$c" "$ACCT" --force 2>&1); crc=$?
     printf '%s\n' "$cout" >>"$LOG"
+    if [ "$crc" = 3 ]; then
+      # refused by POLICY (pinned), not a failure — the roster filter normally catches this first;
+      # reaching here means the pin appeared after the roster was built. Log it as the clean skip it is.
+      log "C: ⊘ skipped: $c is PINNED elsewhere — staying put by policy (not a failure)"; continue
+    fi
     if [ "$crc" != 0 ]; then
       log "C: ⚠ $c NOT switched to $ACCT — LEFT on current account (${cout##*$'\n'})"; continue
     fi

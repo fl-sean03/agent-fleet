@@ -120,6 +120,48 @@ eq "$(live_token)" "sk-CLIENT-OWN-A"        && ok "credential untouched while pi
 eq "$(live_token)" "sk-CLIENT-OWN-B"        && ok "--repin performs the move"         || bad "--repin did not move"
 eq "$(cat "$CC/.pinned-account")" "acct-b"  && ok "--repin moves the pin too (no lie)" || bad "pin not updated"
 
+echo "== --force must NOT be a back door to the pin (the override must never be automated) =="
+# --force exists to override the already-on-target no-op for the repair path. If it ALSO overrode a
+# pin, it would be a sanctioned route back to the exact lie this fix removes — reached deliberately
+# instead of accidentally. Only --repin may move a pin, and it moves BOTH pin and state together.
+reset_client
+printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
+printf 'acct-a\n' > "$CC/.pinned-account"
+out=$("$SA" acme acct-b --force 2>&1); rc=$?
+check "--force does NOT override a pin"          test "$rc" -ne 0
+eq "$rc" "3"                                  && ok "pin refusal exits 3 (policy) not 1 (failure)" || bad "pin refusal exit code: $rc"
+eq "$(live_token)" "sk-CLIENT-OWN-A"          && ok "--force left the pinned credential alone"     || bad "--force moved a pinned workspace"
+eq "$(cat "$CC/.pinned-account")" "acct-a"    && ok "--force left the pin alone"                   || bad "--force moved the pin"
+check "refusal reads as policy, not failure"     bash -c "printf '%s' \"\$1\" | grep -qi 'policy, not a failure'" _ "$out"
+# a real failure must stay distinguishable from a policy refusal
+reset_client; rm -f "$CC/.credentials.acct-b.json"
+"$SA" acme acct-b --force >/dev/null 2>&1; rc=$?
+eq "$rc" "1" && ok "a missing stash still exits 1 (a real failure)" || bad "missing-stash exit code: $rc"
+# and --repin moves pin + state together, never one without the other
+reset_client
+printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
+printf 'acct-a\n' > "$CC/.pinned-account"
+"$SA" acme acct-b --repin >/dev/null 2>&1
+eq "$(cat "$CC/.pinned-account")" "acct-b" && ok "--repin moves the pin"   || bad "--repin pin"
+eq "$(cat "$CC/.account")" "acct-b"        && ok "--repin moves the state" || bad "--repin state"
+eq "$(cat "$CC/.pinned-account")" "$(cat "$CC/.account")" && ok "pin and state never disagree after --repin" || bad "pin/state divergence"
+
+echo "== swap-fleet may never reach a pin override on its own =="
+# precise: no swap-account INVOCATION may carry --repin. (The string --repin does appear in
+# swap-fleet — inside the skip message telling a human how to override deliberately. That is the
+# point: the override is documented but never automated.)
+check "no swap-account invocation passes --repin" \
+  bash -c "! grep -E '\\$A/bin/swap-account\" .*--repin' '$REPO/bin/swap-fleet'"
+check "the CLIENT invocation is the only one passing --force (projects/main must not)" \
+  bash -c "grep -c -- '--force 2>&1' '$REPO/bin/swap-fleet' | grep -qx 1"
+check "swap-fleet filters pinned workspaces out of the roster" grep -q 'is PINNED to' "$REPO/bin/swap-fleet"
+check "a pinned skip is logged (log(), not echo — the tail's stdout goes to the journal)" \
+  bash -c "grep -q 'log \"C: ⊘ skipped: \$_c is PINNED' '$REPO/bin/swap-fleet'"
+check "a pinned skip is worded as expected policy, not an error" \
+  bash -c "grep -q 'not a failure' '$REPO/bin/swap-fleet'"
+check "swap-fleet maps exit 3 to a clean skip line" bash -c "grep -q 'crc\" = 3' '$REPO/bin/swap-fleet'"
+check_not "a pinned skip does NOT page main"  bash -c "sed -n '/⊘ skipped:/,+2p' '$REPO/bin/swap-fleet' | grep -q 'send main'"
+
 echo "== already-on-target is a no-op unless --force (the repair path) =="
 reset_client
 printf 'acct-a\n' > "$CC/.account"

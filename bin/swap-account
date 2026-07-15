@@ -56,14 +56,21 @@ if [ "$KIND" = confined ]; then
   if [ "$cur" = "$ACCT" ] && [ "$FORCE" = 0 ]; then
     echo "✓ $WS already on $ACCT — nothing to do"; exit 0
   fi
-  # A pin is POLICY ("this client stays here"); .account is STATE ("it is here"). Moving state out
+  # A pin is POLICY ("this workspace stays here"); .account is STATE ("it is here"). Moving state out
   # from under a pin would recreate the very divergence this fix exists to kill — so refuse, loudly,
-  # and make the operator say --repin if they mean to move the policy too.
+  # and make the operator say --repin if they mean to move the policy too. --repin is the ONLY way
+  # past this: --force deliberately does NOT bypass it (--force only overrides the already-on-target
+  # no-op), so an automated caller cannot reach a pin override by accident. swap-fleet never passes
+  # --repin; an override is always an explicit human act at the call site, which makes it auditable.
+  #
+  # EXIT 3 = "refused by policy", distinct from 1 = "failed". A pinned client sitting out a rotation
+  # is the routine, expected outcome, and a caller must be able to log it as a clean skip instead of
+  # a scary failure — otherwise we train ourselves to ignore the log.
   if [ -n "$pin" ] && [ "$pin" != "$ACCT" ] && [ "$REPIN" = 0 ]; then
-    echo "✗ $WS is PINNED to '$pin' — refusing to move it to '$ACCT'." >&2
-    echo "  A pin is policy; moving only the credential would make .pinned-account a lie." >&2
+    echo "⊘ $WS is PINNED to '$pin' — not moving it to '$ACCT' (policy, not a failure)." >&2
+    echo "  A pin is a standing decision; moving only the credential would make .pinned-account a lie." >&2
     echo "  Move the pin too:  swap-account $WS $ACCT --repin" >&2
-    exit 1
+    exit 3
   fi
   # FAIL LOUDLY when the target stash is missing — the old failure mode was to carry on and leave the
   # previous account silently live. A confined workspace can only follow the fleet if it has its own login there.
