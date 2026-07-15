@@ -16,11 +16,94 @@ set -euo pipefail
 # does NOT include ~/.local/bin (the 2026-07-04 "agentctl: command not found" failure that stranded main).
 AGENTCTL="$HOME/.local/bin/agentctl"; [ -x "$AGENTCTL" ] || AGENTCTL="$(command -v agentctl || echo agentctl)"
 export PATH="$HOME/.local/bin:$PATH"
-WS="${1:?usage: swap-account <workspace> <account>}"
-ACCT="${2:?usage: swap-account <workspace> <account>}"
-DESC="$HOME/.agents/projects/$WS.env"; [ -f "$DESC" ] || { echo "no workspace '$WS'"; exit 1; }
+WS="${1:?usage: swap-account <workspace> <account> [--repin] [--force]}"
+ACCT="${2:?usage: swap-account <workspace> <account> [--repin] [--force]}"
+shift 2 || true
+REPIN=0; FORCE=0
+while [ "$#" -gt 0 ]; do case "$1" in
+  --repin) REPIN=1 ;;    # also move a confined workspace's .pinned-account (policy), not just .account (state)
+  --force) FORCE=1 ;;    # re-deploy even if the workspace already claims this account (repair path)
+  *) echo "unknown swap-account option: $1" >&2; exit 2 ;;
+esac; shift; done
+A="${A:-$HOME/.agents}"
+DESC="$A/projects/$WS.env"; [ -f "$DESC" ] || { echo "no workspace '$WS'"; exit 1; }
 ROOT=$(grep -oP 'ROOT="?\K[^"]+' "$DESC" | head -1); ROOT="${ROOT/\$HOME/$HOME}"; ROOT="${ROOT/#\~/$HOME}"
 enc=$(printf '%s' "$ROOT" | sed 's#[^a-zA-Z0-9]#-#g')
+
+# KIND — same derivation as agentctl: an explicit KIND=, else anything rooted under ~/clients is a
+# confined client. This matters because a client's auth lives somewhere completely different.
+KIND=$(grep -oP '^KIND="?\K[^"]+' "$DESC" | head -1 || true)
+[ -n "$KIND" ] || case "$ROOT" in "${CONFINED_ROOT:-$HOME/confined}"/*) KIND=confined;; *) KIND=project;; esac
+
+# ---- CONFINED WORKSPACE SWAP -------------------------------------------------------------------
+# A confined workspace's account is NOT the descriptor's ACCOUNT= line. Its auth is the credential file inside
+# its own isolated cfg (bwrap binds ~/.agents/confined-cfg/<c> → /config, HOME=/config, and
+# run-claude-confined prefers /config/.credentials.json over any oauth-token). So the old
+# project-shaped path here — rewrite ACCOUNT=, bounce — moved NOTHING and left the descriptor
+# claiming an account the agent was not using: a silent lie (found in production, 2026-07-15).
+#
+# HARD CONSTRAINT: deploy the client's OWN per-account stash (.credentials.<label>.json) and NEVER a
+# copy of the host profile's credential. Refresh tokens are single-use and rotate, so a shared copy
+# invalidates the host account's token on first refresh — the .credentials.broken-host-* / .DEAD-* files a real fleet
+# accumulates are the scars from exactly that mistake.
+if [ "$KIND" = confined ]; then
+  ccfg="$A/confined-cfg/$WS"
+  [ -d "$ccfg" ] || { echo "confined workspace '$WS' has no isolated cfg ($ccfg)" >&2; exit 1; }
+  stash="$ccfg/.credentials.$ACCT.json"
+  cur=$(cat "$ccfg/.account" 2>/dev/null || true)
+  pin=$(cat "$ccfg/.pinned-account" 2>/dev/null || true)
+
+  if [ "$cur" = "$ACCT" ] && [ "$FORCE" = 0 ]; then
+    echo "✓ $WS already on $ACCT — nothing to do"; exit 0
+  fi
+  # A pin is POLICY ("this client stays here"); .account is STATE ("it is here"). Moving state out
+  # from under a pin would recreate the very divergence this fix exists to kill — so refuse, loudly,
+  # and make the operator say --repin if they mean to move the policy too.
+  if [ -n "$pin" ] && [ "$pin" != "$ACCT" ] && [ "$REPIN" = 0 ]; then
+    echo "✗ $WS is PINNED to '$pin' — refusing to move it to '$ACCT'." >&2
+    echo "  A pin is policy; moving only the credential would make .pinned-account a lie." >&2
+    echo "  Move the pin too:  swap-account $WS $ACCT --repin" >&2
+    exit 1
+  fi
+  # FAIL LOUDLY when the target stash is missing — the old failure mode was to carry on and leave the
+  # previous account silently live. A confined workspace can only follow the fleet if it has its own login there.
+  if [ ! -f "$stash" ]; then
+    echo "✗ $WS has NO credential stash for '$ACCT' ($(basename "$stash")) — NOT switching." >&2
+    echo "  It is still on '${cur:-unknown}'. Grant access with ONE interactive login inside the" >&2
+    echo "  workspace:  agentctl login $WS   (never copy a host profile's credential in — the refresh" >&2
+    echo "  token is single-use and rotates; a shared refresh token kills the host account)." >&2
+    exit 1
+  fi
+  # DUD GUARD (a real dud-credential incident): a stash with no real refreshToken is a dud — deploying it hands the workspace
+  # a credential the CLI zeroes on first refresh, killing the workspace AND the live file.
+  if ! grep -q '"refreshToken":"sk-' "$stash"; then
+    echo "✗ $WS stash for '$ACCT' has NO refresh token (dud/empty) — NOT switching; re-stash needed." >&2
+    exit 1
+  fi
+
+  "$AGENTCTL" stop "$WS" >/dev/null 2>&1 || true; sleep 1   # transient stop; relaunches in place
+  # Preserve the DEPARTING account's credential from the live file first: it holds the freshest
+  # rotation. Guarded — never overwrite a good stash from an EMPTY/zeroed live file (that is how a
+  # real empty-stash dud was minted).
+  if [ -n "$cur" ] && [ "$cur" != "$ACCT" ] && [ -f "$ccfg/.credentials.json" ]; then
+    if grep -q '"refreshToken":"sk-' "$ccfg/.credentials.json"; then
+      cp -f "$ccfg/.credentials.json" "$ccfg/.credentials.$cur.json" && chmod 600 "$ccfg/.credentials.$cur.json"
+      echo "→ preserved departing '$cur' credential from live (latest rotation)"
+    else
+      echo "⚠ live credential is EMPTY/zeroed — NOT refreshing stash .credentials.$cur.json (kept prior good copy)"
+    fi
+  fi
+  mkdir -p "$ccfg/backups"
+  cp -a "$ccfg/.credentials.json" "$ccfg/backups/.credentials.prev-$(date -u +%Y%m%dT%H%M%SZ).bak" 2>/dev/null || true
+  cp -f "$stash" "$ccfg/.credentials.json"; chmod 600 "$ccfg/.credentials.json"
+  printf '%s\n' "$ACCT" > "$ccfg/.account"
+  [ "$REPIN" = 1 ] && { printf '%s\n' "$ACCT" > "$ccfg/.pinned-account"; echo "→ pin moved to $ACCT"; }
+  # keep the descriptor honest too — it is what humans and `agentctl status` read
+  sed -i '/^ACCOUNT=/d' "$DESC"; printf 'ACCOUNT="%s"\n' "$ACCT" >> "$DESC"
+  "$AGENTCTL" up "$WS"
+  echo "✓ $WS (confined) now on account: $ACCT — deployed its own stash $(basename "$stash")"
+  exit 0
+fi
 
 cur=$(grep -oP 'ACCOUNT="?\K[^"]+' "$DESC" | head -1 || true)
 [ -n "$cur" ] || cur=$(cat "$HOME/.agents/accounts/.active" 2>/dev/null || true)

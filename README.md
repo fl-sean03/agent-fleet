@@ -52,7 +52,7 @@ every write is archived with before/after so it can be reversed.
 migrates the whole fleet before you hit a wall — ordered, verified, and aware of per-model caps.
 Opt-in; see [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
-**341 tests** (279 shell + 62 Python). Every subsystem is tested against sandboxed fixtures — no
+**358 tests** (296 shell + 62 Python). Every subsystem is tested against sandboxed fixtures — no
 live credentials, no network. `./run-tests.sh` (the Python suite needs `pip install pytest`).
 
 ---

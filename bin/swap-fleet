@@ -256,44 +256,27 @@ run_tail(){
   #    Before switching away, refresh the DEPARTING label's stash from the live credential — the live
   #    file holds the freshest refreshToken rotation (stale stashes are how restores go bad).
   for c in "${CONFINED_WS[@]}"; do
-    local ccfg="$A/confined-cfg/$c" cred cur
-    cred="$ccfg/.credentials.$ACCT.json"
+    local ccfg="$A/confined-cfg/$c" cur cout crc
     cur=$(cat "$ccfg/.account" 2>/dev/null || true)
     if [ "$cur" = "$ACCT" ] && verify_confined "$c"; then log "C: = $c already on $ACCT (verified) — skipping"; continue; fi
-    # per-model gate BEFORE any stop: a Fable-pinned confined workspace (example-confined) must never board a Fable-blocked
+    # per-model gate BEFORE any stop: a Fable-pinned confined workspace must never board a Fable-blocked
     # account — the exact 2026-07-12 stranding ("reached your Fable 5 limit" for ~6h). Left running.
     if model_gate_skip "$c"; then
       log "C: ⊘ $c is Fable-pinned and $ACCT is Fable-blocked — LEFT on current account (per-model gate)"
       echo "$c" >> "$LEFT_BEHIND_F"; continue
     fi
-    if [ ! -f "$cred" ]; then log "C: ⚠ $c has no pre-staged credential for '$ACCT' ($(basename "$cred")) — LEFT on current account"; continue; fi
-    # GUARD (2026-07-10 example-confined misfire): a stash without a real refreshToken is a DUD — deploying it
-    # gives the confined workspace a credential the CLI zeroes on first refresh (dead confined workspace, zeroed live file).
-    # A 60h-stale stash caused exactly that; empty duds then propagated via the departing-refresh.
-    if ! grep -q '"refreshToken":"sk-' "$cred"; then
-      log "C: ⚠ $c stash for '$ACCT' has NO refresh token (dud/empty) — LEFT on current account; re-stash needed"; continue
-    fi
     log "C: swapping confined workspace $c → $ACCT"
-    "$AGENTCTL" stop "$c" >>"$LOG" 2>&1 || true; sleep 1   # transient (not retire) — confined workspace relaunches in place
-    if [ -n "$cur" ] && [ "$cur" != "$ACCT" ]; then
-      # GUARD: never refresh a stash from an EMPTY live file (CLI zeroes live on failed refresh —
-      # copying that over a good stash is how the account-c dud was minted at 13:32 on 2026-07-10)
-      if grep -q '"refreshToken":"sk-' "$ccfg/.credentials.json"; then
-        cp -f "$ccfg/.credentials.json" "$ccfg/.credentials.$cur.json" && chmod 600 "$ccfg/.credentials.$cur.json" \
-          && log "C: refreshed $c stash .credentials.$cur.json from live (latest rotation)"
-      else
-        log "C: ⚠ $c live credential is EMPTY/zeroed — NOT refreshing stash .credentials.$cur.json (kept prior good copy)"
-      fi
-    else
-      cp -a "$ccfg/.credentials.json" "$ccfg/backups/.credentials.prev-$(date -u +%Y%m%dT%H%M%SZ).bak" 2>/dev/null || true
+    # ONE implementation of the confined credential dance, and it lives in swap-account (missing-stash
+    # + dud guards, departing-stash preservation, .account, never a host profile's credential). This
+    # used to be a second copy here; swap-account had none at all and silently moved nothing for a
+    # confined workspace (found in production, 2026-07-15). Two copies of a rule this scarred will diverge — so: delegate.
+    #   --force: we already decided above that this workspace needs to move (its .account may claim the
+    #   target while verify_confined disagrees — the repair path), so don't let swap-account no-op.
+    cout=$("$A/bin/swap-account" "$c" "$ACCT" --force 2>&1); crc=$?
+    printf '%s\n' "$cout" >>"$LOG"
+    if [ "$crc" != 0 ]; then
+      log "C: ⚠ $c NOT switched to $ACCT — LEFT on current account (${cout##*$'\n'})"; continue
     fi
-    cp -f "$cred" "$ccfg/.credentials.json"; chmod 600 "$ccfg/.credentials.json"
-    "$AGENTCTL" up "$c" >>"$LOG" 2>&1 || true
-    # The copied named cache is the credential source of truth. Claude may retain the prior
-    # oauthAccount.emailAddress in .claude.json until a future interactive /login, so that display
-    # field cannot decide whether this cache switch happened. Record the selected cache label now;
-    # retain the email check as useful diagnostics only.
-    printf '%s\n' "$ACCT" > "$ccfg/.account"
     changed=1
     ws_rc_on "$c" && echo "$c" >> "$RC_MOVED_F"   # RC bridge on the OLD account is now orphaned
     if verify_confined "$c"; then

@@ -294,6 +294,7 @@ case "${1:-help}" in
   kick)      shift; exec "$BIN/fleet-msg" kick "$@" ;;   # submit an agent's stranded/unsubmitted input
   msglog)    shift; exec "$BIN/fleet-msg" log "$@" ;;
   login)     shift; do_login "$@" ;;
+  set-token) shift; do_set_token "$@" ;;
   status|ls) do_status "${2:-}" ;;
   up-all)    for f in "$P"/*.env; do [ -e "$f" ] || continue; grep -q '^AUTOSTART="no"' "$f" && continue; do_up "$(basename "${f%.env}")"; done ;;
   down-all)  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-'); do tmux kill-session -t "$s"; echo "down: $s"; done ;;
