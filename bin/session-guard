@@ -7,23 +7,39 @@
 #     capture what's flushed; this is a second, transcript-scoped copy.)
 #  2) STUCK-SESSION ALERT — flag any live workspace at >=95% context or visibly mid-turn for a long
 #     time. Those are exactly the sessions whose in-memory transcript would be lost on a hard kill
-#     (the example-confined failure). Logged so we can intervene (manual /compact or fresh session) BEFORE a bounce.
+#     (a real transcript-loss failure). Logged so we can intervene (manual /compact or fresh session) BEFORE a bounce.
 set -uo pipefail
+#  3) ROUTING GUARD — alert if a fleet agent is not talking to Anthropic directly, or if a config dir
+#     it reads has grown a settings `env` block. See the incident note at the guard itself.
 A="$HOME/.agents"; ARCH="$A/session-archive"; LOG="$A/session-guard.log"
 log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
 mkdir -p "$ARCH"
+
+# alert_main <key> <msg> — throttled to once per ALERT_SECS per key (mirrors account-watch's
+# aw_alert_main). The fleet alerts its coordinator, not the human; main triages.
+ALERT_SECS="${ALERT_SECS:-21600}"   # 6h — a standing misconfiguration must not re-page every 15min
+alert_main(){
+  local key="$1" msg="$2" ts="$A/.session-guard-alert.$1" now; now=$(date +%s)
+  if [ -f "$ts" ]; then local last; last=$(cat "$ts" 2>/dev/null | tr -cd '0-9')
+    [ -n "$last" ] && [ $((now - last)) -lt "$ALERT_SECS" ] && return 0
+  fi
+  printf '%s\n' "$now" > "$ts"
+  "$HOME/.local/bin/agentctl" send main "[session-guard] $msg" >/dev/null 2>&1 || true
+}
 
 # 0) shared-store integrity preflight (rebase 2026-07-01): every ACCOUNT profile's projects/ must
 # resolve to the shared host store — a diverged copy silently forks sessions on account swap.
 # (confined-cfg profiles are deliberately isolated and are NOT checked.)
 HOST_STORE="$(readlink -f "$HOME/.claude/projects" 2>/dev/null || true)"
-for p in "$A"/accounts/*/projects; do
+# cfg/* are the COMPOSED per-workspace config dirs (PROFILE= workspaces, 2026-07-15). They carry the
+# same invariant for the same reason: their projects/ must be the one shared store.
+for p in "$A"/accounts/*/projects "$A"/cfg/*/projects; do
   [ -e "$p" ] || continue
   [ "$(readlink -f "$p" 2>/dev/null || true)" = "$HOST_STORE" ] || \
     log "!!! SHARED-STORE VIOLATION: $p does not resolve to ~/.claude/projects — sessions will fork on swap"
 done
 
-# 1) archive transcripts from host + every account profile + every confined workspace
+# 1) archive transcripts from host + every account profile + every confined client
 for base in "$HOME/.claude" "$A"/accounts/* "$A"/confined-cfg/*; do
   [ -d "$base/projects" ] || continue
   name=$(basename "$base")
@@ -47,6 +63,53 @@ for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-' 
   if [ -n "${ctx:-}" ] && [ "$ctx" -ge 95 ]; then
     cp "$SB/$ws.txt" "$SB/$ws.STUCK.$(date -u +%Y%m%dT%H%M).txt" 2>/dev/null || true   # preserve a stuck snapshot
     log "STUCK-RISK: $ws at ${ctx}% context — scrollback preserved in $SB/$ws.STUCK.* ; /compact or fresh-session BEFORE any bounce/swap/reboot"
+    # Alert, don't act. The CLI's own auto-compact handles the normal path and is observed working
+    # (main compacted 4x unattended, 2026-07-12/13); firing our own /compact into a live conversation
+    # would discard context the agent chose to keep and inject a turn nobody asked for. What actually
+    # needs a human/coordinator is the case auto-compact did NOT save. Escalate it; leave the agent be.
+    alert_main "stuck-$ws" "STUCK-RISK: workspace '$ws' is at ${ctx}% context and auto-compact has not resolved it. Scrollback is preserved at $SB/$ws.STUCK.*. Do NOT bounce/swap/reboot it before it is compacted or moved to a fresh session — a hard kill loses the unflushed turns."
   fi
 done
 find "$SB" -name '*.STUCK.*' -mtime +30 -delete 2>/dev/null || true
+
+# 3) ROUTING GUARD (incident 2026-07-15, main): a third-party plugin/tool rewrote a settings.json at
+# 01:00 with an `env` block pointing ANTHROPIC_BASE_URL at a local proxy (127.0.0.1:3456) and
+# ANTHROPIC_MODEL at a non-Anthropic model. main silently ran on that proxy for hours — the fleet had
+# NO signal that an agent had been rerouted off Anthropic. Two cheap, high-value checks:
+#   a) live procs: a fleet agent must talk to Anthropic directly (no BASE_URL/MODEL/API-KEY override).
+#   b) config dirs: a settings.json `env` block is the injection vector itself — flag it at rest,
+#      before the next launch picks it up.
+# Detection only: the remedy (which override is legitimate) is a human call. Profile workspaces are
+# structurally protected — their settings.json is composed from ~/.agents/profiles each launch — but
+# legacy workspaces read the account dir's settings.json directly, so this stays valuable either way.
+for pid in $(pgrep -x claude 2>/dev/null); do
+  envf="/proc/$pid/environ"; [ -r "$envf" ] || continue
+  ws=$(tr '\0' '\n' < "$envf" 2>/dev/null | sed -n 's/^WS_NAME=//p' | head -1)
+  [ -n "$ws" ] || continue                      # not a fleet-launched agent — not ours to police
+  for var in ANTHROPIC_BASE_URL ANTHROPIC_MODEL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY; do
+    val=$(tr '\0' '\n' < "$envf" 2>/dev/null | sed -n "s/^$var=//p" | head -1)
+    [ -n "$val" ] || continue
+    case "$var" in ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY) val="<set>";; esac   # never log a secret
+    log "!!! ROUTING OVERRIDE: $ws (pid $pid) has $var=$val — this agent is not on the fleet's normal Anthropic path"
+    alert_main "routing-$ws" "ROUTING OVERRIDE on '$ws': its live process has $var=$val. A fleet agent should talk to Anthropic directly; this is how the 2026-07-15 main incident looked (a plugin rerouted it to a local proxy and it ran on a non-Anthropic model unnoticed). Verify this is intended; if not, check that workspace's config dir settings.json for an 'env' block and relaunch."
+  done
+done
+for s in "$HOME"/.claude/settings.json "$A"/accounts/*/settings.json "$A"/cfg/*/settings.json "$A"/confined-cfg/*/settings.json; do
+  [ -f "$s" ] || continue
+  # Only ROUTING keys, not any env block: legitimate fleet settings carry benign env (a real fleet sets
+  # DISABLE_AUTOUPDATER). A guard that fires on those trains everyone to ignore it.
+  hits=$(python3 -c '
+import json,sys
+KEYS={"ANTHROPIC_BASE_URL","ANTHROPIC_MODEL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY",
+      "ANTHROPIC_SMALL_FAST_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL","CLAUDE_CODE_USE_BEDROCK","CLAUDE_CODE_USE_VERTEX"}
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+env=d.get("env") if isinstance(d,dict) else None
+if not isinstance(env,dict): sys.exit(1)
+# report keys only — an env block can hold a token, and this string is logged + messaged
+found=sorted(set(env) & KEYS)
+print(",".join(found)); sys.exit(0 if found else 1)' "$s" 2>/dev/null) || continue
+  log "!!! SETTINGS ROUTING OVERRIDE: $s env block sets $hits — injected into every agent using this config dir"
+  alert_main "settingsenv-$(basename "$(dirname "$s")")" "CONFIG DRIFT: $s has an 'env' block setting $hits, which is injected into every agent that reads this config dir. That is exactly the vector that rerouted main to a local proxy on 2026-07-15. Confirm it is intended, or remove it and relaunch the affected workspaces."
+done
