@@ -12,8 +12,8 @@
 #     it reads has grown a settings `env` block. See the incident note at the guard itself.
 #  4) LIVENESS + RESOURCE GUARD — is the agent actually THERE, and is the machine about to kill it?
 #     (2026-07-16: the fleet had guards for transcripts, stuck context, rotation and routing — but
-#     none for "the agent is simply gone". A workspace agent was OOM-killed at 08:27 and NOTHING noticed for
-#     ~19h; idle-down even logged "keep <ws> — recent activity", because its liveness proxy is
+#     none for "the agent is simply gone". A workspace agent was OOM-killed at 08:27 and NOTHING noticed
+#     for ~19h; idle-down even logged "keep <ws> — recent activity", because its liveness proxy is
 #     transcript mtime, which cannot tell a dead agent from a quiet one. Separately, a compute
 #     campaign filled the disk with its own scratch and starved itself to death, unremarked.)
 set -uo pipefail
@@ -102,8 +102,8 @@ for pid in $(pgrep -x claude 2>/dev/null); do
 done
 for s in "$HOME"/.claude/settings.json "$A"/accounts/*/settings.json "$A"/cfg/*/settings.json "$A"/client-cfg/*/settings.json; do
   [ -f "$s" ] || continue
-  # Only ROUTING keys, not any env block: legitimate fleet settings carry benign env (one client workspace sets
-  # DISABLE_AUTOUPDATER). A guard that fires on those trains everyone to ignore it.
+  # Only ROUTING keys, not any env block: legitimate fleet settings carry benign env (one client
+  # workspace sets DISABLE_AUTOUPDATER). A guard that fires on those trains everyone to ignore it.
   hits=$(python3 -c '
 import json,sys
 KEYS={"ANTHROPIC_BASE_URL","ANTHROPIC_MODEL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_API_KEY",
@@ -124,8 +124,8 @@ done
 # 4) LIVENESS + RESOURCE GUARD (2026-07-16)
 #
 # Three failures went unnoticed on 2026-07-15 because nothing was watching for them:
-#   • a workspace agent was OOM-killed (14.1GB RSS on a 30GB box). Its tmux session stayed up, so every
-#     existing check saw a healthy workspace. Dead for ~19h.
+#   • a workspace agent was OOM-killed (14.1GB RSS on a 30GB box). Its tmux session stayed up, so
+#     every existing check saw a healthy workspace. Dead for ~19h.
 #   • idle-down said "keep <ws> — recent activity": its liveness proxy is transcript MTIME, which
 #     cannot distinguish a dead agent from a quiet one.
 #   • a compute campaign filled the disk with its own scratch and then starved (its own next write
