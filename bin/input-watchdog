@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""input-watchdog — auto-submit directives stranded in an idle agent's composer.
+
+WHY: several injection paths (Remote Control bridge races, mobile typing, pre-v3 delivery) can
+leave a complete directive sitting in the ❯ box with its Enter swallowed. On 2026-07-16 this
+stranded six directives — including the operator's own "find and fix the delivery bug that swallows the
+Enter", which sat unread in main's box until manually kicked. session-guard pages a human at
+15-minute granularity; this closes the loop automatically within ~2 ticks.
+
+POLICY — a workspace is fired only when ALL hold:
+  * its tmux session has NO attached client (an attached human may be mid-composition and can
+    see the box; injected residue never has a client attached)
+  * the same composer text (>=3 printable-ASCII chars) is sighted on two CONSECUTIVE ticks
+    (~2 min apart — a paste-in-progress or fresh draft never survives two ticks)
+  * the workspace is not held (~/.agents/input-watchdog.holds, lines "<ws> <until-epoch>" —
+    e.g. a directive deliberately parked while its account is rate-capped)
+
+EXECUTOR: `fleet-msg kick <ws>` — the existing verified submitter (agent-alive RCE gate, C-u,
+re-paste, verified Enter loop). This script decides WHEN; it never touches a pane itself.
+Detection also rides kick: `--dry` prints exactly what WOULD be submitted after all its gates,
+so there is one composer-reading implementation in the fleet, not two.
+"""
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+A = os.path.expanduser("~/.agents")
+BIN = f"{A}/bin"
+STATE = f"{A}/tmp/input-watchdog.state.json"
+HOLDS = f"{A}/input-watchdog.holds"
+LOG = f"{A}/logs/input-watchdog.log"
+DRY = os.environ.get("WATCHDOG_DRYRUN") == "1"
+
+def log(line):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with open(LOG, "a") as fh:
+        fh.write(f"[{stamp}] {line}\n")
+    print(line)
+
+def holds():
+    out = {}
+    try:
+        for ln in open(HOLDS):
+            ln = ln.split("#", 1)[0].strip()
+            if not ln:
+                continue
+            ws, until = ln.split()
+            out[ws] = int(until)
+    except FileNotFoundError:
+        pass
+    except ValueError:
+        log(f"WARNING: malformed holds line ignored in {HOLDS}")
+    return out
+
+def sessions():
+    r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name} #{session_attached}"],
+                       capture_output=True, text=True)
+    for ln in r.stdout.splitlines():
+        parts = ln.split()
+        if len(parts) == 2 and parts[0].startswith("agent-"):
+            yield parts[0][len("agent-"):], parts[1] != "0"
+
+def busy(ws):
+    """True while the pane shows a RUNNING turn. Text queued mid-turn self-delivers when the turn
+    ends — kicking it is at best churn (C-u + re-paste of an already-queued message). The watchdog
+    exists for IDLE strands only (validated live 2026-07-16: five busy agents with queued
+    directives armed on the first tick; none of them was stuck)."""
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-t", f"agent-{ws}.2"],
+                       capture_output=True, text=True)
+    tail = "\n".join(r.stdout.splitlines()[-20:])
+    return bool(re.search(r"esc to interrupt|[✻✽✶✢·] [A-Z][a-z]+ing…", tail))
+
+def stuck_text(ws):
+    """What `fleet-msg kick --dry` would submit — None if clear/down/dead (its gates)."""
+    r = subprocess.run([f"{BIN}/fleet-msg", "kick", ws, "--dry"], capture_output=True, text=True)
+    m = re.search(r"WOULD submit stuck input: '(.*)'\s*$", r.stdout, re.S)
+    if not m:
+        return None
+    txt = "".join(c for c in m.group(1) if 32 <= ord(c) < 127).strip()
+    return txt if len(txt) >= 3 else None
+
+def main():
+    try:
+        state = json.load(open(STATE))
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+    hold, now, seen = holds(), int(time.time()), set()
+    for ws, attached in sessions():
+        seen.add(ws)
+        if attached:
+            state.pop(ws, None)          # human present — their box, their Enter
+            continue
+        if hold.get(ws, 0) > now:
+            state.pop(ws, None)          # deliberately parked — do not age it toward firing
+            continue
+        if busy(ws):
+            state.pop(ws, None)          # queued mid-turn text self-delivers at turn end
+            continue
+        txt = stuck_text(ws)
+        if txt is None:
+            state.pop(ws, None)
+            continue
+        sig = hashlib.sha1(txt.encode()).hexdigest()
+        if state.get(ws) == sig:         # second consecutive sighting of the SAME text → fire
+            if DRY:
+                log(f"DRYRUN {ws}: would kick stuck input: {txt!r}")
+            else:
+                r = subprocess.run([f"{BIN}/fleet-msg", "kick", ws], capture_output=True, text=True)
+                log(f"KICKED {ws}: {r.stdout.strip() or r.stderr.strip()}")
+            state.pop(ws, None)
+        else:
+            state[ws] = sig              # first sighting — arm
+    for ws in list(state):
+        if ws not in seen:
+            state.pop(ws)
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(state, open(STATE, "w"))
+
+if __name__ == "__main__":
+    main()

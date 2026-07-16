@@ -18,7 +18,7 @@ check_not(){ local d="$1"; shift; if "$@"; then bad "$d"; else ok "$d"; fi; }
 
 export HOME="$TMP"
 A="$TMP/.agents"
-mkdir -p "$A"/{accounts/acct-a,cfg/ws1,confined-cfg/cli1} "$TMP/.claude/projects" "$TMP/bin" "$TMP/.local/bin"
+mkdir -p "$A"/{accounts/acct-a,cfg/ws1,client-cfg/cli1} "$TMP/.claude/projects" "$TMP/bin" "$TMP/.local/bin"
 ln -sfn "$TMP/.claude/projects" "$A/accounts/acct-a/projects"
 ln -sfn "$TMP/.claude/projects" "$A/cfg/ws1/projects"
 
@@ -84,7 +84,7 @@ run_guard
 # Scope the assertion to THIS guard. `test -s alerts.txt` also caught the disk/liveness guards, so a
 # real low-disk page on the host failed a test about env parsing — the classic over-broad assertion
 # that turns an unrelated true positive into a red suite.
-check_not "no alert for DISABLE_AUTOUPDATER (a real fleet sets this)" bash -c "grep -q 'CONFIG DRIFT' '$TMP/alerts.txt' 2>/dev/null"
+check_not "no alert for DISABLE_AUTOUPDATER (clientx really sets this)" bash -c "grep -q 'CONFIG DRIFT' '$TMP/alerts.txt' 2>/dev/null"
 
 echo "== a secret in an env block is never echoed into logs or messages =="
 rm -f "$A/.session-guard-alert."*
@@ -109,9 +109,9 @@ run_guard
 check_not "no FAILED UNITS alert when none are failed" bash -c "grep -q 'FAILED UNITS' '$TMP/alerts.txt' 2>/dev/null"
 
 echo "== failed-unit sweep: a failed unit pages, and a NEW failure re-pages inside the window =="
-printf 'pilot-qe.service loaded failed failed compute pilot\n' > "$TMP/fixture-failed-usr.txt"
+printf 'c009r3-qe.service loaded failed failed QE pilot\n' > "$TMP/fixture-failed-usr.txt"
 run_guard
-check "a failed user unit is alerted"        bash -c "grep -q 'FAILED UNITS.*usr:pilot-qe' '$TMP/alerts.txt'"
+check "a failed user unit is alerted"        bash -c "grep -q 'FAILED UNITS.*usr:c009r3-qe' '$TMP/alerts.txt'"
 run_guard
 check_not "same failed set is throttled"     bash -c "grep -q 'FAILED UNITS' '$TMP/alerts.txt' 2>/dev/null"
 printf 'logrotate.service loaded failed failed Rotate logs\n' > "$TMP/fixture-failed-sys.txt"
@@ -136,19 +136,23 @@ run_guard
 check_not "a non-compute unit is never a campaign" bash -c "grep -q 'CAMPAIGN STALL: nginx' '$TMP/alerts.txt' 2>/dev/null"
 rm -f "$TMP"/fixture-running-*.txt "$TMP"/fixture-journal-*.ts
 
+
+
 echo "== fleet-model drift: .fleet-model disagreeing with descriptors pages (the disarmed-gating find) =="
 rm -f "$A"/.session-guard-alert.*
 mkdir -p "$A/accounts" "$A/projects"
-printf 'MODEL="claude-fable-5"\nROOT="/x"\n' > "$A/projects/wsA.env"
-printf 'MODEL="claude-fable-5"\nROOT="/x"\n' > "$A/projects/wsB.env"
+printf 'MODEL="claude-fable-5"\nROOT="'"$TMP"'"\n' > "$A/projects/wsA.env"
+printf 'MODEL="claude-fable-5"\nROOT="'"$TMP"'"\n' > "$A/projects/wsB.env"
+mkdir -p "$A/bin"; cp "$REPO/bin/fleet-invariants" "$A/bin/fleet-invariants"; chmod +x "$A/bin/fleet-invariants"
+printf 'acct-a\n' > "$A/accounts/.rotation"; printf '{}' > "$A/accounts/acct-a/.claude.json"; echo acct-a > "$A/accounts/.active"
 echo claude-opus-4-8 > "$A/accounts/.fleet-model"
 run_guard
-check "drift between .fleet-model and descriptors pages" bash -c "grep -q 'FLEET-MODEL DRIFT' '$TMP/alerts.txt'"
-check "the alert carries the one-line fix"               bash -c "grep -q 'fleet-model' '$TMP/alerts.txt'"
+check "drift between .fleet-model and descriptors pages" bash -c "grep -q 'INVARIANTS VIOLATED.*fleet-model' '$TMP/alerts.txt'"
+check "the alert names the violated invariant"           bash -c "grep -q 'fleet-model-vs-descriptors' '$TMP/alerts.txt'"
 echo claude-fable-5 > "$A/accounts/.fleet-model"
 rm -f "$A"/.session-guard-alert.*
 run_guard
-check_not "agreement is silent"                          bash -c "grep -q 'FLEET-MODEL DRIFT' '$TMP/alerts.txt' 2>/dev/null"
+check_not "agreement is silent"                          bash -c "grep -q 'INVARIANTS VIOLATED' '$TMP/alerts.txt' 2>/dev/null"
 rm -f "$A/projects/wsA.env" "$A/projects/wsB.env" "$A/accounts/.fleet-model"
 
 echo "== stall override: file progress counts even when the journal is silent =="

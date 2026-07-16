@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# fleet-invariants — assert every cross-state truth the fleet depends on, in ONE place.
+#
+# WHY THIS EXISTS (2026-07-16): the fleet's worst failures are never crashes — they are two pieces
+# of state quietly disagreeing. accounts/.fleet-model said opus while the fleet ran Fable, and
+# per-model cap gating was silently DISARMED for rotation decisions. Nothing was down, nothing
+# errored; the system was simply wrong. Every such pair needs a standing assertion, and new ones
+# belong HERE, not as one-off checks scattered through the guards. session-guard runs this every
+# sweep and pages on failures; it also runs standalone (exit 0 = all hold, 1 = violations listed).
+#
+# Adding an invariant: one `inv <name> <test...>` line. Keep the name stable — it is the alert key.
+set -uo pipefail
+A="${A:-$HOME/.agents}"
+FAILS=0
+inv(){ # inv <name> <description> <command...>
+  local name="$1" desc="$2"; shift 2
+  if "$@" >/dev/null 2>&1; then
+    [ "${VERBOSE:-}" = 1 ] && echo "ok   $name"
+  else
+    echo "FAIL $name — $desc"
+    FAILS=$((FAILS+1))
+  fi
+}
+
+# --- model/routing state -------------------------------------------------------------------------
+_fleet_model(){ cat "$A/accounts/.fleet-model" 2>/dev/null; }
+_desc_majority(){ grep -h '^MODEL=' "$A"/projects/*.env 2>/dev/null | sed 's/^MODEL="\([^"]*\)".*/\1/' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'; }
+inv fleet-model-vs-descriptors \
+    ".fleet-model ($(_fleet_model)) != descriptor majority ($(_desc_majority)) — cap gating keyed off the wrong model (the 2026-07-16 disarm)" \
+    bash -c '[ -z "$(cat "'"$A"'/accounts/.fleet-model" 2>/dev/null)" ] || [ "$(cat "'"$A"'/accounts/.fleet-model")" = "'"$(_desc_majority)"'" ]'
+
+# --- account state -------------------------------------------------------------------------------
+_active(){ cat "$A/accounts/.active" 2>/dev/null; }
+inv active-account-exists \
+    ".active names '$(_active)' but accounts/$(_active)/.claude.json does not exist — swaps and launches will fail or misroute" \
+    test -f "$A/accounts/$(_active)/.claude.json"
+inv active-in-rotation \
+    ".active ('$(_active)') is not in the .rotation allow-list — account-watch cannot reason about the account the fleet is on" \
+    grep -qx "$(_active)" "$A/accounts/.rotation"
+
+# --- session integrity ---------------------------------------------------------------------------
+inv session-ids-unique \
+    "two descriptors share a SESSION_ID — two workspaces would write ONE conversation file (divergence incident class)" \
+    bash -c 'dups=$(grep -h "^SESSION_ID=" "'"$A"'"/projects/*.env 2>/dev/null | sort | uniq -d); [ -z "$dups" ]'
+inv descriptor-roots-exist \
+    "a descriptor names a ROOT directory that does not exist — its agent cannot launch" \
+    bash -c 'for f in "'"$A"'"/projects/*.env; do r=$(grep -oP "^ROOT=\"\K[^\"]+" "$f" | head -1); r="${r/#\$HOME/$HOME}"; [ -d "$r" ] || exit 1; done'
+
+# --- credential placement (the rename-write trap) ------------------------------------------------
+inv no-creds-in-composed-cfg \
+    "a .credentials.json exists inside a composed cfg dir — the CLI's rename-write will fork the rotating refresh token and kill the account's copy" \
+    bash -c '! ls "'"$A"'"/cfg/*/.credentials.json "'"$A"'"/cfg/*/.claude/.credentials.json 2>/dev/null | grep -q .'
+
+# --- wiring the guards themselves depend on ------------------------------------------------------
+inv profiles-linked \
+    "~/.agents/profiles does not resolve — profile compose fails closed and profiled workspaces cannot launch" \
+    bash -c '[ ! -e "'"$A"'/profiles" ] || [ -d "'"$A"'/profiles/" ]'
+inv stall-conf-paths-exist \
+    "a stall-progress.conf override path is gone — that unit silently loses its file-progress signal and will false-page as stalled" \
+    bash -c 'conf="'"$A"'/stall-progress.conf"; [ -f "$conf" ] || exit 0
+             while read -r u path _; do
+               case "$u" in ""|\#*) continue;; esac
+               [ -e "$path" ] || exit 1
+             done < "$conf"'
+
+# --- mutual watchdog: is the OTHER monitor alive? ------------------------------------------------
+# session-guard runs this file, so it must not self-attest; it attests backup-watch, and
+# backup-watch independently attests session-guard's heartbeat. A monitor pair where each watches
+# the other is the smallest arrangement with no unwatched watcher.
+inv backup-watch-fresh \
+    "backup-status.txt is >26h old — backup-watch (the daily backup monitor) has itself stopped running" \
+    bash -c '[ ! -f "$HOME/.agents/backup-status.txt" ] || [ $(( $(date +%s) - $(stat -c %Y "$HOME/.agents/backup-status.txt") )) -lt 93600 ]'
+
+if [ "$FAILS" -gt 0 ]; then echo "== $FAILS invariant(s) VIOLATED =="; exit 1; fi
+[ "${VERBOSE:-}" = 1 ] && echo "== all invariants hold =="
+exit 0

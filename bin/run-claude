@@ -83,5 +83,7 @@ fi
 if [ -n "${MODEL:-}" ]; then
   CL_ARGS+=(--model "$MODEL"); echo "→ model: $MODEL (descriptor pin)"
 fi
+# EFFORT: descriptor pin, same durability rationale as MODEL (a per-process /effort reverts on bounce).
+if [ -n "${EFFORT:-}" ]; then export CLAUDE_CODE_EFFORT_LEVEL="$EFFORT"; echo "→ effort: $EFFORT (descriptor pin)"; fi
 claude "${CL_ARGS[@]}" || true
 echo; echo "[claude exited — this pane is now a shell. 'run-claude' to restart]"; exec bash

@@ -2,9 +2,9 @@
 """fleet-msg — inter-agent messaging: DIRECT delivery into the recipient's conversation + a durable,
 provenance-linked audit trail.
 
-DELIVERY (the operator, 2026-07-11 rebuild): a message from agent A to agent B is submitted straight into B's
+DELIVERY (operator, 2026-07-11 rebuild): a message from agent A to agent B is submitted straight into B's
 Claude session as a real turn — the way a user prompt is — so B actually processes and acts on it. No
-side-channel inbox to poll (that failed: messages sat unread/invisible; `ws-epsilon` idled on an unread
+side-channel inbox to poll (that failed: messages sat unread/invisible; a workspace idled on an unread
 kickoff, and the operator never saw replies that only reached his inbox). Delivery = paste into B's claude
 pane + Enter. If B is down, the message is queued and flushed into B's conversation on its next launch
 (active redelivery, never a poll).
@@ -98,7 +98,7 @@ def _resolve(to_raw, sender):
         t = tok.lstrip("@").lower()
         if t in ("all", "fleet", "everyone"):
             out += [w for w in _all_workspaces() if w != sender]
-        elif t in ("human", "operator", "owner"):
+        elif t in ("human", "sean", "owner"):
             out.append("main")
         else:
             out.append(tok)
@@ -125,6 +125,8 @@ def _pane_text(pane):
     return r.stdout if r.returncode == 0 else ""
 
 
+# Processes that mean "an agent is running in this pane". A dead pane has ONLY a shell in it —
+# run-claude ends with `exec bash`, and an OOM-killed agent leaves the launcher's shell behind.
 _AGENT_PROCS = {"claude", "claude-bin", "node", "bun", "codex", "opencode", "ssh", "bwrap"}
 
 
@@ -139,11 +141,11 @@ def _proctree(pid):
 def _agent_alive(pane):
     """Is a real agent running in this pane, or is it a bare shell?
 
-    THIS GATE EXISTS BECAUSE OF A LIVE INCIDENT. Delivery is a bracketed paste followed by Enter.
-    That is safe into an agent's input box — but a pane whose agent has died has dropped to a SHELL
-    (run-claude ends `exec bash`; an OOM-killed agent leaves the same), and there the paste+Enter
-    makes **bash execute the message text as commands**. The dead pane we found was full of the
-    wreckage:
+    THIS GATE EXISTS BECAUSE OF A LIVE INCIDENT (2026-07-15). Delivery is a bracketed
+    paste followed by Enter. That is safe into an agent's input box — but a pane whose agent has died
+    has dropped to a SHELL (run-claude ends `exec bash`; an OOM-killed agent leaves the same), and
+    there the paste+Enter makes **bash execute the message text as commands**. the dead pane was
+    still showing the wreckage:
         msg-20260715T005831Z-3666]: command not found
         bash: syntax error near unexpected token `main'
     A message is arbitrary text from another agent. Executing it as shell in the owner's home
@@ -170,43 +172,97 @@ def _agent_alive(pane):
     return False
 
 
-def _input_leftover(pane, needle):
-    """True if `needle` (a prefix of the pasted text) is still sitting in the ❯ input line — i.e. the
-    message was pasted but NOT submitted (the stuck-input bug). Empty input line → submitted/clear."""
-    for line in reversed(_pane_text(pane).splitlines()):
+def _composer(pane):
+    """(visible, text) for the ❯ composer line. visible=False means NO composer is rendered at all
+    (TUI still booting, resume picker, trust modal, full-screen dialog) — which is NOT the same as
+    an empty composer. The old code collapsed the two, so verification was blind during exactly the
+    window where Enters get eaten by a dialog (the post-relaunch swallow, 2026-07-16).
+
+    Reads WITH escapes (-e): an EMPTY composer renders a dim placeholder hint ('Try "..."') that a
+    plain capture returns as literal text — kick would then re-paste the placeholder as a message.
+    Typed/pasted input is never faint, so leading SGR containing param 2 right after ❯ = empty."""
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-e", "-J", "-t", pane],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, ""
+    # Bottom 8 lines only: the real composer renders at the pane bottom. During a boot-time
+    # transcript replay a PAST prompt's '❯' higher up would otherwise satisfy the readiness gate
+    # before the composer exists (review note on 3e286b4; same class as the guard's scrollback FPs).
+    tail = [l for l in r.stdout.splitlines() if l.strip()][-8:]
+    for line in reversed(tail):
         if "❯" in line:
-            after = line.split("❯", 1)[1].strip()
-            return bool(after) and needle[:20].strip() in after
-    return False
+            after = line.split("❯", 1)[1]
+            plain = re.sub(r"\x1b\[[0-9;]*m", "", after).strip()
+            lead = re.match(r"\s*((?:\x1b\[[0-9;]*m)+)", after)
+            dim = bool(lead) and any(p == "2"
+                                     for seq in re.findall(r"\x1b\[([0-9;]*)m", lead.group(1))
+                                     for p in seq.split(";"))
+            # Dim alone is NOT enough to call it a placeholder: QUEUED mid-turn input renders dim
+            # too (found live on a client workspace — a parked directive read as empty would blind every verify).
+            # The placeholder is dim AND hint-shaped; queued real text is dim and arbitrary.
+            if dim and re.fullmatch(r'Try "[^"]*"', plain):
+                return True, ""
+            return True, plain
+    return False, ""
 
 
 def _current_input(pane):
     """Text currently sitting in the ❯ input line (empty string if clear)."""
-    for line in reversed(_pane_text(pane).splitlines()):
-        if "❯" in line:
-            return line.split("❯", 1)[1].strip()
-    return ""
+    return _composer(pane)[1]
 
 
 def _submit(pane, text):
-    """Inject text as a SUBMITTED turn. The ONE load-bearing mechanic (found empirically 2026-07-11):
-    a bracketed paste, a short SETTLE DELAY, then Enter. Without the delay the Enter fires before the
-    paste settles and is swallowed — that was the entire stranding bug. Everything else the earlier
-    version did was unnecessary: NO idle-wait (a busy agent queues the paste as a mid-turn message —
-    verified live, idle and busy), NO input-clear (reliable delivery means nothing stale accumulates
-    to concatenate onto). One verify + re-Enter as cheap insurance against a rare swallowed Enter."""
+    """Inject text as a SUBMITTED turn. Returns "submitted", "stuck", or None (nothing pasted).
+
+    History: v1 pasted+Enter'd blind (stranded messages); v2 (2026-07-11) added a fixed 0.8s settle
+    + one unverified insurance Enter — still stranded 6 directives on 2026-07-16, all in windows
+    where the composer wasn't ready (booting TUI after a fleet swap) or the insurance Enter was
+    itself swallowed with nothing re-checking. v3 verifies every step against the composer:
+
+      1. READINESS GATE — never paste until a ❯ composer is rendered. Pasting at a modal/boot
+         screen sends the eventual Enter to the dialog, not the composer.
+      2. PASTE-ARRIVAL CONFIRM — fire Enter only once the text is visibly IN the composer
+         (strictly stronger than any fixed settle delay, and adapts to slow renders).
+      3. VERIFIED ENTER LOOP — after each Enter, confirm the composer actually cleared; retry
+         with escalating waits. A busy agent queues the message mid-turn (composer clears the
+         same way), so idle and busy both verify identically.
+
+    "stuck" (text visibly sitting after all retries) is a distinct outcome ON PURPOSE: the text IS
+    in the box, so the caller must NOT queue it for re-delivery (that double-delivers when the
+    input-watchdog or a kick later fires it). None = nothing landed — safe to queue."""
+    t0 = time.time()
+    while not _composer(pane)[0]:                         # 1. readiness gate
+        if time.time() - t0 > 25:
+            return None
+        time.sleep(0.5)
     try:
         subprocess.run(["tmux", "load-buffer", "-b", "fmsg", "-"], input=text.encode(), check=True)
         subprocess.run(["tmux", "paste-buffer", "-p", "-b", "fmsg", "-t", pane], check=True)
         subprocess.run(["tmux", "delete-buffer", "-b", "fmsg"], capture_output=True)
     except subprocess.CalledProcessError:
-        return False
-    time.sleep(0.8)                                       # let the bracketed paste settle — ESSENTIAL
-    subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], capture_output=True)
-    time.sleep(0.8)
-    if _input_leftover(pane, text.lstrip()[:20]):         # rare swallow → one more Enter
+        return None
+    t0 = time.time()
+    while time.time() - t0 < 5:                           # 2. paste-arrival confirm
+        vis, cur = _composer(pane)
+        if vis and cur:
+            break
+        time.sleep(0.3)
+    else:
+        vis, cur = _composer(pane)
+        if vis and not cur:
+            return None                                   # paste never arrived — nothing to strand
+    for wait in (0.8, 1.0, 1.5, 2.0, 3.0):                # 3. verified Enter loop
         subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], capture_output=True)
-    return True
+        time.sleep(wait)
+        vis, cur = _composer(pane)
+        if vis and not cur:
+            return "submitted"
+        if not vis:                                       # composer hidden (turn view/re-render):
+            time.sleep(1.0)                               # re-check once before trusting it
+            vis, cur = _composer(pane)
+            if not vis or not cur:
+                return "submitted"
+    return "stuck"
 
 
 def _wire(env):
@@ -221,8 +277,17 @@ def _deliver(name, env, no_submit=False):
     # submitting would EXECUTE this message as commands (see _agent_alive). Queue instead.
     if pane and not _agent_alive(pane):
         pane = None
-    if pane and _submit(pane, _wire(env)):
-        return "delivered"
+    if pane:
+        res = _submit(pane, _wire(env))
+        if res == "submitted":
+            return "delivered"
+        if res == "stuck":
+            # The text IS in the recipient's composer, just unsubmitted. Queuing it too would
+            # double-deliver once the input-watchdog / a kick fires it. Surface, don't re-queue.
+            print(f"fleet-msg: WARNING {name}: message pasted but Enter did not land after retries "
+                  f"— left in composer (input-watchdog will fire it, or: fleet-msg kick {name})",
+                  file=sys.stderr)
+            return "stuck"
     os.makedirs(PENDING, exist_ok=True)
     with open(f"{PENDING}/{name}.jsonl", "a") as fh:
         fh.write(json.dumps(env, ensure_ascii=False) + "\n")
@@ -255,9 +320,12 @@ def cmd_send(a):
     _append_log(rec)
     dv = [r for r, v in rec["recipients"].items() if v["status"] == "delivered"]
     q = [r for r, v in rec["recipients"].items() if v["status"] == "queued"]
+    st = [r for r, v in rec["recipients"].items() if v["status"] == "stuck"]
     out = f"{mid}  delivered→ {', '.join(dv) or 'none'}"
     if q:
         out += f"  |  QUEUED (down, flush on resume)→ {', '.join(q)}"
+    if st:
+        out += f"  |  STUCK-IN-COMPOSER (watchdog will fire)→ {', '.join(st)}"
     print(out)
     return mid
 
@@ -282,7 +350,7 @@ def cmd_flush(a):
         return
     pane = _claude_pane(name)
     # An up tmux session with a DEAD agent is the worst case for flush: it would submit EVERY queued
-    # message into a bash shell, executing each one in turn (that is what wrecked the pane we found).
+    # message into a bash shell, executing each one in turn (that is what wrecked the dead pane we found).
     # A dead agent is 'still down' as far as delivery is concerned — keep the queue, lose nothing.
     if pane and not _agent_alive(pane):
         print(f"({name}: session is up but its AGENT is dead — leaving "
@@ -294,8 +362,17 @@ def cmd_flush(a):
         return
     msgs = [json.loads(l) for l in open(p) if l.strip()]
     db = _db()
+    kept, flushed = [], 0
     for m in msgs:
-        _submit(pane, _wire(m))
+        res = _submit(pane, _wire(m))
+        if res != "submitted":
+            # v2 marked every flush delivered and deleted the queue — an unconfirmed submit lost
+            # the message entirely. Keep unconfirmed ones queued ("stuck" stays queued too: its
+            # text is in the composer, but flush re-wires the envelope so a later flush of the
+            # SAME id is idempotent for the reader and provenance stays truthful).
+            kept.append(m)
+            continue
+        flushed += 1
         dts = _now()
         db.execute("UPDATE messages SET status='delivered', delivered_ts=? WHERE msg_id=? AND recipient=?",
                    (dts, m["id"], name))
@@ -303,8 +380,15 @@ def cmd_flush(a):
                      "body": m["body"], "event": "flush-delivered", "recipient_session": _session_of(name)})
         time.sleep(0.5)
     db.commit(); db.close()
-    os.remove(p)
-    print(f"flushed {len(msgs)} queued message(s) into {name}'s conversation")
+    if kept:
+        with open(p, "w") as fh:
+            for m in kept:
+                fh.write(json.dumps(m, ensure_ascii=False) + "\n")
+        print(f"flushed {flushed}/{len(msgs)} queued message(s) into {name}'s conversation "
+              f"({len(kept)} unconfirmed, kept queued)")
+    else:
+        os.remove(p)
+        print(f"flushed {flushed} queued message(s) into {name}'s conversation")
 
 
 def cmd_kick(a):
@@ -329,21 +413,8 @@ def cmd_kick(a):
         print(f"{name}: WOULD submit stuck input: {cur!r}"); return
     subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], capture_output=True)  # clear the stranded
     time.sleep(0.4)                                                                # text, then re-submit
-    ok = _submit(pane, cur)
+    ok = _submit(pane, cur) == "submitted"
     print(f"{name}: {'submitted' if ok else 'FAILED to submit'} stuck input: {cur!r}")
-
-
-def _since_iso(v):
-    """--since accepts an ISO timestamp OR a duration like 90m / 2h / 7d (what the docs promise)."""
-    if not v:
-        return None
-    m = re.fullmatch(r"(\d+)([mhd])", v.strip())
-    if not m:
-        return v                      # assume ISO; string compare works for ISO-8601
-    n, unit = int(m.group(1)), m.group(2)
-    secs = n * {"m": 60, "h": 3600, "d": 86400}[unit]
-    return (datetime.datetime.now(datetime.timezone.utc)
-            - datetime.timedelta(seconds=secs)).replace(tzinfo=None).isoformat() + "Z"
 
 
 def cmd_log(a):
@@ -358,7 +429,7 @@ def cmd_log(a):
     if a.get("to"):
         where.append("recipient=?"); params.append(a["to"])
     if a.get("since"):
-        where.append("ts>=?"); params.append(_since_iso(a["since"]))
+        where.append("ts>=?"); params.append(a["since"])
     q = "SELECT ts,sender,recipient,status,msg_id,body FROM messages"
     if where:
         q += " WHERE " + " AND ".join(where)

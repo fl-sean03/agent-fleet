@@ -93,7 +93,7 @@ echo "== disk: warn before agents start failing to write =="
 rm -f "$A/.session-guard-alert."*
 rm -f "$TMP/alerts.txt"; DISK_MIN_GB=999999 bash "$REPO/bin/session-guard" >/dev/null 2>&1
 check "a low disk floor alerts"           bash -c "grep -q 'DISK' '$TMP/alerts.txt'"
-check "it explains the starvation shape"  bash -c "grep -q 'starves on its own next write' '$TMP/alerts.txt'"
+check "it explains the starvation shape"  bash -c "grep -q 'starved on its own next write' '$TMP/alerts.txt'"
 rm -f "$A/.session-guard-alert."*
 rm -f "$TMP/alerts.txt"; DISK_MIN_GB=0 bash "$REPO/bin/session-guard" >/dev/null 2>&1
 check_not "ample disk does NOT alert"     bash -c "grep -q 'DISK' '$TMP/alerts.txt' 2>/dev/null"

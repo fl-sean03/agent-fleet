@@ -67,6 +67,28 @@ email_of(){ python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get(
 # that cannot serve Fable: it is LEFT on its current account (not bounced), loudly, and reported.
 FABLE_BLOCK_PCT="${FABLE_BLOCK_PCT:-99}"
 LEFT_BEHIND_F="$ACCTS/.swap-leftbehind"    # ws names Phase A leaves behind; read+cleared by the tail
+INTERRUPTED_F="$ACCTS/.swap-interrupted"   # ws that were MID-TURN when we bounced them (see ws_busy)
+
+# ws_busy <ws> — was this agent actively working when we reached it? A bounce kills the running
+# turn, and a --resume'd session sits idle at the prompt afterward — so an agent busy at bounce
+# time needs a resume nudge or its task silently dies. Static AUTOCONTINUE=yes never covered this:
+# on 2026-07-16 two account swaps decapitated long agent runs mid-flight, twice, and
+# only the four AUTOCONTINUE workspaces got nudged. Busy-at-bounce is the CORRECT nudge criterion —
+# an agent mid-turn is by definition doing something worth resuming.
+ws_busy(){
+  tmux capture-pane -p -t "agent-$1:main.2" 2>/dev/null | grep -q "esc to interrupt"
+}
+# verify_submitted <ws> — a nudge is a paste + Enter; during post-relaunch churn the Enter can be
+# swallowed, leaving the nudge SITTING IN THE INPUT BOX (observed live: a directive
+# stuck unsubmitted, agent idle for an hour looking nudged). Verify the input box
+# actually cleared; if not, one kick submits whatever is stuck.
+verify_submitted(){
+  local ws="$1"; sleep 2
+  local line; line=$(tmux capture-pane -p -t "agent-$ws:main.2" 2>/dev/null | grep "❯" | tail -1)
+  if printf '%s' "$line" | grep -qE "❯ .+"; then
+    "$A/bin/fleet-msg" kick "$ws" >>"$LOG" 2>&1 && log "nudge for $ws was stuck in the input box — kicked"
+  fi
+}
 RC_MOVED_F="$ACCTS/.swap-rcmoved"          # RC-enabled ws that MOVED accounts (orphaned-bridge reminder)
 fable_blocked(){ # <acct> → rc 0 when <acct> cannot serve Fable NOW: fresh .fable-cap marker OR the
   # usage endpoint's per-model fable utilization >= FABLE_BLOCK_PCT. Endpoint errors → not blocked
@@ -211,7 +233,7 @@ if [ "$TAILONLY" = 0 ] && [ -z "$ONLYCONFINED" ]; then
   echo "$ACCT" > "$ACCTS/.active"
   log "=== swap-fleet → $ACCT START (others=${#others[@]} confined workspaces=${#CONFINED_WS[@]} main=$has_main) ==="
   a_ok=0; a_moved=0; a_fail=()
-  rm -f "$LEFT_BEHIND_F" "$RC_MOVED_F"   # fresh swap → fresh cross-phase notes (read by the tail)
+  rm -f "$LEFT_BEHIND_F" "$RC_MOVED_F" "$INTERRUPTED_F"   # fresh swap → fresh cross-phase notes (read by the tail)
   for w in "${others[@]}"; do
     # per-model gate: a Fable-pinned workspace never boards a Fable-blocked account — leave it
     # UNTOUCHED (not even bounced) on its current account; the tail reports the exception to main.
@@ -220,7 +242,11 @@ if [ "$TAILONLY" = 0 ] && [ -z "$ONLYCONFINED" ]; then
       echo "$w" >> "$LEFT_BEHIND_F"; a_ok=$((a_ok+1)); continue
     fi
     log "A: swapping $w → $ACCT"
+    was_busy=0; ws_busy "$w" && { was_busy=1; }
     aout=$("$A/bin/swap-account" "$w" "$ACCT" 2>&1); rc=$?; printf '%s\n' "$aout" >>"$LOG"
+    if [ "$was_busy" = 1 ] && ! printf '%s' "$aout" | grep -q "already on"; then
+      echo "$w" >> "$INTERRUPTED_F"
+    fi
     if [ "$rc" = 0 ] && verify_ws "$w"; then
       if printf '%s' "$aout" | grep -q "already on"; then
         log "A: = $w already on $ACCT (verified)"
@@ -313,17 +339,26 @@ run_tail(){
       hold_active=1; hold_line=$("$A/bin/fleet-hold" status 2>/dev/null || echo "HOLD ACTIVE")
       log "fleet-hold active — post-swap nudges will say STAY IDLE ($hold_line)"
     fi
-    for f in "$A"/projects/*.env; do
-      grep -qE '^AUTOCONTINUE="?yes' "$f" || continue; local ws; ws=$(basename "$f" .env)
+    # Nudge set = static AUTOCONTINUE=yes ∪ DYNAMIC busy-at-bounce (captured per-phase above).
+    # The static flag alone decapitated long agent runs across account swaps —
+    # an agent that was mid-turn when bounced gets a resume nudge whether or not it opted in.
+    local nudge_list; nudge_list=$( { grep -lE '^AUTOCONTINUE="?yes' "$A"/projects/*.env 2>/dev/null | xargs -rn1 basename | sed 's/\.env$//'
+                                      cat "$INTERRUPTED_F" 2>/dev/null; } | sort -u )
+    for ws in $nudge_list; do
+      [ "$ws" = main ] && continue    # main has its own tailored nudge below
+      tmux has-session -t "agent-$ws" 2>/dev/null || continue
+      local was_cut=""; grep -qx "$ws" "$INTERRUPTED_F" 2>/dev/null && was_cut=" You were INTERRUPTED MID-TURN by this bounce — your last task is unfinished, not done."
       if [ "$hold_active" = 1 ]; then
-        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT. A FLEET HOLD is ACTIVE ($hold_line) — do NOT resume work; checkpoint if needed and stay idle until the hold is lifted." >>"$LOG" 2>&1 && log "nudged $ws (hold-aware: stay idle)"
+        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT.$was_cut A FLEET HOLD is ACTIVE ($hold_line) — do NOT resume work; checkpoint if needed and stay idle until the hold is lifted." >>"$LOG" 2>&1 && log "nudged $ws (hold-aware: stay idle)"
       else
-        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT. Your work is checkpointed on disk — continue exactly where you left off from your on-disk notes/checkpoints. Keep going." >>"$LOG" 2>&1 && log "nudged $ws"
+        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT.$was_cut Your work is checkpointed on disk — re-read your last message and continue exactly where you left off. Keep going." >>"$LOG" 2>&1 && log "nudged $ws${was_cut:+ (was mid-turn)}"
       fi
+      verify_submitted "$ws"
       # redeliver any inter-agent messages that were queued while this agent was bounced — they get
-      # SUBMITTED into its conversation now (active redelivery; not a poll). See docs/MESSAGING.md.
+      # SUBMITTED into its conversation now (active redelivery; not a poll). See docs/fleet-messaging.md.
       "$AGENTCTL" flush "$ws" >>"$LOG" 2>&1 || true
     done
+    rm -f "$INTERRUPTED_F"
     # main ALWAYS gets a resume nudge when it was bounced: a --resume'd session sits idle at the prompt
     # until spoken to, so without this the fleet-operator conversation stalls after every swap
     # (the operator observed exactly this, 2026-07-09). Tailored text — main resumes its own interrupted turn.
@@ -333,6 +368,7 @@ run_tail(){
       else
         "$AGENTCTL" send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. Resume autonomously: re-read your own last message, verify this swap completed cleanly (swap-fleet.log phases + fleet/model state), then continue executing whatever you were doing. Do not wait for the operator." >>"$LOG" 2>&1 && log "nudged main (resume-after-bounce)"
       fi
+      verify_submitted main
       "$AGENTCTL" flush main >>"$LOG" 2>&1 || true
     fi
   else

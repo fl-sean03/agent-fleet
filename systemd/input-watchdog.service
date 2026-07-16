@@ -1,0 +1,6 @@
+[Unit]
+Description=input-watchdog — auto-submit directives stranded unsubmitted in idle agent composers
+
+[Service]
+Type=oneshot
+ExecStart=%h/.agents/bin/input-watchdog

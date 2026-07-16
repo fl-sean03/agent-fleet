@@ -10,6 +10,13 @@
 #     (a real transcript-loss failure). Logged so we can intervene (manual /compact or fresh session) BEFORE a bounce.
 #  3) ROUTING GUARD — alert if a fleet agent is not talking to Anthropic directly, or if a config dir
 #     it reads has grown a settings `env` block. See the incident note at the guard itself.
+#  4) LIVENESS + RESOURCE GUARD — is the agent actually THERE, and is the machine about to kill it?
+#     (2026-07-16: the fleet had guards for transcripts, stuck context, rotation and routing — but
+#     none for "the agent is simply gone". A workspace agent was OOM-killed at 08:27 and NOTHING noticed for
+#     ~19h; idle-down even logged "keep <ws> — recent activity", because its liveness proxy is
+#     transcript mtime, which cannot tell a dead agent from a quiet one. Separately, a compute
+#     campaign filled the disk with its own scratch and starved itself to death, unremarked.)
+set -uo pipefail
 A="$HOME/.agents"; ARCH="$A/session-archive"; LOG="$A/session-guard.log"
 log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
 mkdir -p "$ARCH"
@@ -28,7 +35,7 @@ alert_main(){
 
 # 0) shared-store integrity preflight (rebase 2026-07-01): every ACCOUNT profile's projects/ must
 # resolve to the shared host store — a diverged copy silently forks sessions on account swap.
-# (confined-cfg profiles are deliberately isolated and are NOT checked.)
+# (client-cfg profiles are deliberately isolated and are NOT checked.)
 HOST_STORE="$(readlink -f "$HOME/.claude/projects" 2>/dev/null || true)"
 # cfg/* are the COMPOSED per-workspace config dirs (PROFILE= workspaces, 2026-07-15). They carry the
 # same invariant for the same reason: their projects/ must be the one shared store.
@@ -39,7 +46,7 @@ for p in "$A"/accounts/*/projects "$A"/cfg/*/projects; do
 done
 
 # 1) archive transcripts from host + every account profile + every confined client
-for base in "$HOME/.claude" "$A"/accounts/* "$A"/confined-cfg/*; do
+for base in "$HOME/.claude" "$A"/accounts/* "$A"/client-cfg/*; do
   [ -d "$base/projects" ] || continue
   name=$(basename "$base")
   rsync -a --prune-empty-dirs --include='*/' --include='*.jsonl' --exclude='*' \
@@ -93,9 +100,9 @@ for pid in $(pgrep -x claude 2>/dev/null); do
     alert_main "routing-$ws" "ROUTING OVERRIDE on '$ws': its live process has $var=$val. A fleet agent should talk to Anthropic directly; this is how the 2026-07-15 main incident looked (a plugin rerouted it to a local proxy and it ran on a non-Anthropic model unnoticed). Verify this is intended; if not, check that workspace's config dir settings.json for an 'env' block and relaunch."
   done
 done
-for s in "$HOME"/.claude/settings.json "$A"/accounts/*/settings.json "$A"/cfg/*/settings.json "$A"/confined-cfg/*/settings.json; do
+for s in "$HOME"/.claude/settings.json "$A"/accounts/*/settings.json "$A"/cfg/*/settings.json "$A"/client-cfg/*/settings.json; do
   [ -f "$s" ] || continue
-  # Only ROUTING keys, not any env block: legitimate fleet settings carry benign env (a real fleet sets
+  # Only ROUTING keys, not any env block: legitimate fleet settings carry benign env (one client workspace sets
   # DISABLE_AUTOUPDATER). A guard that fires on those trains everyone to ignore it.
   hits=$(python3 -c '
 import json,sys
@@ -110,19 +117,19 @@ if not isinstance(env,dict): sys.exit(1)
 found=sorted(set(env) & KEYS)
 print(",".join(found)); sys.exit(0 if found else 1)' "$s" 2>/dev/null) || continue
   log "!!! SETTINGS ROUTING OVERRIDE: $s env block sets $hits — injected into every agent using this config dir"
-  alert_main "settingsenv-$(basename "$(dirname "$s")")" "CONFIG DRIFT: $s has an 'env' block setting $hits, which is injected into every agent that reads this config dir. That is exactly the vector that rerouted main to a local proxy on 2026-07-15. Confirm it is intended, or remove it and relaunch the affected workspaces."
+  alert_main "settingsenv-$(basename "$(dirname "$s")")" "CONFIG DRIFT: $s has an 'env' block setting $hits, which is injected into every agent that reads this config dir. That is exactly the vector that rerouted an agent to a local proxy. Confirm it is intended, or remove it and relaunch the affected workspaces."
 done
 
 # =================================================================================================
-# 4) LIVENESS + RESOURCE GUARD
+# 4) LIVENESS + RESOURCE GUARD (2026-07-16)
 #
-# Every check above this line reads the tmux SESSION. Nothing read the agent inside it — so an agent
-# that dies leaves a session standing and the whole fleet reports healthy. We lost an agent for ~19h
-# to exactly this: OOM-killed, session up, every check green. Two related blind spots came with it:
-# idle-down's liveness proxy is transcript MTIME, which cannot tell a dead agent from a quiet one
-# (it "kept" the corpse for recent activity); and a job that fills the disk starves on its own next
-# write, which presents as "the work stopped", not "disk full".
-#
+# Three failures went unnoticed on 2026-07-15 because nothing was watching for them:
+#   • a workspace agent was OOM-killed (14.1GB RSS on a 30GB box). Its tmux session stayed up, so every
+#     existing check saw a healthy workspace. Dead for ~19h.
+#   • idle-down said "keep <ws> — recent activity": its liveness proxy is transcript MTIME, which
+#     cannot distinguish a dead agent from a quiet one.
+#   • a compute campaign filled the disk with its own scratch and then starved (its own next write
+#     failed). rpool hit 99% with nobody told.
 # So: check that each up workspace's agent process EXISTS, warn before memory kills it, warn before
 # the disk runs out, and report OOM kills after the fact.
 # =================================================================================================
@@ -137,19 +144,19 @@ mkdir -p "$LIVE_STATE"
 # a human about a healthy agent, and an over-broad match never reports a real death.
 agent_pattern(){
   case "$1" in
-    claude)         echo '^(claude|claude-bin|node)$' ;;   # confined execs the sandboxed claude-bin
+    claude)         echo '^(claude|claude-bin|node)$' ;;   # confined execs /opt/claude-bin
     claude-remote)  echo '^(ssh)$' ;;                      # the agent lives on the far end
     codex)          echo '^(codex|node)$' ;;
     opencode)       echo '^(opencode|node|bun)$' ;;
     *)              echo "^($1)$" ;;                       # unknown harness: match its own name
   esac
 }
-# Every pid under a tmux session's panes. The agent is a CHILD of the launcher script, so
-# pane_current_command is useless here — it reports `bash` for a perfectly healthy agent.
+# every pid under a tmux session's panes (the agent is a CHILD of the launcher script, so
+# pane_current_command is useless here — it reports `bash` for a perfectly healthy agent).
 # FULLY recursive, and it must be: the depth varies by isolation tier, so any fixed depth reports a
 # healthy agent as dead. A project agent is 2 levels down (bash → claude); a CONFINED one is 4
-# (bash → bwrap → bwrap → claude-bin), because bwrap re-execs itself. Guess the depth and you page a
-# human about a perfectly healthy confined agent every 15 minutes.
+# (bash → bwrap → bwrap → claude-bin) because bwrap re-execs itself. Guess the depth and you page a
+# human about a perfectly healthy client agent every 15 minutes.
 proctree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }
 pane_descendants(){
   local sess="$1" pid
@@ -173,14 +180,14 @@ for f in "$A"/projects/*.env; do
 
     if [ "$found" = 1 ]; then
       rm -f "$LIVE_STATE/$ws.$ag"
-      # MEMORY: warn while there is still time to act. The OOM killer takes the whole tmux scope with
-      # it, which is why an OOM-killed agent's pane VANISHES rather than dropping to a shell.
+      # MEMORY: warn while there is still time to act. the OOM killer takes
+      # the whole tmux scope with it, which is why its pane vanished instead of dropping to a shell.
       # Compare the RAW value and format only for display: rounding to %.1f BEFORE the comparison
       # silently floors everything under 0.05GB to "0.0", so a low threshold could never fire.
       gb=$(awk -v k="$hogrss" 'BEGIN{printf "%.1f", k/1048576}')
       if awk -v k="$hogrss" -v w="$MEM_WARN_GB" 'BEGIN{exit !(k/1048576 >= w)}'; then
         log "!!! MEMORY: $ws ($ag, pid $hog) at ${gb}GB RSS — approaching the OOM killer"
-        alert_main "mem-$ws" "MEMORY: workspace '$ws' is holding ${gb}GB RSS (warn >=${MEM_WARN_GB}GB). An OOM kill takes the tmux scope with it — the pane vanishes and nothing notices. Consider checkpointing it and restarting it (agentctl stop $ws && agentctl up $ws) BEFORE the kernel decides."
+        alert_main "mem-$ws" "MEMORY: workspace '$ws' is holding ${gb}GB RSS (warn >=${MEM_WARN_GB}GB). an OOM kill takes the tmux scope with it — the pane vanishes and nothing notices. Consider checkpointing it and restarting it (agentctl stop $ws && agentctl up $ws) BEFORE the kernel decides."
       fi
       continue
     fi
@@ -193,7 +200,7 @@ for f in "$A"/projects/*.env; do
       continue
     fi
     log "!!! DEAD AGENT: $ws ($ag) — tmux session is up but no $ag process exists (confirmed twice)"
-    alert_main "dead-$ws" "DEAD AGENT: workspace '$ws' looks up (its tmux session exists) but has NO $ag process — confirmed on two consecutive checks. Every session-level check reads this workspace as healthy, and idle-down will keep it (its liveness proxy is transcript mtime, which cannot see a dead agent). Its conversation is safe on disk; revive it with: agentctl stop $ws && agentctl up $ws"
+    alert_main "dead-$ws" "DEAD AGENT: workspace '$ws' looks up (its tmux session exists) but has NO $ag process — confirmed on two consecutive checks. Every session-level check reads this workspace as healthy, and idle-down would keep it (its liveness proxy is transcript mtime, which cannot see a dead agent). Its conversation is safe on disk; revive it with: agentctl stop $ws && agentctl up $ws"
   done
 done
 
@@ -208,6 +215,45 @@ if [ -n "$mem_avail_g" ] && [ "$mem_avail_g" -lt "$BOX_MEM_MIN_G" ]; then
   alert_main "boxmem" "BOX MEMORY: only ${mem_avail_g}G available (floor ${BOX_MEM_MIN_G}G). Top consumers: $top_mem. The next allocation failure will be whichever process asks first — likely an agent or a compute job, and the OOM killer takes its whole tmux scope."
 fi
 
+# STUCK INPUT: an idle agent with text sitting in its ❯ input box is a directive that never fired —
+# a bracketed paste whose Enter got swallowed (twice on 2026-07-16: 'keep going autonomously' sat
+# for an hour; the agent looked nudged and did nothing). Two consecutive sightings of the SAME text
+# = stuck, not mid-typing. Alert with the kick command; never auto-submit — the text might be a
+# human's half-typed draft, and pressing Enter on someone's behalf is a decision, not plumbing.
+STUCK_STATE="$A/.session-guard-stuckinput"; mkdir -p "$STUCK_STATE"
+for f in "$A"/projects/*.env; do
+  [ -e "$f" ] || continue
+  ws=$(basename "${f%.env}")
+  tmux has-session -t "agent-$ws" 2>/dev/null || continue
+  pane_txt=$(tmux capture-pane -p -t "agent-$ws:main.2" 2>/dev/null)
+  # only when IDLE: a busy agent legitimately holds queued input mid-turn
+  echo "$pane_txt" | grep -q "esc to interrupt" && { rm -f "$STUCK_STATE/$ws"; continue; }
+  # input box = the LAST ❯ line AND it must sit in the pane's bottom region — scrollback renders
+  # past turns as "❯ text" too, and during a relaunch those echoes can be the last ❯ visible
+  # (3 of 4 first-day pages were exactly this: stale scrollback read as stuck input).
+  # tr -cd '[:print:]' FIRST: an "empty" input line often carries non-ASCII residue — box-drawing
+  # borders, NBSP, the cursor block — which ASCII-only [:space:] stripping does not remove, so a
+  # bare '❯ ' read as stuck text (9-page storm, 2026-07-16 15:19). Multibyte chars are non-printable
+  # byte-wise in the C locale and get dropped here; then require >=3 real chars — a 1-2 char residue
+  # is never a directive.
+  cur=$(echo "$pane_txt" | tail -6 | grep "❯" | tail -1 | sed 's/.*❯ *//' | tr -cd '[:print:]' | tr -d '[:space:]')
+  # the queued-messages hint is UI text, not input
+  case "$cur" in ""|Pressuptoedit*) rm -f "$STUCK_STATE/$ws"; continue;; esac
+  [ "${#cur}" -ge 3 ] || { rm -f "$STUCK_STATE/$ws"; continue; }
+  # key the marker to the PANE PID as well as the text: a bounce replaces the pane, and a marker
+  # from the PREVIOUS process must never combine with the new one into a "two consecutive sweeps"
+  # page (main's finding, 2026-07-16: markers survived the 14:42 swap and false-paged 3 workspaces)
+  pane_pid=$(tmux display-message -p -t "agent-$ws:main.2" '#{pane_pid}' 2>/dev/null)
+  txt40=$(printf '%s' "$cur" | head -c 40)
+  sig="$txt40 pid=$pane_pid"
+  if [ -f "$STUCK_STATE/$ws" ] && [ "$(cat "$STUCK_STATE/$ws" 2>/dev/null)" = "$sig" ]; then
+    log "!!! STUCK INPUT: $ws idle with unsubmitted input ('${txt40}…') — two consecutive sweeps"
+    alert_main "stuckinput-$ws" "STUCK INPUT: workspace '$ws' is idle with text sitting unsubmitted in its input box ('${txt40}…') across two 15-min sweeps — a swallowed Enter means a directive that never fired (an agent sat idle an hour this way on 2026-07-16). If it is a fleet nudge/directive: fleet-msg kick $ws. If it might be a human's half-typed draft, leave it."
+  else
+    printf '%s' "$sig" > "$STUCK_STATE/$ws"
+  fi
+done
+
 # OOM POST-MORTEM: the kernel is the only witness to a kill, and the tmux scope dies with the agent,
 # so by the time anyone looks there is no process left to inspect. Surface it while the journal is warm.
 if command -v journalctl >/dev/null 2>&1; then
@@ -219,11 +265,11 @@ if command -v journalctl >/dev/null 2>&1; then
 fi
 
 # DISK: agents fail in confusing ways when they cannot write (a transcript write, a tool output, a
-# job's own output file). A job that fills the disk starves on its own next write — the failure that
-# reports itself as "the work stopped", not "disk full".
-# Attribution: a floor alert that names no consumer sends a human hunting; naming the top GROWER
-# (delta vs the last stored depth-1 scan) points at the writer. Bounded: depth 1, only computed
-# when an alert is firing, baseline refreshed on each attribution.
+# QE charge density). A runaway campaign filled the disk with its own scratch and then starved
+# on its own next write — the failure that reports itself as "the science stopped", not "disk full".
+# Attribution (main's prevention spec, 2026-07-16): a floor alert that names no consumer sends a
+# human hunting; naming the top GROWER (delta vs the last stored depth-1 scan) points at the writer.
+# Bounded: depth 1, only runs when an alert is firing, baseline refreshed on each attribution.
 DU_ROOT="${DU_ROOT:-$HOME}"
 attrib(){
   local base="$A/.session-guard-du.baseline" newf="$A/.session-guard-du.new" out=""
@@ -237,8 +283,9 @@ attrib(){
   printf '%s' "$out"
 }
 
-# EARLY growth catch: a runaway writer fills a disk over hours; catching it at +20G costs stopping
-# the writer and a few snapshots — catching it at 99% costs real recovery work.
+# EARLY growth catch: the 186G filled over ~30h and was only caught at 99%. A >=GROW_ALERT_G drop
+# between two 15-min runs is a runaway writer — naming it at +20G costs almost nothing to undo
+# (stop the writer, destroy the last few snapshots), at 99% it cost a month of rollback.
 AVAIL_STATE="$A/.session-guard-avail"; GROW_ALERT_G="${GROW_ALERT_G:-20}"
 avail_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -cd '0-9')
 prev_avail=$(tr -cd '0-9' < "$AVAIL_STATE" 2>/dev/null)
@@ -246,23 +293,23 @@ prev_avail=$(tr -cd '0-9' < "$AVAIL_STATE" 2>/dev/null)
 if [ -n "$prev_avail" ] && [ -n "$avail_gb" ] && [ $((prev_avail - avail_gb)) -ge "$GROW_ALERT_G" ]; then
   growers=$(attrib)
   log "!!! DISK GROWTH: ${prev_avail}G -> ${avail_gb}G free in one interval; growers: ${growers:-unattributed}"
-  alert_main "diskgrow" "DISK GROWTH: free space fell ${prev_avail}G -> ${avail_gb}G in ~15min. Top growers: ${growers:-unattributed}. Stop the writer while it is still cheap."
+  alert_main "diskgrow" "DISK GROWTH: free space fell ${prev_avail}G -> ${avail_gb}G in ~15min. Top growers: ${growers:-unattributed}. Caught this early, the cheap fix is stopping the writer and destroying only the last few snapshots (BACKUP.md F8) — at 99% it costs a month of rollback."
 fi
 
 if [ -n "$avail_gb" ] && [ "$avail_gb" -lt "$DISK_MIN_GB" ]; then
   pct=$(df --output=pcent / 2>/dev/null | tail -1 | tr -cd '0-9')
   growers=$(attrib)
   log "!!! DISK: only ${avail_gb}GB free on / (${pct}% used) — below the ${DISK_MIN_GB}GB floor; growers: ${growers:-unattributed}"
-  alert_main "disk" "DISK: only ${avail_gb}GB free on / (${pct}% used, floor ${DISK_MIN_GB}GB). Top consumers/growers: ${growers:-unattributed}. Agents fail in confusing ways when they cannot write, and a job that fills the disk starves on its own next write — which looks like 'the work stopped' rather than 'disk full'."
+  alert_main "disk" "DISK: only ${avail_gb}GB free on / (${pct}% used, floor ${DISK_MIN_GB}GB). Top consumers/growers: ${growers:-unattributed}. Agents fail in confusing ways when they cannot write — a campaign filled the disk and starved on its own next write, which looked like 'the science stopped' rather than 'disk full'."
 fi
 
 # =================================================================================================
-# 5) FAILED-UNIT + CAMPAIGN-STALL SWEEP
+# 5) FAILED-UNIT + CAMPAIGN-STALL SWEEP (stall-sweep prevention spec)
 #
-# Units fail silently: in the incident that motivated this, one unit sat failed NINE DAYS unseen,
-# and system maintenance units died at midnight on a full disk unseen. And an ACTIVE unit can be a
-# corpse: a compute campaign died mid-flight and read as 'the work stopped' for 16h because its
-# service stayed green while its log went silent.
+# Units fail silently: c009r3-qe sat failed NINE DAYS unseen; logrotate/dpkg-db-backup died at
+# midnight on the full disk unseen; idle-down reported failed on a cosmetic exit-status bug and
+# nobody noticed either. And an ACTIVE unit can be a corpse: demo campaign's campaign died mid-flight
+# and read as 'science stopped' for 16h because its service stayed green while its log went silent.
 # =================================================================================================
 # a) anything in --state=failed, user AND system. Throttle key = the failed SET, so a NEW failure
 #    pages immediately even while an old one sits inside the 6h window.
@@ -272,22 +319,22 @@ if [ -n "$failed_units" ]; then
   fkey=$(printf '%s' "$failed_units" | md5sum | cut -c1-10)
   flist=$(echo "$failed_units" | tr '\n' ' ')
   log "!!! FAILED UNITS: $flist"
-  alert_main "failedunits-$fkey" "FAILED UNITS: $flist — systemctl [--user] status <unit> for the why, reset-failed after fixing."
+  alert_main "failedunits-$fkey" "FAILED UNITS: $flist — systemctl [--user] status <unit> for the why, reset-failed after fixing. (Before this sweep a unit sat failed 9 days unseen.)"
 fi
 
-# c) MODEL-STATE drift: accounts/.fleet-model is account-watch's input for cap-relevance — if it
-#    says opus while the fleet runs Fable, per-model cap gating is silently DISARMED (found live
-#    2026-07-16: descriptors+sessions moved to Fable, .fleet-model still said opus). Cross-check it
-#    against the majority MODEL across descriptors; a mismatch is an armed-but-inert rotation.
-fm=$(cat "$A/accounts/.fleet-model" 2>/dev/null)
-maj=$(grep -h '^MODEL=' "$A"/projects/*.env 2>/dev/null | sed 's/^MODEL="\([^"]*\)".*/\1/' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
-if [ -n "$fm" ] && [ -n "$maj" ] && [ "$fm" != "$maj" ]; then
-  log "!!! FLEET-MODEL DRIFT: accounts/.fleet-model=$fm but descriptor majority=$maj"
-  alert_main "fleetmodel" "FLEET-MODEL DRIFT: accounts/.fleet-model says '$fm' but the descriptor majority is '$maj'. account-watch's cap-relevance gating keys off .fleet-model, so this drift silently disarms (or over-arms) per-model cap gating in rotation decisions. Fix: echo '$maj' > ~/.agents/accounts/.fleet-model (or correct the descriptors)."
-fi
+# c) FLEET INVARIANTS: every cross-state truth (model state, account state, session uniqueness,
+#    credential placement, watcher freshness) asserted in ONE canonical place — bin/fleet-invariants.
+#    New "two files disagree" classes get an invariant there, not another inline check here.
+#    Throttle key = hash of the violated set, so a NEW violation pages through an old one's window.
+inv_out=$("$A/bin/fleet-invariants" 2>&1) || {
+  ikey=$(printf '%s' "$inv_out" | md5sum | cut -c1-10)
+  log "!!! INVARIANTS: $(printf '%s' "$inv_out" | grep -c '^FAIL') violated"
+  printf '%s\n' "$inv_out" | while IFS= read -r l; do log "    $l"; done
+  alert_main "invariants-$ikey" "FLEET INVARIANTS VIOLATED: $(printf '%s' "$inv_out" | grep '^FAIL' | tr '\n' ' | ') Run: fleet-invariants (VERBOSE=1) — each failure line says what breaks and how."
+}
 
 # b) campaign-stall: a RUNNING compute service whose journal has gone silent. Pattern is
-#    configurable via COMPUTE_UNITS_RE; default catches a *-camp / *-qe / *-queue convention.
+#    configurable; default catches the *-camp / *-qe / *-queue naming convention.
 # NB: parenthesized default + `--` on the grep — a pattern that begins with a dash is otherwise
 # parsed as a grep OPTION, and the sweep dies silently behind its `|| true`.
 COMPUTE_RE="${COMPUTE_UNITS_RE:-(-camp|-qe|-queue)}"
@@ -317,8 +364,13 @@ for scope in "--user" ""; do
     sh=$(( (now_s - last_s) / 3600 ))
     if [ "$sh" -ge "$STALL_H" ]; then
       log "!!! CAMPAIGN STALL: $u is active but journal-silent for ${sh}h"
-      alert_main "stall-$u" "CAMPAIGN STALL: $u is active but has logged nothing for ${sh}h (threshold ${STALL_H}h) and has no fresh progress files ($STALL_CONF override). A campaign died like this and read as 'science stopped' for 16h. Check: journalctl $scope -u $u -n 30"
+      alert_main "stall-$u" "CAMPAIGN STALL: $u is active but has logged nothing for ${sh}h (threshold ${STALL_H}h) and has no fresh progress files. If this unit logs to FILES (a shell-redirect ExecStart is journal-silent by construction), add a line to $STALL_CONF: '$u <its-log-or-results-dir>'. A campaign died like this and read as 'science stopped' for 16h. Check: journalctl $scope -u $u -n 30"
     fi
   done < <(systemctl $scope list-units --type=service --state=running --no-legend --plain 2>/dev/null \
            | awk '{print $1}' | grep -E -- "$COMPUTE_RE" || true)
 done
+
+# HEARTBEAT — backup-watch attests this file's age daily (the mutual-watchdog pair: this guard
+# attests backup-watch via fleet-invariants; nobody is the unwatched watcher). Written LAST so a
+# fresh heartbeat means the whole sweep ran, not just started.
+date -u +%FT%TZ > "$A/.session-guard-heartbeat"
