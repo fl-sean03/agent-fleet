@@ -54,7 +54,7 @@ check "logged as well as alerted"                   grep -q "SETTINGS ROUTING OV
 
 echo "== throttling: a standing misconfiguration must not re-page every run =="
 run_guard
-check_not "second run inside the window sends nothing" test -s "$TMP/alerts.txt"
+check_not "second run inside the window sends nothing" bash -c "grep -q 'CONFIG DRIFT' '$TMP/alerts.txt' 2>/dev/null"
 
 echo "== benign env is NOT flagged (a guard that cries wolf gets ignored) =="
 rm -f "$A/.session-guard-alert."*
@@ -62,7 +62,10 @@ cat > "$A/accounts/acct-a/settings.json" <<'EOF'
 {"env":{"DISABLE_AUTOUPDATER":"1"},"cleanupPeriodDays":3650}
 EOF
 run_guard
-check_not "no alert for DISABLE_AUTOUPDATER (a real fleet sets this)" test -s "$TMP/alerts.txt"
+# Scope the assertion to THIS guard. `test -s alerts.txt` also caught the disk/liveness guards, so a
+# real low-disk page on the host failed a test about env parsing — the classic over-broad assertion
+# that turns an unrelated true positive into a red suite.
+check_not "no alert for DISABLE_AUTOUPDATER (a real fleet sets this)" bash -c "grep -q 'CONFIG DRIFT' '$TMP/alerts.txt' 2>/dev/null"
 
 echo "== a secret in an env block is never echoed into logs or messages =="
 rm -f "$A/.session-guard-alert."*

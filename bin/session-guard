@@ -8,7 +8,6 @@
 #  2) STUCK-SESSION ALERT — flag any live workspace at >=95% context or visibly mid-turn for a long
 #     time. Those are exactly the sessions whose in-memory transcript would be lost on a hard kill
 #     (a real transcript-loss failure). Logged so we can intervene (manual /compact or fresh session) BEFORE a bounce.
-set -uo pipefail
 #  3) ROUTING GUARD — alert if a fleet agent is not talking to Anthropic directly, or if a config dir
 #     it reads has grown a settings `env` block. See the incident note at the guard itself.
 A="$HOME/.agents"; ARCH="$A/session-archive"; LOG="$A/session-guard.log"
@@ -113,3 +112,107 @@ print(",".join(found)); sys.exit(0 if found else 1)' "$s" 2>/dev/null) || contin
   log "!!! SETTINGS ROUTING OVERRIDE: $s env block sets $hits — injected into every agent using this config dir"
   alert_main "settingsenv-$(basename "$(dirname "$s")")" "CONFIG DRIFT: $s has an 'env' block setting $hits, which is injected into every agent that reads this config dir. That is exactly the vector that rerouted main to a local proxy on 2026-07-15. Confirm it is intended, or remove it and relaunch the affected workspaces."
 done
+
+# =================================================================================================
+# 4) LIVENESS + RESOURCE GUARD
+#
+# Every check above this line reads the tmux SESSION. Nothing read the agent inside it — so an agent
+# that dies leaves a session standing and the whole fleet reports healthy. We lost an agent for ~19h
+# to exactly this: OOM-killed, session up, every check green. Two related blind spots came with it:
+# idle-down's liveness proxy is transcript MTIME, which cannot tell a dead agent from a quiet one
+# (it "kept" the corpse for recent activity); and a job that fills the disk starves on its own next
+# write, which presents as "the work stopped", not "disk full".
+#
+# So: check that each up workspace's agent process EXISTS, warn before memory kills it, warn before
+# the disk runs out, and report OOM kills after the fact.
+# =================================================================================================
+LIVE_STATE="$A/.session-guard-liveness"        # debounce: <ws> seen dead once already
+MEM_WARN_GB="${MEM_WARN_GB:-8}"                # a fleet agent is normally 0.2-0.5GB; 8 is far out
+DISK_MIN_GB="${DISK_MIN_GB:-25}"               # below this, agents start failing to write
+mkdir -p "$LIVE_STATE"
+
+# What process proves this workspace's agent is alive? Derived from the descriptor's AGENTS=, so the
+# check stays harness-agnostic — a remote workspace's agent IS its ssh, a confined one's is the
+# claude-bin inside bwrap. Getting this wrong in either direction is expensive: a false "dead" pages
+# a human about a healthy agent, and an over-broad match never reports a real death.
+agent_pattern(){
+  case "$1" in
+    claude)         echo '^(claude|claude-bin|node)$' ;;   # confined execs the sandboxed claude-bin
+    claude-remote)  echo '^(ssh)$' ;;                      # the agent lives on the far end
+    codex)          echo '^(codex|node)$' ;;
+    opencode)       echo '^(opencode|node|bun)$' ;;
+    *)              echo "^($1)$" ;;                       # unknown harness: match its own name
+  esac
+}
+# Every pid under a tmux session's panes. The agent is a CHILD of the launcher script, so
+# pane_current_command is useless here — it reports `bash` for a perfectly healthy agent.
+# FULLY recursive, and it must be: the depth varies by isolation tier, so any fixed depth reports a
+# healthy agent as dead. A project agent is 2 levels down (bash → claude); a CONFINED one is 4
+# (bash → bwrap → bwrap → claude-bin), because bwrap re-execs itself. Guess the depth and you page a
+# human about a perfectly healthy confined agent every 15 minutes.
+proctree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }
+pane_descendants(){
+  local sess="$1" pid
+  for pid in $(tmux list-panes -t "$sess:main" -F '#{pane_pid}' 2>/dev/null); do proctree "$pid"; done
+}
+
+for f in "$A"/projects/*.env; do
+  [ -e "$f" ] || continue
+  ws=$(basename "${f%.env}")
+  tmux has-session -t "agent-$ws" 2>/dev/null || continue          # down on purpose is not a failure
+  agents=$(grep -oP '^AGENTS="?\K[^"]+' "$f" 2>/dev/null | head -1); agents="${agents:-claude}"
+  for ag in $agents; do
+    pat=$(agent_pattern "$ag"); found=0; hog=""; hogrss=0
+    for pid in $(pane_descendants "agent-$ws"); do
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+      printf '%s' "$comm" | grep -qE "$pat" || continue
+      found=1
+      rss=$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null)
+      [ -n "$rss" ] && [ "$rss" -gt "$hogrss" ] && { hogrss=$rss; hog=$pid; }
+    done
+
+    if [ "$found" = 1 ]; then
+      rm -f "$LIVE_STATE/$ws.$ag"
+      # MEMORY: warn while there is still time to act. The OOM killer takes the whole tmux scope with
+      # it, which is why an OOM-killed agent's pane VANISHES rather than dropping to a shell.
+      # Compare the RAW value and format only for display: rounding to %.1f BEFORE the comparison
+      # silently floors everything under 0.05GB to "0.0", so a low threshold could never fire.
+      gb=$(awk -v k="$hogrss" 'BEGIN{printf "%.1f", k/1048576}')
+      if awk -v k="$hogrss" -v w="$MEM_WARN_GB" 'BEGIN{exit !(k/1048576 >= w)}'; then
+        log "!!! MEMORY: $ws ($ag, pid $hog) at ${gb}GB RSS — approaching the OOM killer"
+        alert_main "mem-$ws" "MEMORY: workspace '$ws' is holding ${gb}GB RSS (warn >=${MEM_WARN_GB}GB). An OOM kill takes the tmux scope with it — the pane vanishes and nothing notices. Consider checkpointing it and restarting it (agentctl stop $ws && agentctl up $ws) BEFORE the kernel decides."
+      fi
+      continue
+    fi
+
+    # DEAD — but debounce: an agent mid-bash-tool-call can momentarily present no matching process,
+    # and a guard that cries wolf gets ignored. Only alert on the SECOND consecutive sighting.
+    if [ ! -f "$LIVE_STATE/$ws.$ag" ]; then
+      date -u +%FT%TZ > "$LIVE_STATE/$ws.$ag"
+      log "liveness: $ws ($ag) has no agent process — re-checking next run before alerting"
+      continue
+    fi
+    log "!!! DEAD AGENT: $ws ($ag) — tmux session is up but no $ag process exists (confirmed twice)"
+    alert_main "dead-$ws" "DEAD AGENT: workspace '$ws' looks up (its tmux session exists) but has NO $ag process — confirmed on two consecutive checks. Every session-level check reads this workspace as healthy, and idle-down will keep it (its liveness proxy is transcript mtime, which cannot see a dead agent). Its conversation is safe on disk; revive it with: agentctl stop $ws && agentctl up $ws"
+  done
+done
+
+# OOM POST-MORTEM: the kernel is the only witness to a kill, and the tmux scope dies with the agent,
+# so by the time anyone looks there is no process left to inspect. Surface it while the journal is warm.
+if command -v journalctl >/dev/null 2>&1; then
+  oom=$(journalctl --user --since "-20min" --no-pager 2>/dev/null | grep -c "killed by the OOM killer" || true)
+  if [ "${oom:-0}" -gt 0 ]; then
+    log "!!! OOM: the kernel OOM-killed $oom process(es) in the last 20min (see: journalctl --user | grep OOM)"
+    alert_main "oomkill" "OOM KILL: the kernel killed $oom process(es) in the last 20 minutes. If a workspace's agent vanished, that is why — the tmux scope dies with it, so the pane disappears rather than dropping to a shell. Check 'agentctl status' for a session that is up with a missing agent pane, and revive it (its conversation is safe on disk)."
+  fi
+fi
+
+# DISK: agents fail in confusing ways when they cannot write (a transcript write, a tool output, a
+# job's own output file). A job that fills the disk starves on its own next write — the failure that
+# reports itself as "the work stopped", not "disk full".
+avail_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -cd '0-9')
+if [ -n "$avail_gb" ] && [ "$avail_gb" -lt "$DISK_MIN_GB" ]; then
+  pct=$(df --output=pcent / 2>/dev/null | tail -1 | tr -cd '0-9')
+  log "!!! DISK: only ${avail_gb}GB free on / (${pct}% used) — below the ${DISK_MIN_GB}GB floor"
+  alert_main "disk" "DISK: only ${avail_gb}GB free on / (${pct}% used, floor ${DISK_MIN_GB}GB). Agents fail in confusing ways when they cannot write, and a job that fills the disk starves on its own next write — which looks like 'the work stopped' rather than 'disk full'. Find the consumer (du -sh \$HOME/* | sort -rh | head) before something else dies."
+fi

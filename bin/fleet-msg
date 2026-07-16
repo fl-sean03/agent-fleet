@@ -125,6 +125,51 @@ def _pane_text(pane):
     return r.stdout if r.returncode == 0 else ""
 
 
+_AGENT_PROCS = {"claude", "claude-bin", "node", "bun", "codex", "opencode", "ssh", "bwrap"}
+
+
+def _proctree(pid):
+    out = [pid]
+    r = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
+    for c in r.stdout.split():
+        out.extend(_proctree(int(c)))
+    return out
+
+
+def _agent_alive(pane):
+    """Is a real agent running in this pane, or is it a bare shell?
+
+    THIS GATE EXISTS BECAUSE OF A LIVE INCIDENT. Delivery is a bracketed paste followed by Enter.
+    That is safe into an agent's input box — but a pane whose agent has died has dropped to a SHELL
+    (run-claude ends `exec bash`; an OOM-killed agent leaves the same), and there the paste+Enter
+    makes **bash execute the message text as commands**. The dead pane we found was full of the
+    wreckage:
+        msg-20260715T005831Z-3666]: command not found
+        bash: syntax error near unexpected token `main'
+    A message is arbitrary text from another agent. Executing it as shell in the owner's home
+    directory is remote code execution by accident — a body containing `$(...)` or backticks runs.
+    So: prove an agent is there before submitting; otherwise queue it (the same path a down
+    workspace already takes, flushed on next launch). Nothing is lost, and nothing is executed.
+
+    Deliberately matches the AGENT process, not "any non-shell": during a Bash tool call the pane
+    subtree is full of shells, but the agent process is still their parent — so a busy agent stays
+    correctly 'alive' and keeps its mid-turn delivery. Erring the other way would silently queue
+    messages to healthy agents until their next relaunch.
+    """
+    r = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return False
+    for pid in _proctree(int(r.stdout.strip())):
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                if fh.read().strip() in _AGENT_PROCS:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def _input_leftover(pane, needle):
     """True if `needle` (a prefix of the pasted text) is still sitting in the ❯ input line — i.e. the
     message was pasted but NOT submitted (the stuck-input bug). Empty input line → submitted/clear."""
@@ -172,6 +217,10 @@ def _wire(env):
 
 def _deliver(name, env, no_submit=False):
     pane = None if no_submit else _claude_pane(name)
+    # A pane exists != an agent is listening. If the agent is gone, the pane is a shell and
+    # submitting would EXECUTE this message as commands (see _agent_alive). Queue instead.
+    if pane and not _agent_alive(pane):
+        pane = None
     if pane and _submit(pane, _wire(env)):
         return "delivered"
     os.makedirs(PENDING, exist_ok=True)
@@ -232,6 +281,14 @@ def cmd_flush(a):
         print(f"({name}: nothing queued)")
         return
     pane = _claude_pane(name)
+    # An up tmux session with a DEAD agent is the worst case for flush: it would submit EVERY queued
+    # message into a bash shell, executing each one in turn (that is what wrecked the pane we found).
+    # A dead agent is 'still down' as far as delivery is concerned — keep the queue, lose nothing.
+    if pane and not _agent_alive(pane):
+        print(f"({name}: session is up but its AGENT is dead — leaving "
+              f"{sum(1 for _ in open(p))} message(s) queued rather than executing them in its shell. "
+              f"Revive it: agentctl stop {name} && agentctl up {name})")
+        return
     if not pane:
         print(f"({name}: still down — leaving {sum(1 for _ in open(p))} message(s) queued)")
         return
@@ -260,6 +317,11 @@ def cmd_kick(a):
     pane = _claude_pane(name)
     if not pane:
         print(f"({name}: down — nothing to kick)"); return
+    # kick presses Enter on whatever is in the box. If the agent is dead that box is a SHELL PROMPT,
+    # and the "stuck input" is a command waiting to run. Never press Enter on a shell for someone.
+    if not _agent_alive(pane):
+        print(f"({name}: session is up but its AGENT is dead — refusing to press Enter on its shell. "
+              f"Revive it: agentctl stop {name} && agentctl up {name})"); return
     cur = _current_input(pane)
     if not cur:
         print(f"({name}: input already clear — nothing stuck)"); return

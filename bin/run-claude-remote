@@ -23,7 +23,47 @@ set -uo pipefail
 T="${SSH:?SSH target required (set SSH= in the descriptor)}"
 SID="${SESSION_ID:-}"
 LAUNCHER="${REMOTE_LAUNCHER:-~/.local/bin/claude-pane}"
+# The project dir ON THE REMOTE BOX, for the trust preseed below. Defaults to the remote $HOME (the
+# launcher's own default cwd); set REMOTE_ROOT= in the descriptor if the launcher cd's elsewhere.
+REMOTE_ROOT_Q="${REMOTE_ROOT:-\$HOME}"
 echo "→ remote agent on '$T' (fixed session ${SID:0:8}…)"
-ssh -t "$T" "SESSION_ID='$SID' REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' MODEL='${MODEL:-}' bash $LAUNCHER" || true
+# TRUST PRESEED — the remote twin of `trust-dir`, which only ever ran on the LOCAL config, so a
+# remote agent was never covered by it. Without this the remote Claude opens with "Is this a project
+# you trust?" — a modal an unattended agent cannot answer, so it sits blocked until a human notices.
+# That is how we lost a remote agent: the modal went unanswered, claude exited, the pane fell back to
+# a shell, and fleet messages were then PASTED INTO BASH and executed as commands.
+# Idempotent and best-effort: a rebuilt box re-preseeds itself on the next launch.
+# NOTE the path: .claude.json lives at $CLAUDE_CONFIG_DIR/.claude.json, and the remote launcher does
+# NOT set CLAUDE_CONFIG_DIR — so it is $HOME/.claude.json, NOT $HOME/.claude/.claude.json. (Writing
+# the latter is a silent no-op: the CLI never reads it. Local intuition misleads here, because the
+# local account profiles always set CLAUDE_CONFIG_DIR, which is why trust-dir writes inside one.)
+# Preserves every other key — the real file holds onboarding state that must not be clobbered.
+ssh "$T" 'python3 - '"$REMOTE_ROOT_Q"' <<'"'"'PY'"'"' 2>/dev/null || true
+import json, os, sys
+d = os.path.abspath(sys.argv[1])
+f = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.environ["HOME"], ".claude.json")
+try: c = json.load(open(f))
+except Exception: c = {}
+p = c.setdefault("projects", {}).setdefault(d, {})
+p["hasTrustDialogAccepted"] = True            # one "No, exit" persists here and strands the agent
+p["hasCompletedProjectOnboarding"] = True     # on EVERY subsequent launch
+c["hasCompletedOnboarding"] = True
+tmp = f + ".tmp"
+json.dump(c, open(tmp, "w"), indent=2); os.replace(tmp, f)
+PY' 2>/dev/null || echo "  (trust preseed skipped — remote unreachable or no python3)"
+# RESUME-GATE SUPPRESSION — the same fix run-claude/run-claude-confined carry, which never crossed
+# the ssh: a remote agent sat on "This session is 6d 4h old and 131.8k tokens" with its input
+# blocked, the same stranding the local tier had already been fixed for. The thresholds live in the
+# REMOTE process's environment, so they must be exported on the FAR SIDE of the connection — an env
+# var set locally does not travel. Both are pushed past any real session (the gate is an AND today;
+# setting both survives an AND→OR change).
+# MODEL crosses the wire for the same class of reason: the descriptor's MODEL= is the fleet's durable
+# source of truth for which model a workspace runs (a /model choice is per-process and reverts on any
+# bounce). Unforwarded, the remote agent quietly runs the REMOTE box's default and the pin is a
+# comment — ours ran a different model than its descriptor claimed for weeks.
+ssh -t "$T" "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 \
+CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=52560000 \
+SESSION_ID='$SID' REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' MODEL='${MODEL:-}' \
+bash $LAUNCHER" || true
 echo; echo "[remote agent on $T exited — this pane is now a LOCAL shell; 'agentctl up <ws>' to relaunch]"
 exec bash
