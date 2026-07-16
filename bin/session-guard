@@ -275,6 +275,17 @@ if [ -n "$failed_units" ]; then
   alert_main "failedunits-$fkey" "FAILED UNITS: $flist — systemctl [--user] status <unit> for the why, reset-failed after fixing."
 fi
 
+# c) MODEL-STATE drift: accounts/.fleet-model is account-watch's input for cap-relevance — if it
+#    says opus while the fleet runs Fable, per-model cap gating is silently DISARMED (found live
+#    2026-07-16: descriptors+sessions moved to Fable, .fleet-model still said opus). Cross-check it
+#    against the majority MODEL across descriptors; a mismatch is an armed-but-inert rotation.
+fm=$(cat "$A/accounts/.fleet-model" 2>/dev/null)
+maj=$(grep -h '^MODEL=' "$A"/projects/*.env 2>/dev/null | sed 's/^MODEL="\([^"]*\)".*/\1/' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+if [ -n "$fm" ] && [ -n "$maj" ] && [ "$fm" != "$maj" ]; then
+  log "!!! FLEET-MODEL DRIFT: accounts/.fleet-model=$fm but descriptor majority=$maj"
+  alert_main "fleetmodel" "FLEET-MODEL DRIFT: accounts/.fleet-model says '$fm' but the descriptor majority is '$maj'. account-watch's cap-relevance gating keys off .fleet-model, so this drift silently disarms (or over-arms) per-model cap gating in rotation decisions. Fix: echo '$maj' > ~/.agents/accounts/.fleet-model (or correct the descriptors)."
+fi
+
 # b) campaign-stall: a RUNNING compute service whose journal has gone silent. Pattern is
 #    configurable via COMPUTE_UNITS_RE; default catches a *-camp / *-qe / *-queue convention.
 # NB: parenthesized default + `--` on the grep — a pattern that begins with a dash is otherwise

@@ -136,6 +136,21 @@ run_guard
 check_not "a non-compute unit is never a campaign" bash -c "grep -q 'CAMPAIGN STALL: nginx' '$TMP/alerts.txt' 2>/dev/null"
 rm -f "$TMP"/fixture-running-*.txt "$TMP"/fixture-journal-*.ts
 
+echo "== fleet-model drift: .fleet-model disagreeing with descriptors pages (the disarmed-gating find) =="
+rm -f "$A"/.session-guard-alert.*
+mkdir -p "$A/accounts" "$A/projects"
+printf 'MODEL="claude-fable-5"\nROOT="/x"\n' > "$A/projects/wsA.env"
+printf 'MODEL="claude-fable-5"\nROOT="/x"\n' > "$A/projects/wsB.env"
+echo claude-opus-4-8 > "$A/accounts/.fleet-model"
+run_guard
+check "drift between .fleet-model and descriptors pages" bash -c "grep -q 'FLEET-MODEL DRIFT' '$TMP/alerts.txt'"
+check "the alert carries the one-line fix"               bash -c "grep -q 'fleet-model' '$TMP/alerts.txt'"
+echo claude-fable-5 > "$A/accounts/.fleet-model"
+rm -f "$A"/.session-guard-alert.*
+run_guard
+check_not "agreement is silent"                          bash -c "grep -q 'FLEET-MODEL DRIFT' '$TMP/alerts.txt' 2>/dev/null"
+rm -f "$A/projects/wsA.env" "$A/projects/wsB.env" "$A/accounts/.fleet-model"
+
 echo "== stall override: file progress counts even when the journal is silent =="
 rm -f "$A"/.session-guard-alert.*
 printf 'filecamp-queue.service loaded active running FileCamp\n' > "$TMP/fixture-running-usr.txt"

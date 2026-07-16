@@ -59,7 +59,9 @@ FABLE_MODEL="claude-fable-5"   # pre-flight model-availability probe (fable-cap 
 # use) is still a perfectly good Opus target. This was the 2026-07-11 bug: stale account-a/account-b
 # markers stranded the Opus fleet on a 94%-5h account while refusing two 0%-5h Opus-healthy accounts.
 # Read from accounts/.fleet-model (default opus-4-8); set it to claude-fable-5 to re-arm Fable gating.
-FLEET_MODEL="$(cat "$ACCTS/.fleet-model" 2>/dev/null || echo claude-opus-4-8)"
+# Fallback = the FLEET STANDARD, not the cheaper tier: if .fleet-model goes missing, assuming the
+# uncapped model silently DISARMS per-model cap gating in rotation decisions. Fail toward ARMED.
+FLEET_MODEL="$(cat "$ACCTS/.fleet-model" 2>/dev/null || echo claude-fable-5)"
 CAP_RE='usage limit|rate limit|reached your|limit reached|quota (exceeded|reached)|out of (usage|tokens)'
 TRIG_5H="${TRIG_5H:-90}"; TRIG_7D="${TRIG_7D:-95}"     # trigger thresholds (also eligibility ceilings)
 IMPROVE_PTS="${IMPROVE_PTS:-20}"                        # target 5h must be >= this many points below active
