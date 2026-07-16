@@ -198,7 +198,7 @@ def _composer(pane):
                                      for seq in re.findall(r"\x1b\[([0-9;]*)m", lead.group(1))
                                      for p in seq.split(";"))
             # Dim alone is NOT enough to call it a placeholder: QUEUED mid-turn input renders dim
-            # too (found live on a client workspace — a parked directive read as empty would blind every verify).
+            # too (found live — a parked directive read as empty would blind every verify).
             # The placeholder is dim AND hint-shaped; queued real text is dim and arbitrary.
             if dim and re.fullmatch(r'Try "[^"]*"', plain):
                 return True, ""
