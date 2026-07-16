@@ -64,6 +64,12 @@ FABLE_MODEL="claude-fable-5"   # pre-flight model-availability probe (fable-cap 
 FLEET_MODEL="$(cat "$ACCTS/.fleet-model" 2>/dev/null || echo claude-fable-5)"
 CAP_RE='usage limit|rate limit|reached your|limit reached|quota (exceeded|reached)|out of (usage|tokens)'
 TRIG_5H="${TRIG_5H:-90}"; TRIG_7D="${TRIG_7D:-95}"     # trigger thresholds (also eligibility ceilings)
+# Per-model Fable scoped-cap threshold (trigger + eligibility ceiling), ACTIVE ONLY ON A FABLE FLEET.
+# 2026-07-16 incident: the active account's scoped fable cap sat at 100% for ~2h while its general
+# windows read healthy (5h=43%, 7d=57%) and nothing rotated; the Fable fleet was frozen until the 5h
+# axis INDEPENDENTLY crossed 90. The endpoint exposes the cap directly (account-usage 'fable' field) —
+# rotation must trigger on it, and destination picks must require actual Fable headroom.
+FABLE_TRIG="${FABLE_TRIG:-90}"
 IMPROVE_PTS="${IMPROVE_PTS:-20}"                        # target 5h must be >= this many points below active
 DWELL_SECS="${DWELL_SECS:-1800}"                        # min dwell after any swap before proactive rotation
 ALERT_SECS="${ALERT_SECS:-3600}"                        # no-eligible-target alert throttle
@@ -158,13 +164,18 @@ for line in sys.stdin:
 aw_ge(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>=b)}'; }   # float >=
 aw_lt(){ awk -v a="$1" -v b="$2" 'BEGIN{exit !(a<b)}'; }    # float <
 
-# aw_trigger_reason <label> → echo reason ("5h=92.0%>=90" / "7d=96.0%>=95") if over a threshold.
-# rc: 0 = triggered, 1 = under thresholds, 2 = usage unknown (endpoint error / no data).
+# aw_trigger_reason <label> → echo reason ("5h=92.0%>=90" / "7d=96.0%>=95" / "fable=100.0%>=90") if
+# over a threshold. rc: 0 = triggered, 1 = under thresholds, 2 = usage unknown (endpoint error / no data).
+# The fable axis fires ONLY on a Fable fleet and only when the endpoint reports a scoped cap (FU
+# non-empty; empty = capless account). 2026-07-16: fable=100 with 5h=43/7d=57 froze the fleet ~2h
+# because this function never looked at FU.
 aw_trigger_reason(){
   local l="$1"
   [ -n "${U5[$l]:-}" ] || return 2
   if aw_ge "${U5[$l]}" "$TRIG_5H"; then echo "5h=${U5[$l]}%>=$TRIG_5H"; return 0; fi
   if aw_ge "${U7[$l]}" "$TRIG_7D"; then echo "7d=${U7[$l]}%>=$TRIG_7D"; return 0; fi
+  if [ "$FLEET_MODEL" = "claude-fable-5" ] && [ -n "${FU[$l]:-}" ] \
+     && aw_ge "${FU[$l]}" "$FABLE_TRIG"; then echo "fable=${FU[$l]}%>=$FABLE_TRIG"; return 0; fi
   return 1
 }
 
@@ -183,9 +194,16 @@ aw_eligible(){
   fable_cap_relevant "$l" && return 1   # Fable-dead AND fleet uses Fable → ineligible (Opus fleet: ignored)
   aw_lt "${U5[$l]}" "$TRIG_5H" || return 1
   aw_lt "${U7[$l]}" "$TRIG_7D" || return 1
+  # Fable fleet: the target must have actual FABLE headroom, not just 5h/7d headroom — an endpoint
+  # fable% at/over the ceiling is as dead as a marker (2026-07-16: a naive 5h/7d pick could have
+  # landed the fleet straight back on a Fable-exhausted account). Empty FU = capless = headroom.
+  if [ "$FLEET_MODEL" = "claude-fable-5" ] && [ -n "${FU[$l]:-}" ]; then
+    aw_lt "${FU[$l]}" "$FABLE_TRIG" || return 1
+  fi
   if [ "$guard" = 1 ]; then
     local tu="${U5[$l]}"
     [ "$axis" = 7d ] && tu="${U7[$l]}"
+    [ "$axis" = fable ] && tu="${FU[$l]:-0}"   # capless target = 0% = maximal fable headroom
     awk -v t="$tu" -v a="$active_util" -v p="$IMPROVE_PTS" 'BEGIN{exit !(t <= a-p)}' || return 1
   fi
   return 0
@@ -196,7 +214,7 @@ aw_eligible(){
 # triggering axis (5h|7d) — validated loudly so a stale 2-arg caller can't silently eat a candidate.
 aw_select_targets(){
   local active_util="$1" guard="$2" axis="$3"; shift 3
-  case "$axis" in 5h|7d) ;; *) echo "aw_select_targets: bad axis '$axis' (5h|7d)" >&2; return 2 ;; esac
+  case "$axis" in 5h|7d|fable) ;; *) echo "aw_select_targets: bad axis '$axis' (5h|7d|fable)" >&2; return 2 ;; esac
   local c l
   for c in "$@"; do
     l="$c"
@@ -269,7 +287,7 @@ aw_snapshot(){
   for c in "$@"; do
     l="$c"
     if [ -n "${UERR[$l]:-}" ]; then out+="$l ERR:${UERR[$l]:0:60} | "
-    elif [ -n "${U5[$l]:-}" ]; then out+="$l 5h=${U5[$l]}%@${R5[$l]:0:16}Z 7d=${U7[$l]}%@${R7[$l]:0:16}Z | "
+    elif [ -n "${U5[$l]:-}" ]; then out+="$l 5h=${U5[$l]}%@${R5[$l]:0:16}Z 7d=${U7[$l]}%@${R7[$l]:0:16}Z${FU[$l]:+ fable=${FU[$l]}%} | "
     else out+="$l (no data) | "; fi
   done
   printf '%s' "${out% | }"
@@ -439,7 +457,9 @@ elif [ $? -eq 2 ]; then
   log "usage endpoint unavailable for active=$active (${UERR[$active]:-no data}) — probe-only fallback this tick"
 fi
 if [ "$degraded" = 0 ]; then
-  log "tick: active=$active 5h=${U5[$active]:-?}% 7d=${U7[$active]:-?}%${ureason:+ TRIGGER($ureason)}${why:+ CAP[$why]}"
+  # fable% in every tick line whenever the account has a scoped cap — the 2026-07-16 stall was
+  # invisible precisely because ticks logged only 5h/7d while scoped fable sat at 100.
+  log "tick: active=$active 5h=${U5[$active]:-?}% 7d=${U7[$active]:-?}%${FU[$active]:+ fable=${FU[$active]}%}${ureason:+ TRIGGER($ureason)}${why:+ CAP[$why]}"
 fi
 
 # --- debounce (scoped to the active account) ------------------------------
@@ -498,9 +518,11 @@ else
     reason="hardcap(probe)"; guard=0
   else
     reason="usage($ureason)"
-    case "$ureason" in 7d=*) axis=7d ;; esac
+    case "$ureason" in 7d=*) axis=7d ;; fable=*) axis=fable ;; esac
   fi
-  active_util="${U5[$active]:-100}"; [ "$axis" = 7d ] && active_util="${U7[$active]:-100}"
+  active_util="${U5[$active]:-100}"
+  [ "$axis" = 7d ] && active_util="${U7[$active]:-100}"
+  [ "$axis" = fable ] && active_util="${FU[$active]:-100}"   # improvement measured in FABLE headroom
   mapfile -t ranked < <(aw_select_targets "$active_util" "$guard" "$axis" "${cands[@]}")
   # re-apply the divergent-Fable preference AFTER ranking (the soonest-reset sort would undo the
   # earlier partition); stable within each class, so reset-order is preserved among the healthy.
@@ -548,7 +570,9 @@ snap=$(aw_snapshot "$active" "${cands[@]}")
 if [ "$degraded" = 1 ]; then
   log "DECISION active=$active trigger=$reason usage: (unavailable) -> target=$next how=chain-order+probe"
 else
-  imp="${U5[$active]:-?}->${U5[$next]:-?}"; [ "${axis:-5h}" = 7d ] && imp="7d:${U7[$active]:-?}->${U7[$next]:-?}"
+  imp="${U5[$active]:-?}->${U5[$next]:-?}"
+  [ "${axis:-5h}" = 7d ] && imp="7d:${U7[$active]:-?}->${U7[$next]:-?}"
+  [ "${axis:-5h}" = fable ] && imp="fable:${FU[$active]:-?}->${FU[$next]:-none}"
   log "DECISION active=$active trigger=$reason usage: $snap -> target=$next reason=soonest-5h-reset;improvement($imp)${swapargs[1]:+;no-confined}"
 fi
 log ">>> FAILOVER: $active ($reason) -> swapping fleet to $next (probed healthy)"

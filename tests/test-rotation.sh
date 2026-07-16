@@ -316,6 +316,61 @@ r=$(aw_heal_401s)
 check "no errors → no refresh calls, healed=0"             bash -c "[ '$r' = 0 ] && [ ! -f '$STUB_LOG' ]"
 unset ACCOUNT_REFRESH STUB_LOG
 
+# --- scoped-cap TRIGGER + fable-headroom eligibility (2026-07-16 blind-stall regression) ----------
+# The active account's scoped fable cap sat at 100% for ~2h while 5h=43/7d=57 read healthy. Ticks
+# logged only 5h/7d; aw_trigger_reason never consulted FU; a naive destination pick could have landed
+# the fleet right back on a fable-exhausted account. Rotation fired only when 5h independently hit 96.
+echo "## scoped fable cap trigger (2026-07-16 blind-stall regression)"
+FLEET_MODEL="claude-fable-5"; rm -f "$ACCTS"/.fable-cap.*
+FR2="2026-07-18T06:00:00+00:00"; FR3="2026-07-20T09:00:00+00:00"
+# the incident's exact shape: a=active(exhausted)  b,c=healthy targets
+aw_load_usage < <(mkjsonl_fable a 43.0 "$T1" 57.0 "$W1" 100.0 "$FR"
+                  mkjsonl_fable b 0.0  "$T2" 33.0 "$W1" 49.0  "$FR2"
+                  mkjsonl_fable c 36.0 "$T3" 27.0 "$W1" 34.0  "$FR3")
+r=$(aw_trigger_reason a); check "FABLE fleet: fable=100 TRIGGERS though 5h=43/7d=57 (the blind spot)" eq "$r" "fable=100.0%>=90"
+check_not "fable=49 under threshold does NOT trigger"          aw_trigger_reason b
+check_not "fable-triggered active is itself no longer eligible" aw_eligible a 100 0
+r=$(aw_select_targets 100.0 1 fable b c | tr '\n' ' ')
+check "fable axis: both healthy targets eligible, soonest-5h-reset order" eq "$r" "b c "
+FLEET_MODEL="claude-opus-4-8"
+check_not "OPUS fleet: fable=100 does NOT trigger (model-aware)"  aw_trigger_reason a
+check     "OPUS fleet: fable=100 account still eligible as target" aw_eligible a 100 0
+FLEET_MODEL="claude-fable-5"
+# boundary + capless
+aw_load_usage < <(mkjsonl_fable a 10 "$T1" 10 "$W1" 90.0 "$FR"; mkjsonl_fable b 10 "$T2" 10 "$W1" 89.9 "$FR"; mkjsonl c 10 "$T3" 10 "$W1")
+r=$(aw_trigger_reason a); check "fable=90.0 boundary triggers"    eq "$r" "fable=90.0%>=90"
+check_not "fable=89.9 does NOT trigger"                           aw_trigger_reason b
+check_not "capless account (FU empty) never fable-triggers"       aw_trigger_reason c
+check_not "FABLE fleet: target at fable=90 ineligible (ceiling)"  aw_eligible a 100 0
+check     "FABLE fleet: target at fable=89.9 eligible"            aw_eligible b 100 0
+check     "FABLE fleet: capless target eligible (FU empty = headroom)" aw_eligible c 100 0
+# improvement guard measured on the FABLE axis (active fable=100, IMPROVE_PTS=20 → target <= 80)
+aw_load_usage < <(mkjsonl_fable a 10 "$T1" 10 "$W1" 100.0 "$FR"
+                  mkjsonl_fable b 10 "$T2" 10 "$W1" 85.0  "$FR2"
+                  mkjsonl_fable c 10 "$T3" 10 "$W1" 49.0  "$FR3"
+                  mkjsonl d 10 "$T3" 10 "$W1")
+mkdir -p "$ACCTS/d"; echo '{"claudeAiOauth":{"accessToken":"x"}}' > "$ACCTS/d/.credentials.json"; echo '{}' > "$ACCTS/d/.claude.json"
+printf 'd\n' >> "$ROT"   # account-profile validates labels against the rotation allow-list
+check_not "fable guard: 100→85 rejected (needs >=20-pt fable improvement)" aw_eligible b 100.0 1 fable
+check     "fable guard: 100→49 accepted"                          aw_eligible c 100.0 1 fable
+check     "fable guard: capless target = 0% fable (always improves)" aw_eligible d 100.0 1 fable
+# snapshot now carries the fable field (the HOLD/DECISION visibility fix)
+r=$(aw_snapshot a)
+check "snapshot includes fable%%"                                 bash -c "echo '$r' | grep -q 'fable=100.0%'"
+# end-to-end through the REAL endpoint parser: --mock body with a live-schema limits[] array
+cat > "$TMP/mock-fable.json" <<EOF
+{
+  "a": {"five_hour": {"utilization": 43.0, "resets_at": "$T1"}, "seven_day": {"utilization": 57.0, "resets_at": "$W1"},
+        "limits": [{"kind": "weekly_scoped", "percent": 100, "resets_at": "$FR",
+                    "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}]},
+  "c": {"five_hour": {"utilization": 36.0, "resets_at": "$T3"}, "seven_day": {"utilization": 27.0, "resets_at": "$W1"}}
+}
+EOF
+aw_load_usage < <("$BIN/account-usage" --mock "$TMP/mock-fable.json" a c 2>/dev/null)
+check "limits[]→fable→FU round-trip (real parser)"                eq "${FU[a]}" "100.0"
+check "no limits[] → FU empty through the real parser"            eq "${FU[c]:-EMPTY}" "EMPTY"
+r=$(aw_trigger_reason a); check "END-TO-END: the stall scenario now triggers rotation" eq "$r" "fable=100.0%>=90"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]
