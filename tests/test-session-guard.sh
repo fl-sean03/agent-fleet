@@ -37,7 +37,26 @@ cat > "$TMP/.local/bin/agentctl" <<'EOF'
 [ "${1:-}" = send ] && { shift 2; printf '%s\n' "$*" >> "$HOME/alerts.txt"; }
 exit 0
 EOF
-chmod +x "$TMP/bin/tmux" "$TMP/bin/pgrep" "$TMP/.local/bin/agentctl"
+# systemctl/journalctl stubs, fixture-driven — the failed-unit and campaign-stall sweeps must be
+# tested deterministically, not against whatever the host happens to have failed today.
+cat > "$TMP/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+scope=sys; [ "$1" = "--user" ] && { scope=usr; shift; }
+case "$*" in
+  *--state=failed*)          cat "$HOME/fixture-failed-$scope.txt" 2>/dev/null ;;
+  *--state=running*)         cat "$HOME/fixture-running-$scope.txt" 2>/dev/null ;;
+esac
+exit 0
+EOF
+cat > "$TMP/bin/journalctl" <<'EOF'
+#!/usr/bin/env bash
+# emit one short-unix line whose age is controlled by the fixture (epoch seconds)
+for a in "$@"; do case "$prev" in -u) unit="$a";; esac; prev="$a"; done
+ts=$(cat "$HOME/fixture-journal-$unit.ts" 2>/dev/null)
+[ -n "$ts" ] && echo "$ts $unit[1]: heartbeat"
+exit 0
+EOF
+chmod +x "$TMP/bin/tmux" "$TMP/bin/pgrep" "$TMP/.local/bin/agentctl" "$TMP/bin/systemctl" "$TMP/bin/journalctl"
 export PATH="$TMP/bin:$PATH"
 run_guard(){ rm -f "$TMP/alerts.txt"; bash "$REPO/bin/session-guard" >/dev/null 2>&1; }
 alerts(){ cat "$TMP/alerts.txt" 2>/dev/null; }
@@ -83,6 +102,51 @@ rm -f "$A/.session-guard-alert."* "$A/session-guard.log"
 rm -f "$A/cfg/ws1/projects"; mkdir -p "$A/cfg/ws1/projects"      # a diverged private store
 run_guard
 check "a forked session store under cfg/ is caught" grep -q "SHARED-STORE VIOLATION.*cfg/ws1" "$A/session-guard.log"
+
+echo "== failed-unit sweep: nothing failed → silence =="
+rm -f "$A"/.session-guard-alert.*
+run_guard
+check_not "no FAILED UNITS alert when none are failed" bash -c "grep -q 'FAILED UNITS' '$TMP/alerts.txt' 2>/dev/null"
+
+echo "== failed-unit sweep: a failed unit pages, and a NEW failure re-pages inside the window =="
+printf 'pilot-qe.service loaded failed failed compute pilot\n' > "$TMP/fixture-failed-usr.txt"
+run_guard
+check "a failed user unit is alerted"        bash -c "grep -q 'FAILED UNITS.*usr:pilot-qe' '$TMP/alerts.txt'"
+run_guard
+check_not "same failed set is throttled"     bash -c "grep -q 'FAILED UNITS' '$TMP/alerts.txt' 2>/dev/null"
+printf 'logrotate.service loaded failed failed Rotate logs\n' > "$TMP/fixture-failed-sys.txt"
+run_guard
+check "a NEW failure pages despite the old one being in-window" bash -c "grep -q 'FAILED UNITS.*sys:logrotate' '$TMP/alerts.txt'"
+rm -f "$TMP/fixture-failed-usr.txt" "$TMP/fixture-failed-sys.txt"
+
+echo "== campaign-stall: active-but-silent compute unit pages; a chatty one does not =="
+rm -f "$A"/.session-guard-alert.*
+printf 'demo-camp.service loaded active running demo campaign\n' > "$TMP/fixture-running-usr.txt"
+date +%s > "$TMP/fixture-journal-demo-camp.service.ts"          # logged just now
+run_guard
+check_not "a campaign logging NOW is not flagged" bash -c "grep -q 'CAMPAIGN STALL' '$TMP/alerts.txt' 2>/dev/null"
+echo $(( $(date +%s) - 10800 )) > "$TMP/fixture-journal-demo-camp.service.ts"   # silent 3h
+run_guard
+check "an active campaign silent 3h is flagged"  bash -c "grep -q 'CAMPAIGN STALL: demo-camp' '$TMP/alerts.txt'"
+check "the alert names the journal command"      bash -c "grep -q 'journalctl --user -u demo-camp' '$TMP/alerts.txt'"
+printf 'nginx.service loaded active running Web\n' > "$TMP/fixture-running-sys.txt"
+echo $(( $(date +%s) - 90000 )) > "$TMP/fixture-journal-nginx.service.ts"
+rm -f "$A"/.session-guard-alert.*
+run_guard
+check_not "a non-compute unit is never a campaign" bash -c "grep -q 'CAMPAIGN STALL: nginx' '$TMP/alerts.txt' 2>/dev/null"
+rm -f "$TMP"/fixture-running-*.txt "$TMP"/fixture-journal-*.ts
+
+echo "== disk growth: a fast drop is attributed =="
+rm -f "$A"/.session-guard-alert.*
+avail_now=$(df -BG --output=avail / | tail -1 | tr -cd '0-9')
+echo $(( avail_now + 25 )) > "$A/.session-guard-avail"       # pretend we had 25G more last run
+mkdir -p "$TMP/duroot/grower"; dd if=/dev/zero of="$TMP/duroot/grower/blob" bs=1M count=200 status=none
+DU_ROOT="$TMP/duroot" bash "$REPO/bin/session-guard" >/dev/null 2>&1
+check "a >=20G drop in one interval pages"     bash -c "grep -q 'DISK GROWTH' '$TMP/alerts.txt'"
+check "the alert names a top grower"           bash -c "grep -q 'grower' '$TMP/alerts.txt'"
+rm -f "$A"/.session-guard-alert.* "$A/.session-guard-avail" "$A"/.session-guard-du.*
+run_guard
+check_not "steady disk does not page growth"   bash -c "grep -q 'DISK GROWTH' '$TMP/alerts.txt' 2>/dev/null"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

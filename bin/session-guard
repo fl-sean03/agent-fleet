@@ -210,9 +210,77 @@ fi
 # DISK: agents fail in confusing ways when they cannot write (a transcript write, a tool output, a
 # job's own output file). A job that fills the disk starves on its own next write — the failure that
 # reports itself as "the work stopped", not "disk full".
+# Attribution: a floor alert that names no consumer sends a human hunting; naming the top GROWER
+# (delta vs the last stored depth-1 scan) points at the writer. Bounded: depth 1, only computed
+# when an alert is firing, baseline refreshed on each attribution.
+DU_ROOT="${DU_ROOT:-$HOME}"
+attrib(){
+  local base="$A/.session-guard-du.baseline" newf="$A/.session-guard-du.new" out=""
+  timeout 110 du -xm --max-depth=1 "$DU_ROOT" 2>/dev/null | sort -k2 > "$newf" || true
+  if [ -s "$base" ] && [ -s "$newf" ]; then
+    out=$(join -j2 "$base" "$newf" 2>/dev/null | awk '{d=$3-$2; if (d>100) print d, $1}' \
+          | sort -rn | head -3 | awk '{printf "%s +%dM; ", $2, $1}')
+  fi
+  [ -z "$out" ] && out=$(sort -rn "$newf" 2>/dev/null | head -3 | awk '{printf "%s %sM; ", $2, $1}')
+  mv -f "$newf" "$base" 2>/dev/null || true
+  printf '%s' "$out"
+}
+
+# EARLY growth catch: a runaway writer fills a disk over hours; catching it at +20G costs stopping
+# the writer and a few snapshots — catching it at 99% costs real recovery work.
+AVAIL_STATE="$A/.session-guard-avail"; GROW_ALERT_G="${GROW_ALERT_G:-20}"
 avail_gb=$(df -BG --output=avail / 2>/dev/null | tail -1 | tr -cd '0-9')
+prev_avail=$(tr -cd '0-9' < "$AVAIL_STATE" 2>/dev/null)
+[ -n "$avail_gb" ] && printf '%s\n' "$avail_gb" > "$AVAIL_STATE"
+if [ -n "$prev_avail" ] && [ -n "$avail_gb" ] && [ $((prev_avail - avail_gb)) -ge "$GROW_ALERT_G" ]; then
+  growers=$(attrib)
+  log "!!! DISK GROWTH: ${prev_avail}G -> ${avail_gb}G free in one interval; growers: ${growers:-unattributed}"
+  alert_main "diskgrow" "DISK GROWTH: free space fell ${prev_avail}G -> ${avail_gb}G in ~15min. Top growers: ${growers:-unattributed}. Stop the writer while it is still cheap."
+fi
+
 if [ -n "$avail_gb" ] && [ "$avail_gb" -lt "$DISK_MIN_GB" ]; then
   pct=$(df --output=pcent / 2>/dev/null | tail -1 | tr -cd '0-9')
-  log "!!! DISK: only ${avail_gb}GB free on / (${pct}% used) — below the ${DISK_MIN_GB}GB floor"
-  alert_main "disk" "DISK: only ${avail_gb}GB free on / (${pct}% used, floor ${DISK_MIN_GB}GB). Agents fail in confusing ways when they cannot write, and a job that fills the disk starves on its own next write — which looks like 'the work stopped' rather than 'disk full'. Find the consumer (du -sh \$HOME/* | sort -rh | head) before something else dies."
+  growers=$(attrib)
+  log "!!! DISK: only ${avail_gb}GB free on / (${pct}% used) — below the ${DISK_MIN_GB}GB floor; growers: ${growers:-unattributed}"
+  alert_main "disk" "DISK: only ${avail_gb}GB free on / (${pct}% used, floor ${DISK_MIN_GB}GB). Top consumers/growers: ${growers:-unattributed}. Agents fail in confusing ways when they cannot write, and a job that fills the disk starves on its own next write — which looks like 'the work stopped' rather than 'disk full'."
 fi
+
+# =================================================================================================
+# 5) FAILED-UNIT + CAMPAIGN-STALL SWEEP
+#
+# Units fail silently: in the incident that motivated this, one unit sat failed NINE DAYS unseen,
+# and system maintenance units died at midnight on a full disk unseen. And an ACTIVE unit can be a
+# corpse: a compute campaign died mid-flight and read as 'the work stopped' for 16h because its
+# service stayed green while its log went silent.
+# =================================================================================================
+# a) anything in --state=failed, user AND system. Throttle key = the failed SET, so a NEW failure
+#    pages immediately even while an old one sits inside the 6h window.
+failed_units=$( { systemctl --state=failed --no-legend --plain 2>/dev/null | awk '{print "sys:"$1}'
+                  systemctl --user --state=failed --no-legend --plain 2>/dev/null | awk '{print "usr:"$1}'; } | sort )
+if [ -n "$failed_units" ]; then
+  fkey=$(printf '%s' "$failed_units" | md5sum | cut -c1-10)
+  flist=$(echo "$failed_units" | tr '\n' ' ')
+  log "!!! FAILED UNITS: $flist"
+  alert_main "failedunits-$fkey" "FAILED UNITS: $flist — systemctl [--user] status <unit> for the why, reset-failed after fixing."
+fi
+
+# b) campaign-stall: a RUNNING compute service whose journal has gone silent. Pattern is
+#    configurable via COMPUTE_UNITS_RE; default catches a *-camp / *-qe / *-queue convention.
+# NB: parenthesized default + `--` on the grep — a pattern that begins with a dash is otherwise
+# parsed as a grep OPTION, and the sweep dies silently behind its `|| true`.
+COMPUTE_RE="${COMPUTE_UNITS_RE:-(-camp|-qe|-queue)}"
+STALL_H="${STALL_H:-2}"
+now_s=$(date +%s)
+for scope in "--user" ""; do
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    last_s=$(journalctl $scope -u "$u" -n1 -o short-unix --no-pager 2>/dev/null | tail -1 | awk '{print int($1)}')
+    [ -n "$last_s" ] && [ "$last_s" -gt 0 ] || continue
+    sh=$(( (now_s - last_s) / 3600 ))
+    if [ "$sh" -ge "$STALL_H" ]; then
+      log "!!! CAMPAIGN STALL: $u is active but journal-silent for ${sh}h"
+      alert_main "stall-$u" "CAMPAIGN STALL: $u is active but has logged nothing for ${sh}h (threshold ${STALL_H}h) — an active unit whose log went quiet is how a dead campaign reads as 'the work stopped'. Check: journalctl $scope -u $u -n 30"
+    fi
+  done < <(systemctl $scope list-units --type=service --state=running --no-legend --plain 2>/dev/null \
+           | awk '{print $1}' | grep -E -- "$COMPUTE_RE" || true)
+done

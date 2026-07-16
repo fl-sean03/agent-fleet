@@ -38,6 +38,21 @@ if last:
     print(int(datetime.datetime.fromisoformat(last.replace('Z','+00:00')).timestamp()))
 PY
 }
+# --- liveness: does a real agent process exist under the pane? (same walk session-guard uses;
+# pane_current_command reports `bash` for a healthy agent, and the tree depth varies by isolation
+# tier, so this must be a full recursive walk matched against per-harness process names)
+proctree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }
+agent_alive(){ # <ws> → 0 if any pane process looks like a live agent
+  local ws="$1" pid comm
+  for pid in $(tmux list-panes -t "agent-$ws:main" -F '#{pane_pid}' 2>/dev/null); do
+    for pid in $(proctree "$pid"); do
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+      case "$comm" in claude|claude-bin|node|bun|codex|opencode|ssh) return 0;; esac
+    done
+  done
+  return 1
+}
+
 pane_busy(){ # <ws> → 0 if the agent pane is mid-turn RIGHT NOW.
   # Match only "esc to interrupt" — the footer shows it ONLY during an active, interruptible turn.
   # (The spinner glyphs ✻/✽/✢ are unreliable: a completed "✻ Crunched for 8m" summary line stays
@@ -62,7 +77,19 @@ while read -r kind name; do
 
   if pane_busy "$name"; then log "keep $name (pane busy — working now)"; kept=$((kept+1)); continue; fi
   if [ -f "$f" ]; then
-    m=$(stat -c %Y "$f"); [ $(( (now-m)/3600 )) -lt 6 ] && { log "keep $name (transcript written <6h ago — recent activity)"; kept=$((kept+1)); continue; }
+    m=$(stat -c %Y "$f")
+    if [ $(( (now-m)/3600 )) -lt 6 ]; then
+      # mtime is only ACTIVITY if the agent is actually alive — a dead agent's transcript keeps a
+      # fresh-looking mtime from before it died, and an OOM-killed agent was once kept 19h as
+      # "recent activity" on exactly that misread. Process-existence is the truth; session-guard
+      # pages for revival.
+      if agent_alive "$name"; then
+        log "keep $name (transcript written <6h ago — recent activity)"; kept=$((kept+1)); continue
+      else
+        log "keep $name (transcript mtime fresh but NO AGENT PROCESS — dead, not idle; session-guard pages for revival)"
+        kept=$((kept+1)); continue
+      fi
+    fi
   fi
   u=$(last_user_epoch "$f"); [ -z "$u" ] && { log "keep $name (no user turns recorded — leave to owner)"; kept=$((kept+1)); continue; }
   idle=$(( (now-u)/86400 ))
