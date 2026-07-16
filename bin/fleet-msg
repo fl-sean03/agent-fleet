@@ -284,9 +284,19 @@ def _deliver(name, env, no_submit=False):
         if res == "stuck":
             # The text IS in the recipient's composer, just unsubmitted. Queuing it too would
             # double-deliver once the input-watchdog / a kick fires it. Surface, don't re-queue.
-            print(f"fleet-msg: WARNING {name}: message pasted but Enter did not land after retries "
-                  f"— left in composer (input-watchdog will fire it, or: fleet-msg kick {name})",
-                  file=sys.stderr)
+            # BUSY qualifier (production data, 16:07Z swap): for a mid-turn recipient the Enter
+            # QUEUES the message yet the queued text keeps rendering in the composer, so the verify
+            # loop reads not-cleared — "stuck" on a busy recipient usually means DELIVERED-QUEUED
+            # (composer confirmed empty post-turn). Cosmetic: qualify so nobody re-fires it by hand.
+            busy = "esc to interrupt" in _pane_text(pane)
+            if busy:
+                print(f"fleet-msg: NOTE {name}: recipient is mid-turn — message likely QUEUED "
+                      f"(composer renders queued text until the turn ends; input-watchdog reconciles). "
+                      f"Do not re-send.", file=sys.stderr)
+            else:
+                print(f"fleet-msg: WARNING {name}: message pasted but Enter did not land after retries "
+                      f"— left in composer (input-watchdog will fire it, or: fleet-msg kick {name})",
+                      file=sys.stderr)
             return "stuck"
     os.makedirs(PENDING, exist_ok=True)
     with open(f"{PENDING}/{name}.jsonl", "a") as fh:
