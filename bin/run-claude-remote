@@ -61,9 +61,21 @@ PY' 2>/dev/null || echo "  (trust preseed skipped — remote unreachable or no p
 # source of truth for which model a workspace runs (a /model choice is per-process and reverts on any
 # bounce). Unforwarded, the remote agent quietly runs the REMOTE box's default and the pin is a
 # comment — ours ran a different model than its descriptor claimed for weeks.
-ssh -t "$T" "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 \
+# RECONNECT LOOP — an ssh-backed agent used to die with its transport: any network blip printed
+# "client_loop: send disconnect: Broken pipe" and left this pane a LOCAL SHELL until a human ran
+# agentctl up. The guard pages on that, but paging is not healing. The fixed SESSION_ID makes
+# reconnection safe: the remote launcher resumes the SAME conversation, so a dropped link costs
+# seconds, not a stranded agent. ServerAlive* bounds drop-detection at ~60s (without it a dead NAT
+# entry hangs the client for hours looking exactly like a healthy idle agent). Deliberate stops
+# still work: `agentctl down` kills this local process, loop included.
+while :; do
+  ssh -t -o ServerAliveInterval=15 -o ServerAliveCountMax=4 "$T" \
+    "CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=1000000000 \
 CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=52560000 \
 SESSION_ID='$SID' REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' MODEL='${MODEL:-}' \
-bash $LAUNCHER" || true
-echo; echo "[remote agent on $T exited — this pane is now a LOCAL shell; 'agentctl up <ws>' to relaunch]"
+bash $LAUNCHER" && break   # clean remote exit = intentional; do not resurrect
+  echo; echo "[link to $T dropped — reconnecting in 20s and resuming session ${SID:0:8}… (Ctrl-C for a shell)]"
+  sleep 20 || break
+done
+echo; echo "[remote agent on $T exited cleanly — this pane is now a LOCAL shell; 'agentctl up <ws>' to relaunch]"
 exec bash
