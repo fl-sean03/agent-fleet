@@ -197,6 +197,17 @@ for f in "$A"/projects/*.env; do
   done
 done
 
+# BOX-LEVEL MEMORY FLOOR: per-agent RSS above catches one hog; this catches the AGGREGATE — 15
+# max-effort agents at 0.5-2G each plus compute jobs can exhaust the box with no single villain
+# (a 400MB headroom probe OOM'd at 24/30Gi used — the box was tight, nobody was huge).
+BOX_MEM_MIN_G="${BOX_MEM_MIN_G:-3}"
+mem_avail_g=$(awk '/MemAvailable/{printf "%d", $2/1048576}' /proc/meminfo 2>/dev/null)
+if [ -n "$mem_avail_g" ] && [ "$mem_avail_g" -lt "$BOX_MEM_MIN_G" ]; then
+  top_mem=$(ps -eo rss,comm --sort=-rss 2>/dev/null | awk 'NR>1 && NR<=4 {printf "%s %.1fG; ", $2, $1/1048576}')
+  log "!!! BOX MEMORY: only ${mem_avail_g}G available (floor ${BOX_MEM_MIN_G}G) — top: $top_mem"
+  alert_main "boxmem" "BOX MEMORY: only ${mem_avail_g}G available (floor ${BOX_MEM_MIN_G}G). Top consumers: $top_mem. The next allocation failure will be whichever process asks first — likely an agent or a compute job, and the OOM killer takes its whole tmux scope."
+fi
+
 # OOM POST-MORTEM: the kernel is the only witness to a kill, and the tmux scope dies with the agent,
 # so by the time anyone looks there is no process left to inspect. Surface it while the journal is warm.
 if command -v journalctl >/dev/null 2>&1; then
@@ -270,16 +281,32 @@ fi
 # parsed as a grep OPTION, and the sweep dies silently behind its `|| true`.
 COMPUTE_RE="${COMPUTE_UNITS_RE:-(-camp|-qe|-queue)}"
 STALL_H="${STALL_H:-2}"
+# Per-unit progress-path override ($A/stall-progress.conf, lines: "<unit> <file-or-dir>"): some
+# runners log progress to FILES, not the journal (first sweep paged a healthy queue whose
+# results.csv had advanced 30min earlier). If the override path shows activity within STALL_H, the
+# unit is healthy no matter how silent its journal — a file mtime is progress a journal can't see.
+STALL_CONF="${STALL_CONF:-$A/stall-progress.conf}"
+progress_fresh(){ # <unit> → 0 if its override path saw writes within STALL_H
+  local u="$1" path
+  path=$(awk -v u="$u" '$1==u {print $2; exit}' "$STALL_CONF" 2>/dev/null)
+  [ -n "$path" ] || return 1
+  if [ -d "$path" ]; then
+    find "$path" -newermt "-${STALL_H} hours" -print -quit 2>/dev/null | grep -q .
+  else
+    [ -e "$path" ] && [ $(( now_s - $(stat -c %Y "$path" 2>/dev/null || echo 0) )) -lt $(( STALL_H*3600 )) ]
+  fi
+}
 now_s=$(date +%s)
 for scope in "--user" ""; do
   while IFS= read -r u; do
     [ -n "$u" ] || continue
+    if progress_fresh "$u"; then continue; fi
     last_s=$(journalctl $scope -u "$u" -n1 -o short-unix --no-pager 2>/dev/null | tail -1 | awk '{print int($1)}')
     [ -n "$last_s" ] && [ "$last_s" -gt 0 ] || continue
     sh=$(( (now_s - last_s) / 3600 ))
     if [ "$sh" -ge "$STALL_H" ]; then
       log "!!! CAMPAIGN STALL: $u is active but journal-silent for ${sh}h"
-      alert_main "stall-$u" "CAMPAIGN STALL: $u is active but has logged nothing for ${sh}h (threshold ${STALL_H}h) — an active unit whose log went quiet is how a dead campaign reads as 'the work stopped'. Check: journalctl $scope -u $u -n 30"
+      alert_main "stall-$u" "CAMPAIGN STALL: $u is active but has logged nothing for ${sh}h (threshold ${STALL_H}h) and has no fresh progress files ($STALL_CONF override). A campaign died like this and read as 'science stopped' for 16h. Check: journalctl $scope -u $u -n 30"
     fi
   done < <(systemctl $scope list-units --type=service --state=running --no-legend --plain 2>/dev/null \
            | awk '{print $1}' | grep -E -- "$COMPUTE_RE" || true)

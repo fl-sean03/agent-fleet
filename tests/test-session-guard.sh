@@ -136,6 +136,20 @@ run_guard
 check_not "a non-compute unit is never a campaign" bash -c "grep -q 'CAMPAIGN STALL: nginx' '$TMP/alerts.txt' 2>/dev/null"
 rm -f "$TMP"/fixture-running-*.txt "$TMP"/fixture-journal-*.ts
 
+echo "== stall override: file progress counts even when the journal is silent =="
+rm -f "$A"/.session-guard-alert.*
+printf 'filecamp-queue.service loaded active running FileCamp\n' > "$TMP/fixture-running-usr.txt"
+echo $(( $(date +%s) - 90000 )) > "$TMP/fixture-journal-filecamp-queue.service.ts"   # journal: silent 25h
+mkdir -p "$TMP/campdir"; touch "$TMP/campdir/results.csv"                            # files: fresh NOW
+printf 'filecamp-queue.service %s\n' "$TMP/campdir" > "$A/stall-progress.conf"
+run_guard
+check_not "fresh progress FILES suppress the stall page" bash -c "grep -q 'CAMPAIGN STALL' '$TMP/alerts.txt' 2>/dev/null"
+touch -d "-4 hours" "$TMP/campdir/results.csv" "$TMP/campdir"                        # files AND dir stale
+# (the dir itself counts in the find — its mtime bumps on any create/delete within, which is
+#  exactly the activity signal we want; a truly stalled campaign leaves both old)
+run_guard
+check "stale files + silent journal DO page"             bash -c "grep -q 'CAMPAIGN STALL: filecamp-queue' '$TMP/alerts.txt'"
+rm -f "$A/stall-progress.conf" "$TMP/fixture-running-usr.txt" "$TMP"/fixture-journal-*.ts
 echo "== disk growth: a fast drop is attributed =="
 rm -f "$A"/.session-guard-alert.*
 avail_now=$(df -BG --output=avail / | tail -1 | tr -cd '0-9')
