@@ -70,6 +70,13 @@ TRIG_5H="${TRIG_5H:-90}"; TRIG_7D="${TRIG_7D:-95}"     # trigger thresholds (als
 # axis INDEPENDENTLY crossed 90. The endpoint exposes the cap directly (account-usage 'fable' field) —
 # rotation must trigger on it, and destination picks must require actual Fable headroom.
 FABLE_TRIG="${FABLE_TRIG:-90}"
+# Weekly-over-Fable policy (operator directive 2026-07-17, [[rotation-weekly-over-fable]]): an account
+# whose 7d (weekly) budget resets within WEEKLY_IMMINENT_SECS is a PREFERRED target and its 7d/Fable
+# ceilings + improvement guard are waived — it is about to get a fresh weekly budget ("move there
+# regardless"). And a Fable-EXHAUSTED account is still usable if its weekly has headroom: rather than
+# HOLD to preserve Fable, drop the fleet to Opus 4.8 and draw the general budget (aw_flip_to_opus).
+WEEKLY_IMMINENT_SECS="${WEEKLY_IMMINENT_SECS:-86400}"   # 24h
+OPUS_MODEL="claude-opus-4-8"                            # the model the fleet drops to when Fable is exhausted everywhere
 IMPROVE_PTS="${IMPROVE_PTS:-20}"                        # target 5h must be >= this many points below active
 DWELL_SECS="${DWELL_SECS:-1800}"                        # min dwell after any swap before proactive rotation
 ALERT_SECS="${ALERT_SECS:-3600}"                        # no-eligible-target alert throttle
@@ -179,28 +186,40 @@ aw_trigger_reason(){
   return 1
 }
 
-# aw_eligible <label> <active_util> [guard01=1] [axis=5h|7d] → rc 0 if label can be a rotation target.
-# eligible = usage known + credential exists + 5h<90 + 7d<95 + (when guard=1) improvement guard ON THE
-# TRIGGERING AXIS: target's <axis> utilization <= active_util - IMPROVE_PTS — never trade 91% for 88%.
-# <active_util> must be the ACTIVE account's utilization on that same axis. Guarding a 7d trigger on
-# the 5h axis made the 7d trigger inert whenever the active 5h was low (7d=95/5h=1 → target needed
-# 5h <= -19, impossible — fleet stranded with two idle targets, 2026-07-12). The guard is WAIVED
-# (guard=0) on a hard cap: the active account is unusable, so any under-threshold target beats
-# staying; requiring a 20-pt drop there could strand the fleet on a dead account.
+# aw_weekly_imminent <label> → rc 0 if the account's 7d (weekly) budget resets within
+# WEEKLY_IMMINENT_SECS (default 24h). Such an account is about to get a fresh weekly budget, so it is a
+# PREFERRED target and its 7d/Fable ceilings + improvement guard are waived (operator directive
+# 2026-07-17: "within 24h of weekly reset, move there regardless"). R7E is the 7d reset epoch
+# (aw_load_usage; 9999999999 = no window = never imminent). Uses real time, so past fixtures never fire.
+aw_weekly_imminent(){
+  local r="${R7E[$1]:-}" now
+  [ -n "$r" ] && [ "$r" != 9999999999 ] || return 1
+  now=$(date -u +%s)
+  [ "$r" -gt "$now" ] && [ $((r - now)) -lt "$WEEKLY_IMMINENT_SECS" ]
+}
+
+# aw_eligible <label> <active_util> [guard01=1] [axis=5h|7d|fable] → rc 0 if label can be a rotation
+# target. eligible = usage known + credential exists + 5h<90 + 7d<95 + Fable-headroom (Fable fleet) +
+# (when guard=1) improvement guard ON THE TRIGGERING AXIS: target's <axis> util <= active_util -
+# IMPROVE_PTS. Guard is WAIVED (guard=0) on a hard cap. TWO waivers (operator directive 2026-07-17):
+#   • weekly-imminent target → waive the 7d ceiling, the Fable gate, AND the improvement guard.
+#   • FABLE_RELAX=1 (the drop-to-Opus fallback) → waive the Fable gate (accept Fable-exhausted accounts,
+#     since we are about to run Opus there). The 5h ceiling is ALWAYS enforced (5h-walled = dead now).
 aw_eligible(){
   local l="$1" active_util="$2" guard="${3:-1}" axis="${4:-5h}"
   [ -n "${U5[$l]:-}" ] || return 1
   aw_cred_exists "$l" || return 1
-  fable_cap_relevant "$l" && return 1   # Fable-dead AND fleet uses Fable → ineligible (Opus fleet: ignored)
-  aw_lt "${U5[$l]}" "$TRIG_5H" || return 1
-  aw_lt "${U7[$l]}" "$TRIG_7D" || return 1
-  # Fable fleet: the target must have actual FABLE headroom, not just 5h/7d headroom — an endpoint
-  # fable% at/over the ceiling is as dead as a marker (2026-07-16: a naive 5h/7d pick could have
-  # landed the fleet straight back on a Fable-exhausted account). Empty FU = capless = headroom.
-  if [ "$FLEET_MODEL" = "claude-fable-5" ] && [ -n "${FU[$l]:-}" ]; then
-    aw_lt "${FU[$l]}" "$FABLE_TRIG" || return 1
+  local relax="${FABLE_RELAX:-0}" imminent=0
+  aw_weekly_imminent "$l" && imminent=1
+  if [ "$relax" != 1 ] && [ "$imminent" != 1 ]; then
+    fable_cap_relevant "$l" && return 1
+    if [ "$FLEET_MODEL" = "claude-fable-5" ] && [ -n "${FU[$l]:-}" ]; then
+      aw_lt "${FU[$l]}" "$FABLE_TRIG" || return 1
+    fi
   fi
-  if [ "$guard" = 1 ]; then
+  aw_lt "${U5[$l]}" "$TRIG_5H" || return 1                      # 5h ceiling: always
+  [ "$imminent" = 1 ] || aw_lt "${U7[$l]}" "$TRIG_7D" || return 1   # 7d ceiling: waived if imminent
+  if [ "$guard" = 1 ] && [ "$imminent" != 1 ]; then            # improvement guard: waived if imminent
     local tu="${U5[$l]}"
     [ "$axis" = 7d ] && tu="${U7[$l]}"
     [ "$axis" = fable ] && tu="${FU[$l]:-0}"   # capless target = 0% = maximal fable headroom
@@ -209,18 +228,36 @@ aw_eligible(){
   return 0
 }
 
+# aw_flip_to_opus → drop the whole fleet's declared model to Opus 4.8: accounts/.fleet-model AND every
+# rotating descriptor's MODEL pin (only those currently on Fable; trailing comments preserved). Called
+# by the drop-to-Opus fallback BEFORE swap-fleet, so the relaunch brings agents up on Opus and the
+# Fable gating disarms. Operator directive 2026-07-17 [[rotation-weekly-over-fable]].
+aw_flip_to_opus(){
+  printf '%s\n' "$OPUS_MODEL" > "$ACCTS/.fleet-model"
+  local f n=0
+  for f in "$A"/projects/*.env; do
+    [ -e "$f" ] || continue
+    if grep -qE '^MODEL="claude-fable-5"' "$f"; then
+      sed -i "s/^MODEL=\"claude-fable-5\"/MODEL=\"$OPUS_MODEL\"/" "$f" && n=$((n+1))
+    fi
+  done
+  log "opus-flip: accounts/.fleet-model + ${n} descriptor MODEL pin(s) -> $OPUS_MODEL"
+}
+
 # aw_select_targets <active_util> <guard01> <axis> <cand>... → echo ELIGIBLE candidates, best first:
 # primary sort soonest five_hour resets_at, tie-break soonest seven_day resets_at. <axis> is the
 # triggering axis (5h|7d) — validated loudly so a stale 2-arg caller can't silently eat a candidate.
 aw_select_targets(){
   local active_util="$1" guard="$2" axis="$3"; shift 3
   case "$axis" in 5h|7d|fable) ;; *) echo "aw_select_targets: bad axis '$axis' (5h|7d|fable)" >&2; return 2 ;; esac
-  local c l
+  local c l imm
   for c in "$@"; do
     l="$c"
     aw_eligible "$l" "$active_util" "$guard" "$axis" || continue
-    printf '%s %s %s\n' "${R5E[$l]}" "${R7E[$l]}" "$l"
-  done | sort -n -k1,1 -k2,2 | awk '{print $3}'
+    # weekly-imminent accounts sort FIRST (imm=0), then soonest 5h reset, then soonest 7d reset.
+    imm=1; aw_weekly_imminent "$l" && imm=0
+    printf '%s %s %s %s\n' "$imm" "${R5E[$l]}" "${R7E[$l]}" "$l"
+  done | sort -n -k1,1 -k2,2 -k3,3 | awk '{print $4}'
 }
 
 # aw_fable_blocked <label> → rc 0 when <label> cannot serve Fable right now, from EITHER signal:
@@ -546,6 +583,28 @@ else
     fi
     next="$cand"; break
   done
+fi
+
+# --- drop-to-Opus fallback (operator directive 2026-07-17 [[rotation-weekly-over-fable]]) ----------
+# On a Fable fleet with no Fable-eligible target, DON'T hold to preserve Fable — drop the fleet to
+# Opus 4.8 and use a weekly-available account's general budget. Relaxed selection (FABLE_RELAX=1,
+# guard=0) ignores the Fable ceiling and the improvement guard: any credentialed account with 5h/7d
+# headroom (or a weekly-imminent one) qualifies, since the active is de-facto dead for Fable work. If
+# one probes healthy, flip the fleet model to Opus BEFORE swap-fleet relaunches on the new descriptors.
+if [ -z "$next" ] && [ "$degraded" = 0 ] && [ "$FLEET_MODEL" = "claude-fable-5" ]; then
+  mapfile -t relaxed < <(FABLE_RELAX=1 aw_select_targets "${U5[$active]:-100}" 0 5h "${cands[@]}")
+  for cand in "${relaxed[@]}"; do
+    cout=$(probe "$(aw_cfg_of "$cand")")
+    if echo "$cout" | grep -qiE "$CAP_RE"; then log "opus-flip pre-flight: $cand probe-capped — skipping [${cout:0:60}]"; continue; fi
+    next="$cand"; break
+  done
+  if [ -n "$next" ]; then
+    aw_flip_to_opus
+    FLEET_MODEL="$OPUS_MODEL"; axis=5h
+    reason="$reason;fable-exhausted->opus-flip"
+    log "OPUS-FLIP: no Fable-healthy account; dropped fleet to Opus 4.8 to use $next (weekly available, Fable exhausted)"
+    aw_alert_main "Fable exhausted fleet-wide (no Fable-healthy account). Auto-flipped the fleet to Opus 4.8 and rotating to $next (has weekly budget). Set accounts/.fleet-model back to claude-fable-5 to return to Fable after it resets."
+  fi
 fi
 
 if [ -z "$next" ]; then

@@ -371,6 +371,53 @@ check "limits[]→fable→FU round-trip (real parser)"                eq "${FU[a
 check "no limits[] → FU empty through the real parser"            eq "${FU[c]:-EMPTY}" "EMPTY"
 r=$(aw_trigger_reason a); check "END-TO-END: the stall scenario now triggers rotation" eq "$r" "fable=100.0%>=90"
 
+# --- weekly-over-fable policy (operator directive 2026-07-17 [[rotation-weekly-over-fable]]) -------
+echo "## weekly-over-fable: 24h-reset preference + drop-to-Opus fallback"
+FLEET_MODEL="claude-fable-5"; rm -f "$ACCTS"/.fable-cap.*
+IMM7=$(date -u -d '+12 hours' +%FT%T+00:00)
+FAR7=$(date -u -d '+100 hours' +%FT%T+00:00)
+T5a=$(date -u -d '+2 hours' +%FT%T+00:00); T5b=$(date -u -d '+1 hour' +%FT%T+00:00)
+elig_relax(){ local rc; FABLE_RELAX=1; aw_eligible "$@"; rc=$?; unset FABLE_RELAX; return $rc; }
+sel_relax(){ FABLE_RELAX=1; aw_select_targets "$@"; unset FABLE_RELAX; }
+
+aw_load_usage < <(mkjsonl a 10 "$T5a" 50 "$IMM7"; mkjsonl b 10 "$T5a" 50 "$FAR7"
+                  printf '{"label":"c","five_hour":{"utilization":10,"resets_at":"%s"},"seven_day":{"utilization":0,"resets_at":null}}\n' "$T5a")
+check "imminent: 7d reset in 12h → true"                aw_weekly_imminent a
+check_not "not imminent: 7d reset in 100h → false"      aw_weekly_imminent b
+check_not "no 7d window (null reset) → not imminent"    aw_weekly_imminent c
+
+aw_load_usage < <(mkjsonl_fable a 10 "$T5a" 96 "$IMM7" 100 "$FAR7")
+check "imminent: 7d=96 over ceiling + fable=100 exhausted → STILL eligible" aw_eligible a 100 1
+aw_load_usage < <(mkjsonl a 85 "$T5a" 50 "$IMM7"; mkjsonl b 85 "$T5a" 50 "$FAR7")
+check "imminent: improvement guard waived (5h=85 vs active 90)"   aw_eligible a 90 1 5h
+check_not "non-imminent twin: same 5h=85 vs 90 rejected by guard" aw_eligible b 90 1 5h
+
+aw_load_usage < <(mkjsonl a 100 "$T5a" 10 "$IMM7")
+check_not "imminent but 5h=100 → still ineligible (5h ceiling always)"  aw_eligible a 100 0
+check_not "relax but 5h=100 → still ineligible (5h ceiling always)"     elig_relax a 100 0
+
+aw_load_usage < <(mkjsonl a 10 "$T5b" 10 "$FAR7"; mkjsonl b 10 "$T5a" 10 "$IMM7")
+r=$(aw_select_targets 100 0 5h a b | tr '\n' ' ')
+check "imminent account sorts FIRST despite later 5h reset (a@1h non-imm, b@2h imm)" eq "$r" "b a "
+
+aw_load_usage < <(mkjsonl_fable a 10 "$T5a" 50 "$FAR7" 100 "$FAR7"; mkjsonl_fable b 10 "$T5b" 50 "$FAR7" 100 "$FAR7")
+check "strict fable-select: empty (both fable-exhausted)"        eq "$(aw_select_targets 100 0 fable a b)" ""
+r=$(sel_relax 100 0 5h a b | tr '\n' ' ')
+check "relaxed select: both fable-exhausted accounts eligible → drop-to-Opus" eq "$r" "b a "
+
+rm -f "$A"/projects/*.env
+printf 'ROOT="/x"\nMODEL="claude-fable-5"   # keep this comment\n' > "$A/projects/wf-a.env"
+printf 'ROOT="/x"\nMODEL="claude-opus-4-8"\n' > "$A/projects/wf-b.env"
+printf 'ROOT="/x"\n' > "$A/projects/wf-none.env"
+echo claude-fable-5 > "$ACCTS/.fleet-model"
+aw_flip_to_opus
+check "flip: .fleet-model → opus"                 eq "$(cat "$ACCTS/.fleet-model")" "claude-opus-4-8"
+check "flip: fable descriptor MODEL → opus"       grep -q '^MODEL="claude-opus-4-8"' "$A/projects/wf-a.env"
+check "flip: trailing comment preserved"          grep -q 'keep this comment' "$A/projects/wf-a.env"
+check "flip: already-opus descriptor unchanged"   grep -q '^MODEL="claude-opus-4-8"' "$A/projects/wf-b.env"
+check_not "flip: no-MODEL descriptor still has no MODEL"  grep -q MODEL "$A/projects/wf-none.env"
+rm -f "$A"/projects/*.env; FLEET_MODEL="claude-opus-4-8"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = 0 ]
