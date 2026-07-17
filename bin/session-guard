@@ -308,7 +308,7 @@ fi
 #
 # Units fail silently: c009r3-qe sat failed NINE DAYS unseen; logrotate/dpkg-db-backup died at
 # midnight on the full disk unseen; idle-down reported failed on a cosmetic exit-status bug and
-# nobody noticed either. And an ACTIVE unit can be a corpse: demo campaign's campaign died mid-flight
+# nobody noticed either. And an ACTIVE unit can be a corpse: a client campaign died mid-flight
 # and read as 'science stopped' for 16h because its service stayed green while its log went silent.
 # =================================================================================================
 # a) anything in --state=failed, user AND system. Throttle key = the failed SET, so a NEW failure
