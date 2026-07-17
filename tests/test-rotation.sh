@@ -112,7 +112,9 @@ check "host resolves to no config directory"              eq "$r" ""
 
 echo "== alert throttle (1/hr) =="
 rm -f "$ALERT_TS"
-agentctl(){ echo "SENT:$*" >> "$TMP/alerts"; }   # shadow the real agentctl
+mkdir -p "$A/bin"                                      # alerts go via fl_send → $A/bin/fleet-msg
+printf '#!/usr/bin/env bash\necho "SENT:$*" >> "%s/alerts"\n' "$TMP" > "$A/bin/fleet-msg"
+chmod +x "$A/bin/fleet-msg"
 aw_alert_main "first"  >/dev/null
 aw_alert_main "second" >/dev/null
 r=$(grep -c SENT "$TMP/alerts" 2>/dev/null || echo 0)
@@ -121,7 +123,7 @@ echo 0 > "$ALERT_TS"
 aw_alert_main "third" >/dev/null
 r=$(grep -c SENT "$TMP/alerts")
 check "alert fires again after throttle window"           eq "$r" "2"
-unset -f agentctl
+check "alert carries the system envelope identity"        bash -c "grep -q -- '--from system:account-watch' '$TMP/alerts'"
 
 echo "== account-usage --mock end-to-end =="
 cat > "$TMP/mock.json" <<EOF

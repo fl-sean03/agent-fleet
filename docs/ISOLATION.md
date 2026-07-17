@@ -57,6 +57,33 @@ project account's live credential. A confined workspace can be pinned to one acc
 (`.pinned-account`), so a fleet-wide rotation never drags it across an account boundary it shouldn't
 cross.
 
+#### One engagement, several agents (the multi-project client pattern)
+
+Sometimes one client engagement grows a second project — a build repo and a docs site, say — and you
+want a second agent without a second login. The supported pattern: give both descriptors the **same
+ROOT** (the engagement root). The confined launcher keys the isolated config on the ROOT's basename,
+so both workspaces mount the **same** `~/.agents/confined-cfg/<engagement>/` at `/config`:
+
+```
+# projects/exampleco.env                    # projects/exampleco-site.env
+ROOT="$HOME/confined/exampleco"             ROOT="$HOME/confined/exampleco"     # same engagement root
+KIND="confined"                             KIND="confined"
+SESSION_ID="<uuid-a>"                       SESSION_ID="<uuid-b>"   # distinct pin = distinct conversation
+```
+
+Three things make this correct, and one of them is subtle:
+
+- **The config + credential file is a share, not a copy.** Load-bearing: the CLI rename-writes
+  `.credentials.json` on every token refresh, and refresh tokens are single-use and rotating — two
+  *copies* would fork the refresh token, and whichever copy refreshes second kills the other's
+  login. One shared file means both agents ride the one rotating credential together. (Same rule
+  that forbids copying credentials into composed profile dirs — see `docs/PROFILES.md`.)
+- **Distinct `SESSION_ID`s** keep the two conversations separate inside the shared isolated store.
+- **The isolation boundary is the client engagement, not the sub-project.** Both agents see the
+  whole engagement root at `/work` (and each other's transcripts in the shared store) — and nothing
+  outside it. That is the right wall for "two projects, one client". A second *client* is a
+  different boundary and gets its own confined workspace, config, and login.
+
 ### Remote
 The agent process runs on another machine over `ssh -t`; the local pane is a view. Its auth lives on
 the remote box, so account swaps don't apply — and the fleet's swap logic **skips these by design**

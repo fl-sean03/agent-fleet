@@ -17,12 +17,18 @@
 #     transcript mtime, which cannot tell a dead agent from a quiet one. Separately, a compute
 #     campaign filled the disk with its own scratch and starved itself to death, unremarked.)
 set -uo pipefail
-A="$HOME/.agents"; ARCH="$A/session-archive"; LOG="$A/session-guard.log"
-log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+A="${A:-$HOME/.agents}"; ARCH="$A/session-archive"; LOG="$A/session-guard.log"
+# shared primitives (fl_log/fl_send/fl_proctree/ws_busy) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
+FL_SCRIPT=session-guard   # envelope identity: [message from system:session-guard | id]
+log(){ fl_log "$@"; }
 mkdir -p "$ARCH"
 
 # alert_main <key> <msg> — throttled to once per ALERT_SECS per key (mirrors account-watch's
-# aw_alert_main). The fleet alerts its coordinator, not the human; main triages.
+# aw_alert_main). The fleet alerts its coordinator, not the human; main triages. Alerts are the
+# alarm channel — never dormancy-gated (unlike wake nudges, which are).
 ALERT_SECS="${ALERT_SECS:-21600}"   # 6h — a standing misconfiguration must not re-page every 15min
 alert_main(){
   local key="$1" msg="$2" ts="$A/.session-guard-alert.$1" now; now=$(date +%s)
@@ -30,7 +36,7 @@ alert_main(){
     [ -n "$last" ] && [ $((now - last)) -lt "$ALERT_SECS" ] && return 0
   fi
   printf '%s\n' "$now" > "$ts"
-  "$HOME/.local/bin/agentctl" send main "[session-guard] $msg" >/dev/null 2>&1 || true
+  fl_send main "[session-guard] $msg" >/dev/null 2>&1 || true
 }
 
 # 0) shared-store integrity preflight (rebase 2026-07-01): every ACCOUNT profile's projects/ must
@@ -153,21 +159,20 @@ agent_pattern(){
 }
 # every pid under a tmux session's panes (the agent is a CHILD of the launcher script, so
 # pane_current_command is useless here — it reports `bash` for a perfectly healthy agent).
-# FULLY recursive, and it must be: the depth varies by isolation tier, so any fixed depth reports a
-# healthy agent as dead. A project agent is 2 levels down (bash → claude); a CONFINED one is 4
-# (bash → bwrap → bwrap → claude-bin) because bwrap re-execs itself. Guess the depth and you page a
-# human about a perfectly healthy client agent every 15 minutes.
-proctree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }
+# FULLY recursive (fl_proctree), and it must be: the depth varies by isolation tier, so any fixed
+# depth reports a healthy agent as dead. A project agent is 2 levels down (bash → claude); a
+# CONFINED one is 4 (bash → bwrap → bwrap → claude-bin) because bwrap re-execs itself. Guess the
+# depth and you page a human about a perfectly healthy client agent every 15 minutes.
 pane_descendants(){
   local sess="$1" pid
-  for pid in $(tmux list-panes -t "$sess:main" -F '#{pane_pid}' 2>/dev/null); do proctree "$pid"; done
+  for pid in $(tmux list-panes -t "$sess:main" -F '#{pane_pid}' 2>/dev/null); do fl_proctree "$pid"; done
 }
 
 for f in "$A"/projects/*.env; do
   [ -e "$f" ] || continue
   ws=$(basename "${f%.env}")
   tmux has-session -t "agent-$ws" 2>/dev/null || continue          # down on purpose is not a failure
-  agents=$(grep -oP '^AGENTS="?\K[^"]+' "$f" 2>/dev/null | head -1); agents="${agents:-claude}"
+  agents=$(ws_agents "$ws")
   for ag in $agents; do
     pat=$(agent_pattern "$ag"); found=0; hog=""; hogrss=0
     for pid in $(pane_descendants "agent-$ws"); do

@@ -30,11 +30,12 @@ echo "fleet-msg $*" >> "$HOME/calls.txt"
 EOS
 chmod +x "$TMP/bin/tmux" "$A/bin/fleet-msg"; export PATH="$TMP/bin:$PATH"
 
-# extract the helpers from swap-fleet and drive them directly (unit-level; the full phase flow
-# needs a live tmux+accounts world that the account-convention suite owns)
-sed -n '/^ws_busy(){/,/^}/p;/^verify_submitted(){/,/^}/p' "$REPO/bin/swap-fleet" > "$TMP/helpers.sh"
-LOG="$TMP/log.txt"; log(){ echo "$*" >> "$LOG"; }
-. "$TMP/helpers.sh"
+# the helpers live in fleet-lib.sh now (consolidation 2026-07-17) — source them directly, no
+# sed-extraction from swap-fleet (that seam broke whenever the script was touched) and no
+# SWAP_TEST sourcing (which takes the swap lock). Unit-level; the full phase flow needs a live
+# tmux+accounts world that the account-convention suite owns.
+LOG="$TMP/log.txt"
+. "$REPO/bin/fleet-lib.sh"
 
 echo "== ws_busy reads the agent pane, not vibes =="
 check "a mid-turn agent is busy"        ws_busy busy1
@@ -51,7 +52,10 @@ check "opt-in workspace is in the set"        bash -c "echo '$union' | grep -qw 
 check "interrupted workspace is in the set"   bash -c "echo '$union' | grep -qw orch"
 check_not "untouched-idle workspace is NOT"   bash -c "echo '$union' | grep -qw quiet"
 
-echo "== a stuck nudge gets kicked =="
+echo "== a stuck nudge is LEFT VISIBLE, never auto-kicked (auto-submit removed 2026-07-17) =="
+# The RC bridge can REPLAY drafts into a composer — auto-firing whatever sits there is unsafe by
+# design (the same draft was auto-fired into main 3x on 2026-07-17). verify_submitted now detects
+# + logs; the only submit path is a MANUAL fleet-msg kick.
 cat > "$TMP/bin/tmux" <<'EOS'
 #!/usr/bin/env bash
 case "$*" in
@@ -62,9 +66,19 @@ esac
 exit 0
 EOS
 chmod +x "$TMP/bin/tmux"
-rm -f "$HOME/calls.txt"; verify_submitted stuck1
-check "stuck input triggers exactly one kick"  bash -c "grep -q 'fleet-msg kick stuck1' '$HOME/calls.txt'"
-rm -f "$HOME/calls.txt"; verify_submitted clean1
-check_not "a clean submit is not kicked"       bash -c "grep -q 'kick clean1' '$HOME/calls.txt' 2>/dev/null"
+rm -f "$HOME/calls.txt" "$LOG"; verify_submitted stuck1
+check_not "stuck input is NOT auto-kicked"     bash -c "grep -q 'kick stuck1' '$HOME/calls.txt' 2>/dev/null"
+check "stuck input is logged as left-visible"  bash -c "grep -q 'LEFT VISIBLE' '$LOG'"
+check "the log names the manual remedy"        bash -c "grep -q 'fleet-msg kick stuck1' '$LOG'"
+rm -f "$HOME/calls.txt" "$LOG"; verify_submitted clean1
+check_not "a clean submit logs nothing"        bash -c "grep -q 'LEFT VISIBLE' '$LOG' 2>/dev/null"
+
+echo "== dormancy gate (operator policy 2026-07-17: no wake messages to agents idle > 6h) =="
+# the primitive (ws_active_within) is covered in test-fleet-lib.sh; here assert swap-fleet actually
+# WIRES it into both nudge paths, with the interrupted (busy-at-bounce) exemption and no flush gating.
+check "fleet nudges are dormancy-gated"        grep -q 'ws_active_within "\$ws"' "$REPO/bin/swap-fleet"
+check "main's nudge is dormancy-gated"         grep -q 'ws_active_within main' "$REPO/bin/swap-fleet"
+check "interrupted (busy-at-bounce) exempt"    bash -c "grep -B2 'ws_active_within \"\$ws\"' '$REPO/bin/swap-fleet' | grep -q was_cut"
+check "a skipped nudge still flushes the queue" bash -c "grep -A2 'nudge skipped: \$ws' '$REPO/bin/swap-fleet' | grep -q 'flush \"\$ws\"'"
 
 echo; echo "PASS=$PASS FAIL=$FAIL"; [ "$FAIL" = 0 ]

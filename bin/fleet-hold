@@ -23,6 +23,10 @@
 #   fleet-hold --active                    quiet rc-only check (for scripts: swap-fleet, tempo rules)
 set -uo pipefail
 A="${A:-$HOME/.agents}"
+# shared primitives (fl_dur_to_secs) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
 F="${FLEET_HOLD_F:-$A/.fleet-hold}"
 
 now(){ date -u +%s; }
@@ -36,15 +40,7 @@ read_marker(){
   return 0
 }
 
-dur_to_secs(){ # 45m / 6h / 2d → seconds; rc 1 on garbage
-  local d="$1" n unit
-  n="${d%[smhd]}"; unit="${d##*[0-9]}"
-  [[ "$n" =~ ^[0-9]+$ ]] || return 1
-  case "$unit" in
-    s) echo "$n" ;; m) echo $((n*60)) ;; h) echo $((n*3600)) ;; d) echo $((n*86400)) ;;
-    *) return 1 ;;
-  esac
-}
+dur_to_secs(){ fl_dur_to_secs "$@"; }   # 45m / 6h / 2d → seconds; rc 1 on garbage (lib)
 
 case "${1:-status}" in
   on)

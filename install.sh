@@ -24,6 +24,7 @@ say(){ printf '  %s\n' "$*"; }
 
 if [ "$UNINSTALL" = 1 ]; then
   echo "uninstalling (workspaces, memory, and accounts are LEFT ALONE)…"
+  # input-watchdog stays in this list so uninstall also cleans installs that predate its retirement
   for u in account-watch session-guard brain-nightly idle-down input-watchdog backup-watch; do
     systemctl --user disable --now "$u.timer" 2>/dev/null
     rm -f "$UNITS/$u.timer" "$UNITS/$u.service"
@@ -96,6 +97,15 @@ for u in "$KIT"/systemd/*; do
   [ -f "$u" ] || continue    # skip subdirs (environment.d/ has its own installer)
   sed "s|{{FLEET_KIT_ROOT}}|$KIT|g" "$u" > "$UNITS/$(basename "$u")"
 done
+# RETIRED units (see attic/retired-tools/): input-watchdog auto-submitted stranded composer text —
+# unsafe by design (the RC bridge can replay unsent drafts into composers; see docs/MESSAGING.md).
+# Re-running install.sh after an upgrade disables + removes it from earlier installs.
+if [ -f "$UNITS/input-watchdog.timer" ] || [ -f "$UNITS/input-watchdog.service" ]; then
+  systemctl --user disable --now input-watchdog.timer 2>/dev/null
+  rm -f "$UNITS/input-watchdog.timer" "$UNITS/input-watchdog.service"
+  rm -f "$A/bin/input-watchdog"
+  say "retired input-watchdog (auto-submit removed 2026-07-17 — stranded input is left visible; manual: fleet-msg kick)"
+fi
 # environment.d: PATH for ALL --user units, including the transient ones Claude Code spawns for the
 # Remote-Control bridge / Stop hooks (without it those run under systemd's bare default PATH and
 # fail with "node: not found"). Idempotent; takes effect for units started after the next login or
@@ -105,14 +115,13 @@ done
 systemctl --user daemon-reload 2>/dev/null
 say "installed $(ls "$KIT"/systemd | wc -l) systemd units"
 if [ "$WITH_TIMERS" = 1 ]; then
-  for t in account-watch session-guard idle-down brain-nightly input-watchdog; do
+  for t in account-watch session-guard idle-down brain-nightly; do
     systemctl --user enable --now "$t.timer" 2>/dev/null && say "enabled $t.timer"
   done
   say "background services running. 'systemctl --user list-timers' to see them."
 else
   say "timers NOT enabled (safe default). Enable when ready:"
   say "    systemctl --user enable --now session-guard.timer   # transcript protection (recommended)"
-  say "    systemctl --user enable --now input-watchdog.timer  # auto-submit stranded composer input"
   say "    systemctl --user enable --now account-watch.timer   # multi-account rotation (opt-in, see docs/ACCOUNTS.md)"
   say "    systemctl --user enable --now brain-nightly.timer   # the second brain"
   say "    systemctl --user enable --now idle-down.timer       # spin down idle workspaces"

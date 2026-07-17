@@ -26,14 +26,17 @@ while [ "$#" -gt 0 ]; do case "$1" in
   *) echo "unknown swap-account option: $1" >&2; exit 2 ;;
 esac; shift; done
 A="${A:-$HOME/.agents}"
+# shared primitives (ws_root/ws_kind/ws_get/fl_encode_cwd) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
 DESC="$A/projects/$WS.env"; [ -f "$DESC" ] || { echo "no workspace '$WS'"; exit 1; }
-ROOT=$(grep -oP 'ROOT="?\K[^"]+' "$DESC" | head -1); ROOT="${ROOT/\$HOME/$HOME}"; ROOT="${ROOT/#\~/$HOME}"
-enc=$(printf '%s' "$ROOT" | sed 's#[^a-zA-Z0-9]#-#g')
+ROOT=$(ws_root "$WS" 2>/dev/null || true)
+enc=$(fl_encode_cwd "$ROOT")
 
-# KIND — same derivation as agentctl: an explicit KIND=, else anything rooted under $CONFINED_ROOT is
-# confined. This matters because a confined workspace's auth lives somewhere completely different.
-KIND=$(grep -oP '^KIND="?\K[^"]+' "$DESC" | head -1 || true)
-[ -n "$KIND" ] || case "$ROOT" in "${CONFINED_ROOT:-$HOME/confined}"/*) KIND=confined;; *) KIND=project;; esac
+# KIND — same derivation as agentctl (lib ws_kind): an explicit KIND=, else anything rooted under
+# $CONFINED_ROOT is confined. Matters because a confined workspace's auth lives somewhere completely different.
+KIND=$(ws_kind "$WS")
 
 # ---- CONFINED WORKSPACE SWAP -------------------------------------------------------------------
 # A confined workspace's account is NOT the descriptor's ACCOUNT= line. Its auth is the credential file inside
@@ -112,7 +115,7 @@ if [ "$KIND" = confined ]; then
   exit 0
 fi
 
-cur=$(grep -oP 'ACCOUNT="?\K[^"]+' "$DESC" | head -1 || true)
+cur=$(ws_get "$WS" ACCOUNT 2>/dev/null || true)
 [ -n "$cur" ] || cur=$(cat "$HOME/.agents/accounts/.active" 2>/dev/null || true)
 [ -n "$cur" ] || { echo "workspace '$WS' has no ACCOUNT and fleet-active is unset" >&2; exit 1; }
 srcbase="$("$HOME/.agents/bin/account-profile" "$cur")" || exit 1

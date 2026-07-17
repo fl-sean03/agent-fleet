@@ -76,14 +76,19 @@ def _db():
 
 def _session_of(name):
     """The workspace's fixed conversation/session id (SESSION_ID, or legacy RESUME=) — the provenance
-    link into that agent's transcript. None for non-workspace senders (system timers)."""
+    link into that agent's transcript. None for non-workspace senders (system timers).
+
+    ANCHORED + MULTILINE (2026-07-17 consolidation): the old unanchored search matched a confined
+    workspace's commented '#RESUME-retired-…' line first and recorded the garbage session id
+    '-retired-…=' as that workspace's provenance link. Only a line-initial KEY= counts."""
     f = f"{DESC}/{name}.env"
     try:
         txt = open(f).read()
     except OSError:
         return None
-    m = re.search(r'SESSION_ID="?([^"\n]+)', txt) or re.search(r'RESUME="?([^"\n]+)', txt)
-    return m.group(1) if m else None
+    m = (re.search(r'^SESSION_ID="?([^"\n]+)', txt, re.M)
+         or re.search(r'^RESUME="?([^"\n]+)', txt, re.M))
+    return m.group(1).rstrip('"') if m else None
 
 
 def _all_workspaces():
@@ -228,8 +233,9 @@ def _submit(pane, text):
          same way), so idle and busy both verify identically.
 
     "stuck" (text visibly sitting after all retries) is a distinct outcome ON PURPOSE: the text IS
-    in the box, so the caller must NOT queue it for re-delivery (that double-delivers when the
-    input-watchdog or a kick later fires it). None = nothing landed — safe to queue."""
+    in the box, so the caller must NOT queue it for re-delivery (that double-delivers if a manual
+    kick later fires it). None = nothing landed — safe to queue. (Auto-submit of stranded text was
+    REMOVED by the operator 2026-07-17 — RC-bridge draft replay; stuck text stays visible.)"""
     t0 = time.time()
     while not _composer(pane)[0]:                         # 1. readiness gate
         if time.time() - t0 > 25:
@@ -283,7 +289,7 @@ def _deliver(name, env, no_submit=False):
             return "delivered"
         if res == "stuck":
             # The text IS in the recipient's composer, just unsubmitted. Queuing it too would
-            # double-deliver once the input-watchdog / a kick fires it. Surface, don't re-queue.
+            # double-deliver if a manual kick later fires it. Surface, don't re-queue.
             # BUSY qualifier (production data, 16:07Z swap): for a mid-turn recipient the Enter
             # QUEUES the message yet the queued text keeps rendering in the composer, so the verify
             # loop reads not-cleared — "stuck" on a busy recipient usually means DELIVERED-QUEUED
@@ -291,12 +297,12 @@ def _deliver(name, env, no_submit=False):
             busy = "esc to interrupt" in _pane_text(pane)
             if busy:
                 print(f"fleet-msg: NOTE {name}: recipient is mid-turn — message likely QUEUED "
-                      f"(composer renders queued text until the turn ends; input-watchdog reconciles). "
-                      f"Do not re-send.", file=sys.stderr)
+                      f"(composer renders queued text until the turn ends). Do not re-send.",
+                      file=sys.stderr)
             else:
                 print(f"fleet-msg: WARNING {name}: message pasted but Enter did not land after retries "
-                      f"— left in composer (input-watchdog will fire it, or: fleet-msg kick {name})",
-                      file=sys.stderr)
+                      f"— LEFT VISIBLE in the composer (auto-submit removed 2026-07-17; "
+                      f"manual: fleet-msg kick {name})", file=sys.stderr)
             return "stuck"
     os.makedirs(PENDING, exist_ok=True)
     with open(f"{PENDING}/{name}.jsonl", "a") as fh:
@@ -339,7 +345,7 @@ def cmd_send(a):
     if q:
         out += f"  |  QUEUED (down, flush on resume)→ {', '.join(q)}"
     if st:
-        out += f"  |  STUCK-IN-COMPOSER (watchdog will fire)→ {', '.join(st)}"
+        out += f"  |  STUCK-IN-COMPOSER (left visible; manual kick only)→ {', '.join(st)}"
     print(out)
     return mid
 
@@ -421,14 +427,47 @@ def _is_artifact(text):
     return any(s in text for s in _TUI_ARTIFACTS)
 
 
+def _is_own_echo(pane, text):
+    """ECHO-GUARD (live incident, 2026-07-17): True when the candidate composer text appears
+    VERBATIM in the agent's own recent on-screen OUTPUT — i.e. the "stuck input" is screen-echo
+    (stray selection-paste / RC-bridge artifact of the agent's own rendering), not operator input.
+    A kick once fired a fragment of an agent's OWN conversation content (a journal title it had
+    been discussing, on screen moments earlier) back into it as if the operator sent it.
+    Discriminator, validated against both live cases:
+      * echo:     the fragment appears verbatim in that agent's scrollback output → suppress+clear.
+      * genuine:  a real operator directive whose Enter was swallowed appears NOWHERE in the
+                  agent's own output → flushed normally.
+    Haystack = the last ~300 scrollback lines ABOVE the composer, EXCLUDING '❯' lines: everything
+    from the last ❯ down is the input box itself (the candidate lives there by definition), and past
+    submitted prompts render as '❯ <text>' echoes too — an operator RE-sending an earlier directive
+    must not be suppressed by their own previous send. Whitespace-normalized substring match, applied
+    regardless of length (short texts are the risk area, accepted trade: a false suppress is a
+    cleared+logged composer line, recoverable; a false flush is agent output executing with operator
+    authority)."""
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-J", "-S", "-300", "-t", pane],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return False
+    lines = r.stdout.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if "❯" in lines[i]:
+            lines = lines[:i]
+            break
+    hay = " ".join(" ".join(l.split()) for l in lines if "❯" not in l)
+    needle = " ".join(text.split())
+    return bool(needle) and needle in hay
+
+
 def cmd_kick(a):
     """Recover an agent stranded with UNSUBMITTED text in its input (pasted but never submitted —
     the stuck-input bug). Submits what was in the box, WRAPPED in the standard provenance envelope
-    ([message from system:<script> | msg-id]) and recorded in the durable log — a watchdog-fired
+    ([message from system:<script> | msg-id]) and recorded in the durable log — a machine-fired
     submission must never be indistinguishable from a live human Enter (a ghost draft once executed
     with operator authority on exactly that confusion). The envelope also defuses '!'/'/' lines:
     prefixed text can no longer execute as a bash/slash command. Known TUI render artifacts are
-    cleared, not submitted."""
+    cleared, not submitted. Screen-echo of the agent's OWN output (_is_own_echo) is likewise
+    cleared, not submitted — one live incident flushed an agent's own conversation content back
+    into it as operator input."""
     name = a.get("name") or os.environ.get("WS_NAME")
     if not name:
         sys.exit("fleet-msg: kick needs a name")
@@ -445,12 +484,25 @@ def cmd_kick(a):
     cur = _current_input(pane)
     if not cur:
         print(f"({name}: input already clear — nothing stuck)"); return
+    artifact = _is_artifact(cur)
+    echo = (not artifact) and _is_own_echo(pane, cur)
     if a.get("dry"):
-        print(f"{name}: WOULD submit stuck input as {sender}: {cur!r}"); return
+        if artifact:
+            print(f"{name}: WOULD clear TUI artifact (not submit): {cur!r}")
+        elif echo:
+            print(f"echo-guard: {name}: WOULD clear screen-echo of the agent's own output (not submit): {cur!r}")
+        else:
+            print(f"{name}: WOULD submit stuck input as {sender}: {cur!r}")
+        return
     subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], capture_output=True)  # clear the stranded
     time.sleep(0.4)                                                                # text first
-    if _is_artifact(cur):
+    if artifact:
         print(f"{name}: cleared TUI artifact (not submitted): {cur!r}")
+        return
+    if echo:
+        # screen-echo of the agent's own output: submitting it would feed the agent its own words
+        # with operator authority (the live echo incident above). Cleared, logged, never submitted.
+        print(f"echo-guard: {name}: cleared screen-echo of the agent's own output (not submitted): {cur!r}")
         return
     mid, ts = _new_id(), _now()
     env = {"id": mid, "ts": ts, "from": sender, "body": cur}

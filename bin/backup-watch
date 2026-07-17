@@ -18,9 +18,14 @@
 # path — which is exactly the silent failure this tool exists to catch.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-A="$HOME/.agents"; LOG="$A/backup-watch.log"; MARK="$A/.backup-watch-alerted"
+A="${A:-$HOME/.agents}"; LOG="$A/backup-watch.log"; MARK="$A/.backup-watch-alerted"
 CONF="${BACKUP_WATCH_CONF:-$A/backup-watch.conf}"
-log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+# shared primitives (fl_log/fl_send) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
+FL_SCRIPT=backup-watch   # envelope identity: [message from system:backup-watch | id]
+log(){ fl_log "$@"; }
 
 [ -f "$CONF" ] || { log "no $CONF — nothing to watch (see the header of this script for the format)"; exit 0; }
 
@@ -49,7 +54,7 @@ log "STALE: ${alerts[*]}"
 today=$(date -u +%F)
 [ "$(cat "$MARK" 2>/dev/null)" = "$today" ] && exit 0
 echo "$today" > "$MARK"
-# FLEET_MSG_FROM: the provenance standard — a machine-mediated message names its originating script.
-FLEET_MSG_FROM="system:backup-watch" agentctl send main \
-  "[backup-watch] Backup staleness: ${alerts[*]}" >/dev/null 2>&1 \
+# fl_send: the provenance standard — a machine-mediated message names its originating script
+# ([message from system:backup-watch | id]). Alerts are the alarm channel — never dormancy-gated.
+fl_send main "[backup-watch] Backup staleness: ${alerts[*]}" >/dev/null 2>&1 \
   && log "alerted main pane" || log "alert send failed"

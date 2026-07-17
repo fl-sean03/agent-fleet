@@ -29,6 +29,16 @@ printf '#!/usr/bin/env bash\nexec /usr/bin/tmux -L %s "$@"\n' "$SOCK" > "$TMP/bi
 # agentctl stub → record alerts instead of sending them
 printf '#!/usr/bin/env bash\n[ "${1:-}" = send ] && { shift 2; printf "%%s\\n" "$*" >> "$HOME/alerts.txt"; }\nexit 0\n' > "$TMP/.local/bin/agentctl"
 chmod +x "$TMP/bin/tmux" "$TMP/.local/bin/agentctl"
+# session-guard's alerts ride fl_send → $A/bin/fleet-msg (2026-07-17 envelope consolidation) — record
+# them the same way. The delivery tests below still call the REAL fleet-msg by absolute path ($FM).
+mkdir -p "$A/bin"
+cat > "$A/bin/fleet-msg" <<'EOF'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do case "$1" in send) shift;; --to|--from) shift 2;; *) break;; esac; done
+printf '%s\n' "$*" >> "$HOME/alerts.txt"
+exit 0
+EOF
+chmod +x "$A/bin/fleet-msg"
 export PATH="$TMP/bin:$PATH"
 # a real executable named `claude` (a bash script would appear as `bash` in /proc/<pid>/comm — the
 # exact reason a naive check reports a healthy agent as dead)
@@ -133,6 +143,37 @@ out=$(python3 "$FM" flush dead2 2>&1)
 check_not "flush did NOT execute the queue"   test -f "$TMP/PWNED2"
 check "flush says the agent is dead"          bash -c "printf '%s' \"$out\" | grep -q 'AGENT is dead'"
 check "flush LEFT the messages queued"        test -s "$A/messages/pending/dead2.jsonl"
+
+echo "== echo-guard: kick never submits the agent's OWN screen output back into it (live incident 2026-07-17) =="
+# The incident: a kick fired a fragment of an agent's own conversation content (a journal title it
+# had been discussing), stranded into the composer by a stray selection-paste and flushed back into
+# the agent as operator input. Discriminator: composer text that appears VERBATIM in the agent's own
+# output above the composer = echo (clear, never submit); a genuine swallowed directive appears
+# nowhere in the output and must still flush.
+mkws echoer
+tmux new-session -d -s agent-echoer -n main -c "$TMP" "exec bash" 2>/dev/null
+tmux split-window -t agent-echoer:main -c "$TMP" \
+  "printf 'The reviewer cited Journal of Example Research for the preconditioner\n❯ Journal of Example Research\n'; exec \"$TMP/bin/claude\" -c 'import time;time.sleep(300)' sid-echoer" 2>/dev/null
+mkws genuine
+tmux new-session -d -s agent-genuine -n main -c "$TMP" "exec bash" 2>/dev/null
+tmux split-window -t agent-genuine:main -c "$TMP" \
+  "printf 'agent: say the word and it goes\n❯ resume the queue\n'; exec \"$TMP/bin/claude\" -c 'import time;time.sleep(300)' sid-genuine" 2>/dev/null
+sleep 1
+echo_of(){ REPO="$REPO" python3 - "$1" "$2" <<'PYX'
+import os, sys
+from importlib.machinery import SourceFileLoader
+fm = SourceFileLoader("fm", os.environ["REPO"] + "/bin/fleet-msg").load_module()
+p = fm._claude_pane(sys.argv[1])
+print("echo" if (p and fm._is_own_echo(p, sys.argv[2])) else "no-echo")
+PYX
+}
+check "own-output text reads as echo"              bash -c "[ \"$(echo_of echoer 'Journal of Example Research')\" = echo ]"
+check "a genuine swallowed directive is NOT echo"  bash -c "[ \"$(echo_of genuine 'resume the queue')\" = no-echo ]"
+kout=$(python3 "$FM" kick echoer --as test 2>&1)
+check "kick CLEARS the echo instead of submitting" bash -c "printf '%s' \"$kout\" | grep -q 'echo-guard:.*cleared screen-echo'"
+check_not "the echo was never submitted"           bash -c "printf '%s' \"$kout\" | grep -q 'submitted stuck input'"
+dout=$(python3 "$FM" kick genuine --as test --dry 2>&1)
+check "the genuine directive would still be submitted" bash -c "printf '%s' \"$dout\" | grep -q 'WOULD submit stuck input'"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

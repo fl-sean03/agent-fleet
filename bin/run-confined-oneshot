@@ -41,7 +41,7 @@ if [ -n "$ACTIVE" ] && [ "$CUR" != "$ACTIVE" ]; then
     echo "⚠ $WS is UP on '$CUR' — not swapping live credentials under a running session; running pinned" >&2
   else
     echo "⚠ $WS has no stash for fleet-active '$ACTIVE' — running pinned on '${CUR:-unknown}'" >&2
-    "$HOME/.local/bin/agentctl" send main "[run-confined-oneshot] $WS cannot follow fleet to $ACTIVE: no per-confined-workspace stash — ran pinned on ${CUR:-unknown}; grant = /login inside the confined workspace under $ACTIVE" 2>/dev/null || true
+    FLEET_MSG_FROM=system:run-confined-oneshot "$HOME/.local/bin/agentctl" send main "[run-confined-oneshot] $WS cannot follow fleet to $ACTIVE: no per-confined-workspace stash — ran pinned on ${CUR:-unknown}; grant = /login inside the confined workspace under $ACTIVE" 2>/dev/null || true
   fi
 fi
 

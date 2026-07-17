@@ -56,10 +56,49 @@ attributes memories to it.
 | `watch-freeze` | Quieting the watchdog for maintenance — with a guaranteed auto-thaw |
 | `account-watch` | *When* and *where* to rotate accounts (usage, caps, debounce, backoff) |
 | `swap-fleet` / `swap-account` | *How* to move: ordered, verified, per-model-gated |
+| `fleet-lib.sh` | The ONE implementation of every shared primitive (sourced, never executed) |
 | `brain` | Turning transcripts into memory (see [BRAIN.md](BRAIN.md)) |
 
 Two of those are deliberately split: **`account-watch` decides, `swap-fleet` executes.** Deciding and
 doing have different failure modes and different tests.
+
+## The shared library (consolidation, 2026-07-17)
+
+Descriptor parsing, pane addressing, busy detection, process-tree liveness, RC re-registration, the
+fable-cap marker read, the log format and the system-message envelope each used to exist as 3–6
+slightly different copies across `bin/`. The differences were never design — they were drift, and
+drift bites: one unanchored descriptor grep matched a *commented-out* `#RESUME-retired…` line and fed
+a garbage session id into message provenance and idle detection for a confined workspace.
+
+Now there is **one implementation**: `bin/fleet-lib.sh`, sourced by the eleven scripts that used to
+carry private copies (`swap-fleet`, `account-watch`, `session-guard`, `idle-down`, `backup-watch`,
+`agentctl`, `account-status`, `swap-account`, `fleet-hold`, `watch-freeze`, `provision-profile`).
+What lives there:
+
+- **Descriptor access** — `ws_get` and friends: anchored (a commented line can never match),
+  quote-aware, inline-comment-safe. One parser, one set of bugs to fix.
+- **Pane + liveness** — `fl_agent_pane` / `ws_busy` (one busy signature: `esc to interrupt`) /
+  `fl_proctree` + `fl_agent_alive` (full recursive walk — tree depth varies by isolation tier).
+- **Envelope send** — `fl_send` routes through `fleet-msg` as `system:<script>` (see
+  [MESSAGING.md](MESSAGING.md)).
+- **The dormancy gate** — `ws_active_within <ws> [hours]`: automated *wake* messages (post-swap
+  resume nudges) go only to agents whose transcript was written in the last
+  `FL_WAKE_ACTIVE_HOURS` (default 6). A dormant agent is swapped but not woken; the skip is
+  logged with its idle age. Exempt by design: busy-at-bounce workspaces (observed mid-turn =
+  in use), queued-message flush (delivery-of-record), and alert pages (the alarm channel).
+- **Post-swap recovery** — `verify_submitted` (detect-and-log only: stranded text is LEFT VISIBLE,
+  never auto-fired) and `verify_rc_retry` (re-trigger `/remote-control` after the transient
+  first-registration failure) — extracted so nothing has to source `swap-fleet` past its swap lock.
+
+Rules that keep it safe to source: no side effects at source time, everything reads `$A`/`$ACCTS` at
+call time (test sandboxes always win), and the `fleet-lib-sane` invariant pages within one
+`fleet-invariants` sweep if the lib ever fails to parse — it is load-bearing for eleven scripts, so
+a syntax error there must be loud, not mysterious.
+
+Retired in the same pass: the `input-watchdog` (automated composer submission — unsafe by design
+because the Remote Control bridge can replay unsent drafts into composers; see MESSAGING.md) and
+`run-claude`'s dead `RESUME=` legacy branch. Retired tools keep their history under
+`attic/retired-tools/`.
 
 ## The agent-agnostic seam
 
@@ -99,4 +138,5 @@ the brain's model call shells out to `claude -p`. Both sit behind one narrow int
 - **One writer per session file.** Two processes appending one transcript is how you lose history.
 - **Debounce anything that triggers an action.** Two consecutive observations before acting, plus a
   dwell time after. Undebounced reactors flap.
-- **Everything mechanical is tested.** 249 tests against fixtures — no live credentials, no network.
+- **Everything mechanical is tested.** 479 harness tests plus the brain's pytest suite, all against
+  fixtures — no live credentials, no network.

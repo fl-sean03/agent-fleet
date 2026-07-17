@@ -20,16 +20,18 @@ set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"
 LOG="${LOG:-$ACCTS/watch.log}"
+# shared primitives (fl_log/fl_dur_to_secs) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
 TIMER="account-watch.timer"
 THAW_UNIT="watch-thaw"           # transient systemd-run unit name (creates watch-thaw.timer)
 MAX_SECS=$((24*3600))            # hard ceiling — a "maintenance" freeze may not span days
 
-log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+log(){ fl_log "$@"; }
 run(){ if [ "${WATCH_FREEZE_DRY:-}" = 1 ]; then echo "DRY: $*"; else "$@"; fi; }
 
-dur_to_secs(){ local d="$1" n unit; n="${d%[smhd]}"; unit="${d##*[0-9]}"
-  [[ "$n" =~ ^[0-9]+$ ]] || return 1
-  case "$unit" in s) echo "$n";; m) echo $((n*60));; h) echo $((n*3600));; d) echo $((n*86400));; *) return 1;; esac; }
+dur_to_secs(){ fl_dur_to_secs "$@"; }
 
 case "${1:-status}" in
   thaw)

@@ -29,6 +29,13 @@ export PATH="$HOME/.local/bin:$PATH"
 A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"; AGENTCTL="$HOME/.local/bin/agentctl"
 AUSAGE="${AUSAGE:-$A/bin/account-usage}"
 LOG="${LOG:-$ACCTS/swap-fleet.log}"
+# Shared primitives (ws_get/ws_model/ws_rc_on/ws_busy/verify_submitted/verify_rc_retry/fable-marker/
+# ws_active_within/fl_send) — ONE implementation, in the lib; this file keeps only swap POLICY.
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
+FL_SCRIPT=swap-fleet    # envelope identity: messages from here render as [message from system:swap-fleet | id]
+FL_LOG_TEE=1            # swap-fleet's log lines also go to stdout (historical tee behavior)
 ACCT="${1:?usage: swap-fleet <account> [--dry] [--no-confined] [--only-confined <name>]}"; shift || true
 DRY=0; NOCONFINED=0; OPTIN=0; TAILONLY=0; NUDGE=0; ONLYCONFINED=""
 while [ "$#" -gt 0 ]; do
@@ -55,11 +62,11 @@ if [ "$TAILONLY" = 1 ]; then
 else
   flock -n 9 || { echo "another swap-fleet is in progress (accounts/.swap.lock) — aborting"; exit 1; }
 fi
-log(){ echo "[$(date -u +%FT%TZ)] $*" | tee -a "$LOG"; }
+log(){ fl_log "$@"; }   # tee'd via FL_LOG_TEE above
 
 # account label → credentialed named profile + login email (for verification)
-cfg_of(){ "$A/bin/account-profile" "$1"; }
-email_of(){ python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$(cfg_of "$1")/.claude.json" 2>/dev/null || true; }
+cfg_of(){ fl_cfg_of "$1"; }
+email_of(){ fl_email_of "$(cfg_of "$1")"; }
 
 # --- per-model cap gate (incident 2026-07-12: example-confined, the sole Fable-5 workspace, was moved onto a
 # Fable-capped account — swap validated only 5h/7d — and stranded ~6h on "reached your Fable 5
@@ -69,48 +76,17 @@ FABLE_BLOCK_PCT="${FABLE_BLOCK_PCT:-99}"
 LEFT_BEHIND_F="$ACCTS/.swap-leftbehind"    # ws names Phase A leaves behind; read+cleared by the tail
 INTERRUPTED_F="$ACCTS/.swap-interrupted"   # ws that were MID-TURN when we bounced them (see ws_busy)
 
-# ws_busy <ws> — was this agent actively working when we reached it? A bounce kills the running
+# ws_busy (lib) — was this agent actively working when we reached it? A bounce kills the running
 # turn, and a --resume'd session sits idle at the prompt afterward — so an agent busy at bounce
 # time needs a resume nudge or its task silently dies. Static AUTOCONTINUE=yes never covered this:
 # on 2026-07-16 two account swaps decapitated long agent runs mid-flight, twice, and
 # only the four AUTOCONTINUE workspaces got nudged. Busy-at-bounce is the CORRECT nudge criterion —
 # an agent mid-turn is by definition doing something worth resuming.
-ws_busy(){
-  tmux capture-pane -p -t "agent-$1:main.2" 2>/dev/null | grep -q "esc to interrupt"
-}
-# verify_submitted <ws> — a nudge is a paste + Enter; during post-relaunch churn the Enter can be
-# swallowed, leaving the nudge SITTING IN THE INPUT BOX (observed live: a directive
-# stuck unsubmitted, agent idle for an hour looking nudged). Verify the input box
-# actually cleared; if not, one kick submits whatever is stuck.
-verify_submitted(){
-  local ws="$1"; sleep 2
-  local line; line=$(tmux capture-pane -p -t "agent-$ws:main.2" 2>/dev/null | grep "❯" | tail -1)
-  if printf '%s' "$line" | grep -qE "❯ .+"; then
-    "$A/bin/fleet-msg" kick "$ws" >>"$LOG" 2>&1 && log "nudge for $ws was stuck in the input box — kicked"
-  fi
-}
+# verify_submitted (lib) — a nudge is a paste + Enter; during post-relaunch churn the Enter can be
+# swallowed, leaving the nudge SITTING IN THE INPUT BOX (observed live: a directive stuck
+# unsubmitted, agent idle for an hour looking nudged). The lib detects + LOGS; it never auto-submits.
+# fable_blocked (lib) — marker OR usage-endpoint fable% >= FABLE_BLOCK_PCT; endpoint errors fail open.
 RC_MOVED_F="$ACCTS/.swap-rcmoved"          # RC-enabled ws that MOVED accounts (orphaned-bridge reminder)
-fable_blocked(){ # <acct> → rc 0 when <acct> cannot serve Fable NOW: fresh .fable-cap marker OR the
-  # usage endpoint's per-model fable utilization >= FABLE_BLOCK_PCT. Endpoint errors → not blocked
-  # (fail open: the pre-existing behavior; the marker path still catches walls seen by real calls).
-  local f="$ACCTS/.fable-cap.$1" exp u
-  if [ -f "$f" ]; then
-    exp=$(head -1 "$f" 2>/dev/null | tr -cd '0-9')
-    [ -n "$exp" ] && [ "$(date +%s)" -lt "$exp" ] && return 0
-  fi
-  u=$("$AUSAGE" --json "$1" 2>/dev/null | python3 -c '
-import json,sys
-try:
-    r = json.loads(sys.stdin.readline() or "{}")
-    fb = r.get("fable") or {}
-    u = fb.get("utilization")
-    print("" if u is None else u)
-except Exception:
-    print("")')
-  [ -n "$u" ] && awk -v u="$u" -v p="$FABLE_BLOCK_PCT" 'BEGIN{exit !(u>=p)}'
-}
-ws_model(){ grep -oP '^MODEL="?\K[^"# ]+' "$A/projects/$1.env" 2>/dev/null | head -1; }
-ws_rc_on(){ [ "$(grep -oP '^REMOTE_CONTROL="?\K[^"# ]+' "$A/projects/$1.env" 2>/dev/null | head -1)" = on ]; }
 model_gate_skip(){ # <ws> → rc 0 = leave this workspace where it is (Fable-pinned + target Fable-blocked)
   [ "$(ws_model "$1")" = "claude-fable-5" ] || return 1
   [ "${TARGET_FABLE_BLOCKED:-0}" = 1 ]
@@ -128,7 +104,7 @@ verify_ws(){ # <ws> → 0 if the live claude proc for this workspace reads crede
   #                securestorage points at the account                      → resolves to it
   # Checking the config dir alone would silently pass every profile workspace on the WRONG account.
   local ws="$1" sid pid cd want arg0; want="$(readlink -f "$TCFG")"
-  sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$A/projects/$ws.env" | head -1)
+  sid=$(ws_session_id "$ws" 2>/dev/null) || true
   [ -n "$sid" ] || return 1
   for _ in $(seq 1 "${VERIFY_TRIES:-10}"); do
     for pid in $(pgrep -f -- "$sid" 2>/dev/null); do
@@ -155,27 +131,10 @@ verify_confined(){ # <confined workspace> → 0 if its .claude.json login email 
   return 1
 }
 
-# verify_rc_retry <ws> — after a swap relaunch, the workspace boots RC-enabled but its FIRST RC
-# registration against the freshly-swapped account can fail with a transient "Remote credentials fetch
-# failed" (the RC credential exchange lags the account change), and the CLI never retries — so Remote
-# Control stays DOWN fleet-wide after every swap until poked. The agent is idle for a beat right after
-# the bounce (before the resume-nudge), so re-triggering /remote-control then registers cleanly, under
-# the correct name (run-claude passes -n). Best-effort (all tmux calls tolerate failure); logs the outcome.
-verify_rc_retry(){
-  local w="$1" pane="agent-$1.2" attempt txt
-  ws_rc_on "$w" || return 0
-  for attempt in 1 2 3; do
-    txt=$(tmux capture-pane -p -t "$pane" -S -20 2>/dev/null || true)
-    printf '%s' "$txt" | grep -qiE 'remote-control is active|Continue here, on your phone' && return 0
-    printf '%s' "$txt" | grep -q 'esc to interrupt' && return 0   # busy (a live turn owns the box) — leave it
-    tmux send-keys -t "$pane" C-u 2>/dev/null || true; sleep 1
-    tmux send-keys -t "$pane" "/remote-control" 2>/dev/null || true; sleep 3
-    tmux send-keys -t "$pane" Enter 2>/dev/null || true; sleep 5
-  done
-  txt=$(tmux capture-pane -p -t "$pane" -S -20 2>/dev/null || true)
-  printf '%s' "$txt" | grep -qiE 'remote-control is active|Continue here' && return 0
-  return 1
-}
+# verify_rc_retry (lib) — after a swap relaunch, the workspace boots RC-enabled but its FIRST RC
+# registration against the freshly-swapped account fails transiently and the CLI never retries
+# (observed live: after one swap only 2 of 13 workspaces kept Remote Control); the lib re-triggers
+# /remote-control while the agent idles post-bounce.
 
 # --- test gate: SWAP_TEST=1 sourcing stops here (helpers only, no roster/moves) -------------------
 if [ "${SWAP_TEST:-}" = 1 ]; then return 0 2>/dev/null || exit 0; fi
@@ -198,7 +157,7 @@ mapfile -t PROJ < <(agentctl status --json 2>/dev/null | python3 -c "import json
 mapfile -t CONFINED_WS < <(agentctl status --json 2>/dev/null | python3 -c "import json,sys;[print(w['name']) for w in json.load(sys.stdin) if w['status']=='up' and w['kind']=='confined']")
 others=(); skipped=(); has_main=0
 for w in "${PROJ[@]}"; do
-  ag=$(grep -oP '^AGENTS="?\K[^"]+' "$A/projects/$w.env" 2>/dev/null | head -1)
+  ag=$(ws_agents "$w")
   if [ -n "$ag" ] && [ "$ag" != claude ]; then skipped+=("$w($ag)"); continue; fi
   [ "$w" = main ] && has_main=1 || others+=("$w")
 done
@@ -229,7 +188,7 @@ if [ -z "$ONLYCONFINED" ]; then
     if [ -n "$_pin" ] && [ "$_pin" != "$ACCT" ]; then
       # log(), not echo: the detached B+C tail's stdout goes to the systemd journal, so an echo here
       # never reached swap-fleet.log — the skip was invisible in the file anyone actually reads.
-      # Worded as the routine, expected outcome it is: a pin is a standing decision, and a client
+      # Worded as the routine, expected outcome it is: a pin is a standing decision, and a workspace
       # sitting out a rotation because of one is NOT a failure. (a workspace pinned to its own account by
       # design, so this line is expected on every swap; if it read as an error we would learn to
       # ignore the log.) Deliberately NOT alerted to main: standing policy is not an exception.
@@ -296,6 +255,7 @@ run_tail(){
     echo "main" >> "$LEFT_BEHIND_F"
   elif [ "$has_main" = 1 ]; then
     log "B: swapping main → $ACCT (detached)"
+    local main_busy=0; ws_busy main && main_busy=1   # busy-at-bounce exempts main from the dormancy gate
     local bout brc; bout=$("$A/bin/swap-account" main "$ACCT" 2>&1); brc=$?; printf '%s\n' "$bout" >>"$LOG"
     if [ "$brc" = 0 ] && verify_ws main; then
       if printf '%s' "$bout" | grep -q "already on"; then log "B: = main already on $ACCT (verified)"
@@ -379,10 +339,21 @@ run_tail(){
       [ "$ws" = main ] && continue    # main has its own tailored nudge below
       tmux has-session -t "agent-$ws" 2>/dev/null || continue
       local was_cut=""; grep -qx "$ws" "$INTERRUPTED_F" 2>/dev/null && was_cut=" You were INTERRUPTED MID-TURN by this bounce — your last task is unfinished, not done."
+      # DORMANCY GATE (operator policy 2026-07-17: "we should not be sending swap messages if the
+      # agent has not been in use/process for the last 6 hours"): AUTOMATED wake messages go only to agents whose
+      # transcript was written within FL_WAKE_ACTIVE_HOURS (6h). The swap itself already happened —
+      # only the wake message is skipped. Busy-at-bounce (INTERRUPTED) workspaces are exempt: they
+      # were observed mid-turn moments ago, which is direct evidence of current use. Queued messages
+      # still flush — delivery-of-record is never gated (same rule as the fleet-hold case above).
+      if [ -z "$was_cut" ] && ! ws_active_within "$ws"; then
+        log "nudge skipped: $ws idle $(fl_idle_hours "$ws")h > ${FL_WAKE_ACTIVE_HOURS:-6}h (dormancy policy 2026-07-17) — swapped, no wake message"
+        "$AGENTCTL" flush "$ws" >>"$LOG" 2>&1 || true
+        continue
+      fi
       if [ "$hold_active" = 1 ]; then
-        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT.$was_cut A FLEET HOLD is ACTIVE ($hold_line) — do NOT resume work; checkpoint if needed and stay idle until the hold is lifted." >>"$LOG" 2>&1 && log "nudged $ws (hold-aware: stay idle)"
+        fl_send "$ws" "[account-swap] Fleet moved to account $ACCT.$was_cut A FLEET HOLD is ACTIVE ($hold_line) — do NOT resume work; checkpoint if needed and stay idle until the hold is lifted." >>"$LOG" 2>&1 && log "nudged $ws (hold-aware: stay idle)"
       else
-        "$AGENTCTL" send "$ws" "[account-swap] Fleet moved to account $ACCT.$was_cut Your work is checkpointed on disk — re-read your last message and continue exactly where you left off. Keep going." >>"$LOG" 2>&1 && log "nudged $ws${was_cut:+ (was mid-turn)}"
+        fl_send "$ws" "[account-swap] Fleet moved to account $ACCT.$was_cut Your work is checkpointed on disk — re-read your last message and continue exactly where you left off. Keep going." >>"$LOG" 2>&1 && log "nudged $ws${was_cut:+ (was mid-turn)}"
       fi
       verify_submitted "$ws"
       # redeliver any inter-agent messages that were queued while this agent was bounced — they get
@@ -394,13 +365,19 @@ run_tail(){
     # until spoken to, so without this the fleet-operator conversation stalls after every swap
     # (the operator observed exactly this, 2026-07-09). Tailored text — main resumes its own interrupted turn.
     if [ "${main_moved:-0}" = 1 ]; then
-      if [ "$hold_active" = 1 ]; then
-        "$AGENTCTL" send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. A FLEET HOLD is ACTIVE ($hold_line) — verify the swap completed cleanly (swap-fleet.log), then stay idle; do not resume fleet work or re-nudge agents until the hold lifts." >>"$LOG" 2>&1 && log "nudged main (hold-aware resume-after-bounce)"
+      # same dormancy gate as the fleet nudges: an overnight-idle main is swapped but not woken.
+      if [ "${main_busy:-0}" = 0 ] && ! ws_active_within main; then
+        log "nudge skipped: main idle $(fl_idle_hours main)h > ${FL_WAKE_ACTIVE_HOURS:-6}h (dormancy policy 2026-07-17) — swapped, no wake message"
+        "$AGENTCTL" flush main >>"$LOG" 2>&1 || true
+      elif [ "$hold_active" = 1 ]; then
+        fl_send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. A FLEET HOLD is ACTIVE ($hold_line) — verify the swap completed cleanly (swap-fleet.log), then stay idle; do not resume fleet work or re-nudge agents until the hold lifts." >>"$LOG" 2>&1 && log "nudged main (hold-aware resume-after-bounce)"
+        verify_submitted main
+        "$AGENTCTL" flush main >>"$LOG" 2>&1 || true
       else
-        "$AGENTCTL" send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. Resume autonomously: re-read your own last message, verify this swap completed cleanly (swap-fleet.log phases + fleet/model state), then continue executing whatever you were doing. Do not wait for the operator." >>"$LOG" 2>&1 && log "nudged main (resume-after-bounce)"
+        fl_send main "[account-swap] You (main) were just bounced to account $ACCT mid-conversation. Resume autonomously: re-read your own last message, verify this swap completed cleanly (swap-fleet.log phases + fleet/model state), then continue executing whatever you were doing. Do not wait for the operator." >>"$LOG" 2>&1 && log "nudged main (resume-after-bounce)"
+        verify_submitted main
+        "$AGENTCTL" flush main >>"$LOG" 2>&1 || true
       fi
-      verify_submitted main
-      "$AGENTCTL" flush main >>"$LOG" 2>&1 || true
     fi
   else
     log "no workspace actually moved — skipping nudges"
@@ -411,7 +388,8 @@ run_tail(){
   if [ -s "$LEFT_BEHIND_F" ]; then
     lb=$(tr '\n' ' ' < "$LEFT_BEHIND_F")
     log "per-model gate summary: left behind on their previous account: $lb"
-    "$AGENTCTL" send main "[swap-fleet] PER-MODEL GATE: fleet moved to $ACCT but these Fable-pinned workspaces were LEFT on their previous account because $ACCT is Fable-capped: $lb— they keep working there; they rejoin on a future swap once $ACCT can serve Fable. No action required unless you want them moved by hand." >>"$LOG" 2>&1 || true
+    # exception REPORT (not a wake nudge — never dormancy-gated: main must learn of state divergence)
+    fl_send main "[swap-fleet] PER-MODEL GATE: fleet moved to $ACCT but these Fable-pinned workspaces were LEFT on their previous account because $ACCT is Fable-capped: $lb— they keep working there; they rejoin on a future swap once $ACCT can serve Fable. No action required unless you want them moved by hand." >>"$LOG" 2>&1 || true
   fi
   rm -f "$LEFT_BEHIND_F"
   # RC ORPHANS (the operator hard rule 2026-07-13: ONE RC session per workspace; stop-then-up is enforced by
@@ -421,7 +399,7 @@ run_tail(){
   if [ -s "$RC_MOVED_F" ]; then
     rcws=$(tr '\n' ' ' < "$RC_MOVED_F")
     log "RC bridges: moved RC-enabled workspaces: $rcws— old-account app entries are now ORPHANED (manual removal in the Claude app)"
-    "$AGENTCTL" send main "[swap-fleet] RC BRIDGE REMINDER: these Remote-Control workspaces moved accounts: $rcws— each leaves an orphaned session entry in the Claude app under the OLD account (server-side registration, no CLI dereg). When convenient, remove the stale entries in the app so every workspace shows exactly ONE live RC session." >>"$LOG" 2>&1 || true
+    fl_send main "[swap-fleet] RC BRIDGE REMINDER: these Remote-Control workspaces moved accounts: $rcws— each leaves an orphaned session entry in the Claude app under the OLD account (server-side registration, no CLI dereg). When convenient, remove the stale entries in the app so every workspace shows exactly ONE live RC session." >>"$LOG" 2>&1 || true
   fi
   rm -f "$RC_MOVED_F"
   log "=== swap-fleet → $ACCT COMPLETE ==="

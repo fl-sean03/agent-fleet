@@ -65,12 +65,10 @@ if [ -n "${SESSION_ID:-}" ]; then
   else
     CL_ARGS+=(--session-id "$SESSION_ID"); echo "→ creating session ${SESSION_ID:0:8} (first run, fixed id)"
   fi
-elif [ -n "${RESUME:-}" ]; then            # legacy fallback for any pre-SESSION_ID descriptor
-  if [ "$RESUME" = "continue" ]; then
-    sid="$("$HOME/.agents/bin/resolve-session" "$PWD" "$SESS_BASE" 2>/dev/null || true)"
-    [ -n "$sid" ] && { CL_ARGS+=(--resume "$sid"); echo "→ resuming canonical session ${sid:0:8}"; } || echo "→ fresh session"
-  else CL_ARGS+=(--resume "$RESUME"); echo "→ resuming pinned session ${RESUME:0:8}"; fi
 fi
+# (RESUME= legacy fallback REMOVED 2026-07-17: dead path — no project descriptor carries RESUME=
+# anymore. Confined workspaces launch via run-claude-confined, which keeps its own RESUME= fallback
+# until their SESSION_ID migration.)
 # FORK=1 (one-shot: set it transiently in a descriptor, then remove it): resume the pinned session but
 # FORK it into a brand-new session id carrying the FULL transcript. A new session id registers Remote
 # Control fresh, so -n (below) finally takes effect and the app shows the workspace NAME instead of the
@@ -86,7 +84,8 @@ if [ "${REMOTE_CONTROL:-}" = "on" ]; then
   # near-identical auto-title instead of its own name. The NAME_PREFIX env below did NOT override
   # that; --name does. (For a session that is already registered, -n does nothing — use `/rename`.)
   CL_ARGS+=(-n "$RCNAME")
-  export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$RCNAME"   # (kept; superseded by --name for display)
+  # (CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX export REMOVED 2026-07-17: proven inert for display —
+  # the 2026-07-17 RC-name fix showed the prefix env did NOT override auto-titles; --name does.)
   echo "→ Remote Control: ON (mobile session '$RCNAME')"
 fi
 # MODEL: pin the workspace's model in the DESCRIPTOR so it survives every relaunch. An in-session

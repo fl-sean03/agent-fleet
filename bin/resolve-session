@@ -11,6 +11,11 @@
 # user turns picks the substantive conversation regardless of which tiny shell was touched last.
 # (This is exactly the rule the operator asked for: "the one with the larger # of turns.")
 #
+# CALLERS (audit 2026-07-17): exactly one — swap-account's non-shared-store fallback (carrying a
+# session between stores that don't symlink to the shared one). run-claude's RESUME=continue path,
+# the other caller, was removed 2026-07-17 (no descriptor uses RESUME= for projects). Keep this
+# tool as that safety net; do not grow new callers — SESSION_ID pinning is the standard.
+#
 # Session storage:  ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl   where the dir name is the
 # absolute cwd with every non-alphanumeric char replaced by '-'.  Pass projects_base to point at a
 # confined workspace's isolated config dir instead of the host's ~/.claude.

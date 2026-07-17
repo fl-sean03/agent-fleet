@@ -37,6 +37,19 @@ cat > "$TMP/.local/bin/agentctl" <<'EOF'
 [ "${1:-}" = send ] && { shift 2; printf '%s\n' "$*" >> "$HOME/alerts.txt"; }
 exit 0
 EOF
+# alerts ride fl_send → $A/bin/fleet-msg since the 2026-07-17 envelope consolidation — record those
+mkdir -p "$A/bin"
+cat > "$A/bin/fleet-msg" <<'EOF'
+#!/usr/bin/env bash
+# fleet-msg send --to main --from system:<script> "<msg>"  → record the body
+while [ $# -gt 0 ]; do case "$1" in send) shift;; --to|--from) shift 2;; *) break;; esac; done
+printf '%s\n' "$*" >> "$HOME/alerts.txt"
+exit 0
+EOF
+chmod +x "$A/bin/fleet-msg"
+# the sandboxed fleet must carry the real lib: the fleet-lib-sane invariant (rightly) fails a
+# fleet whose $A/bin has no parseable fleet-lib.sh
+cp "$HERE/../bin/fleet-lib.sh" "$A/bin/fleet-lib.sh"
 # systemctl/journalctl stubs, fixture-driven — the failed-unit and campaign-stall sweeps must be
 # tested deterministically, not against whatever the host happens to have failed today.
 cat > "$TMP/bin/systemctl" <<'EOF'

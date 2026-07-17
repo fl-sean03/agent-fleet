@@ -65,10 +65,21 @@ fi
 # MODEL: descriptor pin, same durability rationale as run-claude — a per-process /model reverts on any
 # bounce, so the descriptor is the source of truth. Unset (most legacy confined workspaces) → account default.
 [ -n "${MODEL:-}" ] && { CL_ARGS+=(--model "$MODEL"); echo "→ model: $MODEL (descriptor pin)"; }
+# EFFORT: descriptor pin, same durability rationale as MODEL (a per-process /effort reverts on bounce).
+# bwrap uses an explicit env allow-list (--setenv below), so this must be injected as a setenv, not
+# a plain export — an outer export does not cross the sandbox boundary.
+EFFORT_ENV=()
+[ -n "${EFFORT:-}" ] && { EFFORT_ENV=(--setenv CLAUDE_CODE_EFFORT_LEVEL "$EFFORT"); echo "→ effort: $EFFORT (descriptor pin)"; }
+# FORK=1 (one-shot, set transiently in the descriptor then removed — same mechanism as run-claude):
+# fork the resumed session into a brand-new id carrying the FULL transcript. A new session id
+# registers Remote Control fresh, which is the proven cure for a wedged server-side RC bridge.
+# Old session file stays intact in the isolated store.
+[ "${FORK:-}" = 1 ] && CL_ARGS+=(--fork-session)
 RC_ENV=()
 if [ "${REMOTE_CONTROL:-}" = "on" ]; then
   RCNAME="${RC_NAME:-$WS}"
   CL_ARGS+=(--remote-control "$RCNAME")
+  CL_ARGS+=(-n "$RCNAME")   # names NEW/forked sessions; existing sessions need in-session /rename
   # also set the session-name PREFIX env — this is what actually drives the displayed name
   # (default is the hostname); --setenv it into the sandbox
   RC_ENV=(--setenv CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX "$RCNAME")

@@ -52,6 +52,9 @@ inv no-creds-in-composed-cfg \
     bash -c '! ls "'"$A"'"/cfg/*/.credentials.json "'"$A"'"/cfg/*/.claude/.credentials.json 2>/dev/null | grep -q .'
 
 # --- wiring the guards themselves depend on ------------------------------------------------------
+inv fleet-lib-sane \
+    "bin/fleet-lib.sh is missing or unparseable — every lib-sourcing harness script (swap-fleet, account-watch, session-guard, idle-down, agentctl, …) fails at startup" \
+    bash -c '[ -f "'"$A"'/bin/fleet-lib.sh" ] && bash -n "'"$A"'/bin/fleet-lib.sh"'
 inv profiles-linked \
     "~/.agents/profiles does not resolve — profile compose fails closed and profiled workspaces cannot launch" \
     bash -c '[ ! -e "'"$A"'/profiles" ] || [ -d "'"$A"'/profiles/" ]'

@@ -15,11 +15,14 @@
 # Operating manual (for agents): the `agent-workspaces` skill.
 set -euo pipefail
 A="$HOME/.agents"; P="$A/projects"; BIN="$A/bin"; CONFINED_ROOT="${FLEET_CONFINED_ROOT:-$HOME/confined}"; TPL="$CONFINED_ROOT/_template"
+# shared primitives (fl_have/fl_agent_pane/fl_proctree) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
 mkdir -p "$P"
 sock(){ tmux start-server 2>/dev/null || true; }
 die(){ echo "agentctl: $*" >&2; exit 1; }
-have(){ tmux has-session -t "agent-$1" 2>/dev/null; }
-proctree(){ local p=$1; echo "$p"; local c; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }  # recursive PID tree
+have(){ fl_have "$1"; }
 
 load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspace '$PROJECT' (try: agentctl ls)"
   ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""; EFFORT=""; PROFILE=""
@@ -36,7 +39,7 @@ load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspac
 }
 
 firstpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | head -1; }
-agentpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | sed -n 2p; }   # control=pane1, claude=pane2
+agentpane(){ fl_agent_pane "$PROJECT" || true; }   # control=pane1, claude=pane2 (lib; empty when down — same contract as the old sed -n 2p under set -e)
 
 addpane(){ local a="$1"
   [ "$a" = "claude" ] && [ "${SANDBOX:-}" = "bwrap" ] && a="claude-confined"
@@ -291,7 +294,7 @@ do_down(){ load "$1"
   # shell on exit (run-claude) and can outlive `tmux kill-session`, orphaning a writer that keeps
   # appending its session jsonl — which is what caused the split-brain / divergent-copy bug.
   local pids all="" pp; pids=$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null || true)
-  for pp in $pids; do all="$all $(proctree "$pp")"; done
+  for pp in $pids; do all="$all $(fl_proctree "$pp")"; done
   tmux kill-session -t "$SESSION" 2>/dev/null || true
   for pp in $all; do kill "$pp" 2>/dev/null || true; done; sleep 1
   for pp in $all; do kill -9 "$pp" 2>/dev/null || true; done

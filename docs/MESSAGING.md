@@ -6,7 +6,7 @@ agentctl send a,b,c "standup: one line each"
 agentctl send @all "pausing for a deploy — checkpoint and idle"
 agentctl msglog 20 --from main --since 2h
 agentctl flush ws-gpu            # redeliver what queued while it was down
-agentctl kick ws-gpu             # submit input that got stranded in its prompt
+agentctl kick ws-gpu             # MANUAL-ONLY: submit input stranded in its composer (--dry first)
 ```
 
 ## The one design decision
@@ -22,28 +22,37 @@ like anything you typed.
 
 Durability didn't go away; it moved alongside (see the log, below).
 
-## How delivery actually works
+## How delivery actually works (v3 — verified at every step)
 
 The mechanics are small but every part is load-bearing:
 
 1. **Target the agent's pane, not the session.** A workspace's tmux session has a control shell in
    pane 1 and the agent in pane 2. Sending to "the session" hits whatever pane is active — usually
    the shell, where your message becomes a shell command nobody ever sees. Deliver to pane 2.
-2. **Bracketed paste, then wait, then Enter.** This is the whole trick:
+2. **Verify, don't assume.** The v2 mechanism (paste → fixed ~0.8s delay → Enter) still stranded
+   directives whenever the pane was at a boot screen or modal. v3 verifies each step:
 
    ```
-   tmux load-buffer  →  paste-buffer -p  →  sleep ~0.8s  →  send-keys Enter
+   readiness gate      — never paste until a ❯ composer is actually rendered
+                         (pasting at a boot screen/modal sends the eventual Enter to the dialog)
+   paste-arrival check — fire Enter only once the text is visibly IN the composer
+   verified-Enter loop — after each Enter, confirm the composer cleared; retry with
+                         escalating waits
    ```
 
-   An `Enter` fired before the bracketed paste settles is **swallowed**, and the text sits in the
-   prompt forever, unsubmitted. That single missing delay was the cause of every "stranded input"
-   bug in this system's history. (`agentctl kick` exists to rescue agents stranded by *other* means:
-   clear the prompt, re-paste, submit.)
 3. **Busy agents are fine.** A recipient mid-turn has the pasted text queued by its harness and
-   surfaced to the model as a mid-turn message. You do not need to wait for idle.
+   surfaced to the model as a mid-turn message. You do not need to wait for idle. (The composer
+   keeps *rendering* the queued text until the turn ends — that's delivered, not stuck; do not
+   re-send.)
 
-Everything else people assume is necessary — waiting for idle, clearing the input first, retry
-loops — was tried, tested, and **removed**. The delay is the mechanism.
+**"Stuck" is a distinct, terminal verdict.** Text still visibly sitting in the composer after all
+retries is IN the box, so it is never re-queued (that double-delivers). Stranded composer text is
+**left visible for the operator — never auto-submitted**. The reason is a hard one: the Remote
+Control bridge can **replay an unsent draft into a composer on reconnect** (observed live: the same
+draft re-appeared three times in one afternoon), so any automation that presses Enter on whatever
+is sitting there submits text nobody just typed. The fleet used to ship an `input-watchdog` that
+did exactly that; it is retired (`attic/retired-tools/`), and the only submit path for stranded
+text is a **manual** `fleet-msg kick <ws>` after a human reads the box.
 
 ## When the recipient is down
 
@@ -78,12 +87,13 @@ carries:
 ```
 
 The rule: **a submission fired by a script must never be indistinguishable from a live human
-Enter.** The incident behind it — a watchdog once auto-submitted a stale draft sitting in a
+Enter.** The incident behind it — an automated kicker once submitted a stale draft sitting in a
 composer, and the agent executed it with operator authority because it looked exactly like the
-operator pressing Enter. The envelope names the *script* (`system:input-watchdog`,
+operator pressing Enter. The envelope names the *script* (`system:swap-fleet`,
 `system:session-guard`), not a bare `system`, so the recipient can weigh the authority correctly,
 and the wrapped text lands in the durable log like any message. Wrapping also defuses `!`/`/`
-prefixes: enveloped text can no longer execute as a bash or slash command.
+prefixes: enveloped text can no longer execute as a bash or slash command. The shared library's
+`fl_send` (see `bin/fleet-lib.sh`) is how every watcher script sends with this identity.
 
 Two ways a script declares itself:
 
@@ -92,10 +102,21 @@ Two ways a script declares itself:
 - `fleet-msg kick <ws> --as <script>` — a kick submits the stranded composer text **enveloped and
   logged** (event `kick` in the durable store), attributed to `system:<script>`.
 
-`kick` also refuses to submit known **TUI render artifacts** — strings like `No response
-requested` or `esc to interrupt` that the composer reader can misread as stranded input. Those
-are cleared, never submitted (UI noise fired as a user turn carries user authority; see
-`_TUI_ARTIFACTS` in `bin/fleet-msg` and extend it as new render strings surface).
+`kick` is **manual-only** (no automated invoker exists; see the delivery section above for why),
+and even a manual kick refuses to submit what isn't operator input:
+
+- **TUI render artifacts** — strings like `No response requested` or `esc to interrupt` that the
+  composer reader can misread as stranded input. Cleared, never submitted (UI noise fired as a
+  user turn carries user authority; see `_TUI_ARTIFACTS` in `bin/fleet-msg`).
+- **Screen-echo of the agent's own output** (`_is_own_echo`) — composer text that appears verbatim
+  in the agent's scrollback *above* the composer (excluding past-prompt `❯` lines) is the agent's
+  own rendering flushed back at it (stray selection-paste, RC-bridge artifact), not a directive.
+  Cleared and logged, never submitted — a live incident fed an agent a fragment of its own
+  conversation as if the operator had sent it.
+
+The one standing watcher for stranded text is session-guard's **STUCK INPUT** sweep: detect twice
+across 15-minute sweeps, then **page a human** (envelope-tagged `system:session-guard`) with the
+`fleet-msg kick` command to run if — and only if — the human decides the text should fire.
 
 ## Addressing
 

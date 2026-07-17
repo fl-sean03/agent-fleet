@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""input-watchdog — auto-submit directives stranded in an idle agent's composer.
+"""RETIRED (operator decision, 2026-07-17): automated composer submission is removed entirely.
+
+Auto-submitting stranded composer text is UNSAFE BY DESIGN, not just buggy: the Remote Control
+bridge can REPLAY an unsent draft into a composer on reconnect (observed live: the same draft
+re-appeared three times in one afternoon and was auto-kicked each time), and a separate incident
+fed an agent screen-echo of its OWN output as operator input. Stranded composer text is now LEFT
+VISIBLE for the operator; the only submit path is a MANUAL, envelope-tagged `fleet-msg kick <ws>`
+(which keeps the artifact + echo guards even for manual use). session-guard's STUCK INPUT sweep
+pages a human instead — detect and notify, never act. The systemd units are retired alongside this
+script; nothing may re-enable automated kicking.
+
+Original header follows for the record.
+
+input-watchdog — auto-submit directives stranded in an idle agent's composer.
 
 WHY: several injection paths (Remote Control bridge races, mobile typing, pre-v3 delivery) can
 leave a complete directive sitting in the ❯ box with its Enter swallowed. On 2026-07-16 this

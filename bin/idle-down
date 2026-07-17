@@ -13,10 +13,15 @@
 # Transient `agentctl stop` (flush-safe; stays listed — idle != ended). Log: ~/.agents/idle-down.log.
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-A="$HOME/.agents"; P="$A/projects"; AGENTCTL="$HOME/.local/bin/agentctl"; LOG="$A/idle-down.log"
+A="${A:-$HOME/.agents}"; P="$A/projects"; AGENTCTL="$HOME/.local/bin/agentctl"; LOG="$A/idle-down.log"
+# shared primitives (ws_get/ws_agents/ws_transcript/fl_agent_alive/ws_busy) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
+FL_SCRIPT=idle-down
 DAYS=7; DRY=0
 while [ $# -gt 0 ]; do case "$1" in --days) DAYS="${2:?}"; shift 2;; --dry) DRY=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
-log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+log(){ fl_log "$@"; }
 now=$(date +%s); downed=0; kept=0
 
 # last user-turn epoch for a workspace's transcript (empty if none / no file)
@@ -38,52 +43,31 @@ if last:
     print(int(datetime.datetime.fromisoformat(last.replace('Z','+00:00')).timestamp()))
 PY
 }
-# --- liveness: does a real agent process exist under the pane? (same walk session-guard uses;
-# pane_current_command reports `bash` for a healthy agent, and the tree depth varies by isolation
-# tier, so this must be a full recursive walk matched against per-harness process names)
-proctree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }
-agent_alive(){ # <ws> → 0 if any pane process looks like a live agent
-  local ws="$1" pid comm
-  for pid in $(tmux list-panes -t "agent-$ws:main" -F '#{pane_pid}' 2>/dev/null); do
-    for pid in $(proctree "$pid"); do
-      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
-      case "$comm" in claude|claude-bin|node|bun|codex|opencode|ssh) return 0;; esac
-    done
-  done
-  return 1
-}
-
-pane_busy(){ # <ws> → 0 if the agent pane is mid-turn RIGHT NOW.
-  # Match only "esc to interrupt" — the footer shows it ONLY during an active, interruptible turn.
-  # (The spinner glyphs ✻/✽/✢ are unreliable: a completed "✻ Crunched for 8m" summary line stays
-  # visible in an idle pane and would false-positive every idle workspace.)
-  tmux capture-pane -p -t "agent-$1:main.2" 2>/dev/null | grep -qi 'esc to interrupt'
-}
+# --- liveness + busy: fl_agent_alive / ws_busy (fleet-lib) — the same full recursive proc walk
+# session-guard uses (pane_current_command reports `bash` for a healthy agent; tree depth varies by
+# isolation tier) and the same "esc to interrupt" footer match (the ONLY reliable busy signal:
+# spinner glyphs ✻/✽/✢ persist in idle panes and would false-positive every idle workspace).
 
 [ "$DRY" = 1 ] && echo "idle-down --dry (threshold ${DAYS}d) — nothing will be stopped"
 log "=== idle-down scan (threshold ${DAYS}d, dry=$DRY) ==="
 
 while read -r kind name; do
   [ "$name" = main ] && { log "keep main (home base, always exempt)"; kept=$((kept+1)); continue; }
-  desc="$P/$name.env"
-  ag=$(grep -oP '^AGENTS="?\K[^"]+' "$desc" 2>/dev/null | head -1)
+  ag=$(ws_agents "$name")
   [ "$ag" = claude-remote ] && { log "keep $name (remote agent — no local transcript)"; kept=$((kept+1)); continue; }
-  grep -qE '^NOIDLE="?yes' "$desc" 2>/dev/null && { log "keep $name (NOIDLE=yes)"; kept=$((kept+1)); continue; }
+  [ "$(ws_get "$name" NOIDLE 2>/dev/null)" = yes ] && { log "keep $name (NOIDLE=yes)"; kept=$((kept+1)); continue; }
 
-  sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$desc" 2>/dev/null | head -1)
-  root=$(grep -oP 'ROOT="?\K[^"]+' "$desc" | head -1); root="${root/\$HOME/$HOME}"; root="${root/#\~/$HOME}"
-  enc=$(printf '%s' "$root" | sed 's#[^a-zA-Z0-9]#-#g')
-  [ "$kind" = confined ] && f="$A/confined-cfg/$name/projects/-work/$sid.jsonl" || f="$HOME/.claude/projects/$enc/$sid.jsonl"
+  f=$(ws_transcript "$name" 2>/dev/null) || f=""
 
-  if pane_busy "$name"; then log "keep $name (pane busy — working now)"; kept=$((kept+1)); continue; fi
-  if [ -f "$f" ]; then
+  if ws_busy "$name"; then log "keep $name (pane busy — working now)"; kept=$((kept+1)); continue; fi
+  if [ -n "$f" ] && [ -f "$f" ]; then
     m=$(stat -c %Y "$f")
     if [ $(( (now-m)/3600 )) -lt 6 ]; then
       # mtime is only ACTIVITY if the agent is actually alive — a dead agent's transcript keeps a
       # fresh-looking mtime from before it died, and an OOM-killed agent was once kept 19h as
       # "recent activity" on exactly that misread. Process-existence is the truth; session-guard
       # pages for revival.
-      if agent_alive "$name"; then
+      if fl_agent_alive "$name"; then
         log "keep $name (transcript written <6h ago — recent activity)"; kept=$((kept+1)); continue
       else
         log "keep $name (transcript mtime fresh but NO AGENT PROCESS — dead, not idle; session-guard pages for revival)"

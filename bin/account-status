@@ -9,13 +9,17 @@
 #         5h/7d utilization + reset countdowns — the rotation-policy signal, cheap HTTP).
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-A="$HOME/.agents"; ACCTS="$A/accounts"
+A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"
+# shared primitives (fl_cfg_of/fl_email_of/ws_get) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
 CAP_RE='usage limit|rate limit|reached your|limit reached|quota (exceeded|reached)|out of (usage|tokens)'
 PROBE=0; USAGE=0
 for arg in "$@"; do case "$arg" in --probe) PROBE=1;; --usage) USAGE=1;; esac; done
 
-cfg_of(){ "$A/bin/account-profile" "$1"; }
-email_of(){ python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress','?'))" "$(cfg_of "$1")/.claude.json" 2>/dev/null || echo '?'; }
+cfg_of(){ fl_cfg_of "$1"; }
+email_of(){ local e; e=$(fl_email_of "$(cfg_of "$1" 2>/dev/null)"); printf '%s\n' "${e:-?}"; }
 label_of_cfg(){ # config dir path → rotation label
   local d="$1" label cfg; d="$(readlink -f "$d")"
   while IFS= read -r label; do
@@ -31,6 +35,10 @@ is_claude_proc(){ # PID → exact Claude CLI process, not a shell whose text hap
   return 1
 }
 
+# NOTE no hold indicator: the .hold mechanism was REMOVED 2026-07-10 (account-watch loudly ignores a
+# stale file). Claiming "[HOLD — watchdog frozen]" for a leftover file was a lie about a dead switch;
+# a stale file is still surfaced, honestly, so someone deletes it.
+echo "ACTIVE : $(cat "$ACCTS/.active" 2>/dev/null || echo '?')$( [ -f "$ACCTS/.hold" ] && echo '   [stale .hold file — mechanism removed 2026-07-10, IGNORED by account-watch; rm it]' )"
 echo "CHAIN  : $(grep -vE '^\s*(#|$)' "$ACCTS/.rotation" 2>/dev/null | awk 'NR>1{printf " -> "}{printf "%s",$0}END{print ""}')"
 echo
 echo "ACCOUNTS"
@@ -54,12 +62,12 @@ for w in sorted(json.load(sys.stdin), key=lambda x: (x['kind'], x['name'])):
     em=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress','?'))" "$A/confined-cfg/$name/.claude.json" 2>/dev/null || echo '?')
     printf "%-8s %-15s %-10s %s\n" "$kind" "$name" "$lbl" "login: $em"
   else
-    ag=$(grep -oP '^AGENTS="?\K[^"]+' "$A/projects/$name.env" 2>/dev/null | head -1)
+    ag=$(ws_agents "$name")
     if [ -n "$ag" ] && [ "$ag" != claude ]; then
       printf "%-8s %-15s %-10s %s\n" "$kind" "$name" "n/a" "remote agent ($ag) — own auth on remote box"
       continue
     fi
-    sid=$(grep -oP '(SESSION_ID|RESUME)="?\K[^"]+' "$A/projects/$name.env" 2>/dev/null | head -1)
+    sid=$(ws_session_id "$name" 2>/dev/null || true)
     lbl="?"; src="(no live proc found)"
     for pid in $(pgrep -f -- "$sid" 2>/dev/null); do
       is_claude_proc "$pid" || continue

@@ -43,6 +43,11 @@
 set -uo pipefail
 export PATH="$HOME/.local/bin:$PATH"   # agentctl et al. — robust under any systemd/env caller
 A="${A:-$HOME/.agents}"; ACCTS="${ACCTS:-$A/accounts}"
+# shared primitives (descriptor access, fable marker, envelope send) — see bin/fleet-lib.sh
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
+FL_SCRIPT=account-watch   # envelope identity for alerts: [message from system:account-watch | id]
 ROT="${ROT:-$ACCTS/.rotation}"; ACTIVE_F="${ACTIVE_F:-$ACCTS/.active}"; STATE="${STATE:-$ACCTS/.watch-state}"
 LOG="${LOG:-$ACCTS/watch.log}"
 ALERT_TS="${ALERT_TS:-$ACCTS/.watch-alert-ts}"   # last no-eligible-target alert (epoch) — 1/hr throttle
@@ -87,7 +92,7 @@ ALERT_SECS="${ALERT_SECS:-3600}"                        # no-eligible-target ale
 SAFETY_POLL_SECS="${SAFETY_POLL_SECS:-1800}"            # max skip while holding (30 min) — the floor
 BACKOFF_MARGIN="${BACKOFF_MARGIN:-60}"                  # recheck this many secs AFTER a reset (let it land)
 BACKOFF_F="${BACKOFF_F:-$ACCTS/.watch-backoff}"         # "<active-acct> <deadline-epoch>"
-log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+log(){ fl_log "$@"; }
 # probe <config-dir> → echo `claude -p` output, explicitly on Opus (--model), NOT the account default.
 # `--no-session-persistence` means NO session jsonl is created at all, so health-probes can never litter a
 # session store (the bug that flooded ~/.claude/projects/-home-operator with hundreds of "reply ok" sessions).
@@ -106,15 +111,10 @@ aw_cred_exists(){ [ -f "$(aw_cfg_of "$1")/.credentials.json" ]; }
 
 # aw_fable_capped <label> → rc 0 while a FRESH fable-cap marker exists ($ACCTS/.fable-cap.<label>,
 # content = expiry epoch; written by bin/fable-cap-mark from whichever component hit the wall —
-# agentcall, example-confined-nightly, or our own pre-flight). Expired/garbled markers are removed on read.
+# agentcall, a nightly job, or our own pre-flight). Expired/garbled markers are removed on read.
 # This is how the MODEL-specific Fable cap (invisible to the usage endpoint) reaches rotation.
-aw_fable_capped(){
-  local f="$ACCTS/.fable-cap.$1" exp
-  [ -f "$f" ] || return 1
-  exp=$(head -1 "$f" 2>/dev/null | tr -cd '0-9')
-  if [ -z "$exp" ] || [ "$(date +%s)" -ge "$exp" ]; then rm -f "$f"; return 1; fi
-  return 0
-}
+# Implementation: fleet-lib.
+aw_fable_capped(){ fl_fable_marker_fresh "$1"; }
 
 # fable_cap_relevant <label> → rc 0 only when a Fable-cap on <label> should affect ROTATION: i.e. the
 # FLEET runs Fable AND <label> is fable-capped. On an Opus fleet this is always false, so Fable
@@ -275,11 +275,12 @@ aw_fable_blocked(){
 # while the fleet model is something else (example-confined/ws-beta/infrastructure, 2026-07-13). These move with the
 # fleet but die on a Fable-capped account, so target choice prefers Fable-healthy accounts for them.
 aw_divergent_fable(){
-  local f m
+  local f m ws
   for f in "$A"/projects/*.env; do
     [ -e "$f" ] || continue
-    m=$(grep -oP '^MODEL="?\K[^"# ]+' "$f" 2>/dev/null | head -1)
-    [ "$m" = "claude-fable-5" ] && [ "$m" != "$FLEET_MODEL" ] && basename "$f" .env
+    ws=$(basename "$f" .env)
+    m=$(ws_model "$ws" 2>/dev/null) || true
+    [ "$m" = "claude-fable-5" ] && [ "$m" != "$FLEET_MODEL" ] && echo "$ws"
   done
   return 0
 }
@@ -330,13 +331,14 @@ aw_snapshot(){
   printf '%s' "${out% | }"
 }
 
-# aw_alert_main <msg> → agentctl send main, throttled to once per ALERT_SECS via ALERT_TS file.
+# aw_alert_main <msg> → envelope send to main (system:account-watch), throttled to once per
+# ALERT_SECS via ALERT_TS file. Alerts are the alarm channel, never dormancy-gated.
 aw_alert_main(){
   local now last; now=$(date -u +%s); last=$(cat "$ALERT_TS" 2>/dev/null || echo 0)
   [ $((now - last)) -ge "$ALERT_SECS" ] || { log "alert throttled (last $((now-last))s ago)"; return 0; }
   echo "$now" > "$ALERT_TS"
-  agentctl send main "[account-watch] $1" >/dev/null 2>&1 \
-    && log "alerted main: $1" || log "alert to main FAILED (agentctl send): $1"
+  fl_send main "[account-watch] $1" >/dev/null 2>&1 \
+    && log "alerted main: $1" || log "alert to main FAILED (fleet-msg send): $1"
 }
 
 # aw_earliest_reset [now] → echo the earliest FUTURE reset epoch across ALL accounts: 5h resets_at

@@ -34,9 +34,11 @@ print(f"flags: {'set ' + ', '.join(changed) if changed else 'already set'}")
 EOF
 
 # pre-trust every live fleet root under THIS profile (trust-dir writes into $CLAUDE_CONFIG_DIR)
+# shellcheck source=fleet-lib.sh
+. "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)/fleet-lib.sh"
 n=0
 for envf in "$A"/projects/*.env; do
-  root=$(grep -oP '^ROOT="?\K[^"]+' "$envf" 2>/dev/null | head -1 | sed "s|\$HOME|$HOME|; s|^~|$HOME|")
+  root=$(ws_root "$(basename "${envf%.env}")" 2>/dev/null || true)
   [ -n "$root" ] && [ -d "$root" ] || continue
   CLAUDE_CONFIG_DIR="$CFG" "$A/bin/trust-dir" "$root" 2>/dev/null && n=$((n+1)) || true
 done
