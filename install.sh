@@ -24,7 +24,7 @@ say(){ printf '  %s\n' "$*"; }
 
 if [ "$UNINSTALL" = 1 ]; then
   echo "uninstalling (workspaces, memory, and accounts are LEFT ALONE)…"
-  for u in account-watch session-guard brain-nightly idle-down; do
+  for u in account-watch session-guard brain-nightly idle-down input-watchdog backup-watch; do
     systemctl --user disable --now "$u.timer" 2>/dev/null
     rm -f "$UNITS/$u.timer" "$UNITS/$u.service"
   done
@@ -93,21 +93,30 @@ say "projected canonical surface into ~/.claude (skills, CLAUDE.md→base AGENTS
 
 # --- 6. systemd units (installed; enabled only with --with-timers) -----------------------------
 for u in "$KIT"/systemd/*; do
+  [ -f "$u" ] || continue    # skip subdirs (environment.d/ has its own installer)
   sed "s|{{FLEET_KIT_ROOT}}|$KIT|g" "$u" > "$UNITS/$(basename "$u")"
 done
+# environment.d: PATH for ALL --user units, including the transient ones Claude Code spawns for the
+# Remote-Control bridge / Stop hooks (without it those run under systemd's bare default PATH and
+# fail with "node: not found"). Idempotent; takes effect for units started after the next login or
+# `systemctl --user daemon-reexec`.
+[ -x "$KIT/systemd/environment.d/install.sh" ] && "$KIT/systemd/environment.d/install.sh" >/dev/null 2>&1 \
+  && say "installed environment.d PATH drop-in (transient --user units get ~/.local/bin)"
 systemctl --user daemon-reload 2>/dev/null
 say "installed $(ls "$KIT"/systemd | wc -l) systemd units"
 if [ "$WITH_TIMERS" = 1 ]; then
-  for t in account-watch session-guard idle-down brain-nightly; do
+  for t in account-watch session-guard idle-down brain-nightly input-watchdog; do
     systemctl --user enable --now "$t.timer" 2>/dev/null && say "enabled $t.timer"
   done
   say "background services running. 'systemctl --user list-timers' to see them."
 else
   say "timers NOT enabled (safe default). Enable when ready:"
   say "    systemctl --user enable --now session-guard.timer   # transcript protection (recommended)"
+  say "    systemctl --user enable --now input-watchdog.timer  # auto-submit stranded composer input"
   say "    systemctl --user enable --now account-watch.timer   # multi-account rotation (opt-in, see docs/ACCOUNTS.md)"
   say "    systemctl --user enable --now brain-nightly.timer   # the second brain"
   say "    systemctl --user enable --now idle-down.timer       # spin down idle workspaces"
+  say "    systemctl --user enable --now backup-watch.timer    # backup staleness alerts (needs ~/.agents/backup-watch.conf)"
 fi
 
 cat <<EOF

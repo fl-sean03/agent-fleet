@@ -3,7 +3,7 @@
 #
 # Grok's OAuth (grok login) mints a ~6h access credential (~/.grok/auth.json) and — unlike the
 # Claude CLI — a headless `grok -p` does NOT self-refresh an expired one: it just prints a login
-# hint and fails (bit infrastructure 2026-07-13; would strand any automated an experiment grok run).
+# hint and fails (bit infrastructure 2026-07-13; would strand any automated grok run).
 # Re-auth is browser-only (device code). This helper makes that failure mode explicit and cheap:
 #
 #   grok-ready            rc 0 = credential present + unexpired (static check, no model spend)

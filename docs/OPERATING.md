@@ -76,8 +76,8 @@ Agents message each other the same way. That is how a fleet coordinates without 
 agentctl new api --root ~/work/api --rc "API" --up
 
 # a CONFINED agent — bwrap namespace, sees only its own dir + its own config
-agentctl new acme --confined "Acme Corp" --up
-agentctl login acme            # one interactive login; its credentials never touch your others
+agentctl new exampleco --confined "ExampleCo Corp" --up
+agentctl login exampleco            # one interactive login; its credentials never touch your others
 
 # a non-Claude agent
 printf 'ROOT="$HOME/work/x"\nAGENTS="codex"\n' > ~/.agents/projects/x.env && agentctl up x

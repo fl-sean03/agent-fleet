@@ -264,14 +264,14 @@ r=$(aw_earliest_reset "$(date -u -d '2026-07-15T00:00:00+00:00' +%s)")
 check "earliest reset includes the fable weekly reset"     eq "$r" "$(date -u -d "$FR" +%s)"
 
 # --- divergent-Fable workspace detection + target preference -------------------------------------
-echo "## divergent-model preference (example-confined/ws-arc on an Opus fleet)"
+echo "## divergent-model preference (example-confined/ws-beta on an Opus fleet)"
 mkdir -p "$A/projects"
-printf 'ROOT="/x"\nMODEL="claude-fable-5"   # pinned\n' > "$A/projects/ws-arc.env"
+printf 'ROOT="/x"\nMODEL="claude-fable-5"   # pinned\n' > "$A/projects/ws-beta.env"
 printf 'ROOT="/x"\nMODEL="claude-opus-4-8"\n' > "$A/projects/ws-gpu.env"
 printf 'ROOT="/x"\n' > "$A/projects/nomodel.env"
 FLEET_MODEL="claude-opus-4-8"
 r=$(aw_divergent_fable | sort | tr '\n' ' ')
-check "fable-pinned ws detected on an Opus fleet"          eq "$r" "ws-arc "
+check "fable-pinned ws detected on an Opus fleet"          eq "$r" "ws-beta "
 FLEET_MODEL="claude-fable-5"
 r=$(aw_divergent_fable)
 check "no divergence when the fleet itself is Fable"       eq "$r" ""

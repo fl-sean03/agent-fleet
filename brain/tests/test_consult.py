@@ -448,17 +448,17 @@ class TestStatePipeline(Base):
         json.dump([{"workspace": "ws-gamma", "headline": "Shipped X",
                     "advanced": ["a1", "a2", "a3", "a4"], "blocked": ["waiting on Y"],
                     "notable": []},
-                   {"workspace": "ws-arc", "headline": "Quiet day", "advanced": [], "blocked": []}],
+                   {"workspace": "ws-beta", "headline": "Quiet day", "advanced": [], "blocked": []}],
                   open(f"{state_p.DAILY_DIR}/2026-07-08.json", "w"))
         # pre-existing open-failures content must be REPLACED (current-state, not a log)
-        ST.state_write("ws-arc", {"failures": "- ancient blocker"})
+        ST.state_write("ws-beta", {"failures": "- ancient blocker"})
         state_p.run()
         got = ST.state_read("ws-gamma")
         self.assertTrue(got["resume"].startswith("2026-07-08: Shipped X"))
         self.assertIn("- a1", got["resume"])
         self.assertNotIn("- a4", got["resume"])                      # top-3 only
         self.assertEqual(got["failures"], "- waiting on Y")
-        self.assertEqual(ST.state_read("ws-arc")["failures"], "(nothing yet)")   # replaced
+        self.assertEqual(ST.state_read("ws-beta")["failures"], "(nothing yet)")   # replaced
         self.assertFalse(os.path.exists(f"{ST.MEMORY_ROOT}/old"))    # only the LATEST file is read
 
     def test_no_daily_json_exits_green(self):

@@ -64,8 +64,8 @@ See [OPERATING.md](OPERATING.md#the-coordinator-pattern-main).
 Requires `bubblewrap` (`apt install bubblewrap`).
 
 ```bash
-agentctl new acme --confined "Acme Corp" --up
-agentctl login acme          # follow the URL; finish with: agentctl login acme --code <CODE>
+agentctl new exampleco --confined "ExampleCo Corp" --up
+agentctl login exampleco          # follow the URL; finish with: agentctl login exampleco --code <CODE>
 ```
 
 This agent runs in a namespace where **your home directory is not mounted**. It cannot read your

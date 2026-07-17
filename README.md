@@ -29,7 +29,7 @@ credentials, its own session store) · *Remote* (the agent runs on another box o
 Confinement is not a nicety: an unsandboxed agent asked for a fact it was never told **will grep
 your other agents' transcripts to find it.**
 
-**Workspace profiles.** `~/.agents/` is the single source of truth; `~/.claude/` (and `~/.codex/`, `~/.grok/`) are projections of it. Categorize a workspace by **profile** — `agentctl new acme --profile client` (confined, restricted toolkit, client instructions) vs `--profile lab` (unconfined, full toolkit) — and its config is composed from `base < profile < descriptor`, while still sharing one session store and rotating across accounts (credentials stay in the account — the config dir never holds them). See [docs/PROFILES.md](docs/PROFILES.md).
+**Workspace profiles.** `~/.agents/` is the single source of truth; `~/.claude/` (and `~/.codex/`, `~/.grok/`) are projections of it. Categorize a workspace by **profile** — `agentctl new exampleco --profile client` (confined, restricted toolkit, client instructions) vs `--profile lab` (unconfined, full toolkit) — and its config is composed from `base < profile < descriptor`, while still sharing one session store and rotating across accounts (credentials stay in the account — the config dir never holds them). See [docs/PROFILES.md](docs/PROFILES.md).
 
 **Agent-agnostic.** The descriptor's `AGENTS=` field picks the launcher — `claude`, `codex`,
 `opencode`, or your own `bin/run-<name>`. Everything else (workspaces, messaging, holds, idle-down,
@@ -38,9 +38,14 @@ session protection) works the same regardless of which CLI is inside.
 **Inter-agent messaging.** `agentctl send <who> "..."` delivers text **into another agent's live
 conversation** as a real turn — not an inbox it has to remember to poll. Messages to a stopped agent
 queue and flush on resume. Everything is logged to a durable SQLite store with conversation links.
+Machine-fired submissions carry a **provenance envelope** (`[message from system:<script> | msg-id]`)
+so nothing a script injects is ever indistinguishable from a human pressing Enter — see
+[docs/MESSAGING.md](docs/MESSAGING.md).
 
 **Steer from your phone.** Remote Control bridges every workspace into the Claude mobile app. One
-session per workspace, enforced.
+session per workspace, enforced, **named after the workspace** (`-n` at launch for new sessions;
+in-session `/rename` for existing ones), and re-registered automatically after account swaps (the
+first registration against a freshly-swapped account fails transiently — the swap retries it).
 
 **A second brain (optional).** A nightly pipeline reads your agents' own transcripts and distills
 them into per-workspace memory: durable facts, operating rules, and lessons from their own failure

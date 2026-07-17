@@ -27,7 +27,7 @@ confidentiality instructions — and your own lab work that should behave anothe
 toolkit, your choice of model. You don't want to configure each workspace by hand.
 
 ```bash
-agentctl new acme  --profile client          # confined + client instructions + narrow skills
+agentctl new exampleco  --profile client          # confined + client instructions + narrow skills
 agentctl new rig   --profile lab --root ~/work/rig   # unconfined + full toolkit
 ```
 
@@ -41,7 +41,7 @@ At launch, `agent-profile compose <ws>` builds a **per-workspace config director
 (`~/.agents/cfg/<ws>/`) and points the workspace's `CLAUDE_CONFIG_DIR` at it:
 
 ```
-~/.agents/cfg/acme/
+~/.agents/cfg/exampleco/
   AGENTS.md          = base + profile + descriptor instructions (concatenated)
   CLAUDE.md          → AGENTS.md            (harness-compat mirror)
   settings.json      = deep-merge(base, profile, descriptor)

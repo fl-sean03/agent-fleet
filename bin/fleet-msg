@@ -98,7 +98,7 @@ def _resolve(to_raw, sender):
         t = tok.lstrip("@").lower()
         if t in ("all", "fleet", "everyone"):
             out += [w for w in _all_workspaces() if w != sender]
-        elif t in ("human", "sean", "owner"):
+        elif t in ("human", "owner", "operator"):
             out.append("main")
         else:
             out.append(tok)
@@ -305,7 +305,11 @@ def _deliver(name, env, no_submit=False):
 
 
 def cmd_send(a):
-    sender = a.get("from") or os.environ.get("WS_NAME") or "system"
+    # Sender identity precedence: explicit --from > FLEET_MSG_FROM (a system script's declared
+    # identity, e.g. "system:session-guard" — the provenance standard: every machine-mediated
+    # message names the SCRIPT it came from) > the workspace name > bare "system".
+    sender = (a.get("from") or os.environ.get("FLEET_MSG_FROM")
+              or os.environ.get("WS_NAME") or "system")
     body = _body(a)
     if not body.strip():
         sys.exit("fleet-msg: empty message")
@@ -401,13 +405,35 @@ def cmd_flush(a):
         print(f"flushed {flushed} queued message(s) into {name}'s conversation")
 
 
+# TUI render strings that are NOT input — residue the composer reader can misread as stranded text.
+# Kicking one submits UI noise as a user turn with user authority ('No response requested.' was once
+# auto-submitted into a workspace as if the operator sent it). Matched text is CLEARED, never
+# submitted. Substring match, case-sensitive; extend as new render strings surface.
+_TUI_ARTIFACTS = (
+    "No response requested",
+    "Interrupted · What should Claude do instead",
+    "ctrl+o to expand",
+    "esc to interrupt",
+)
+
+
+def _is_artifact(text):
+    return any(s in text for s in _TUI_ARTIFACTS)
+
+
 def cmd_kick(a):
     """Recover an agent stranded with UNSUBMITTED text in its input (pasted but never submitted —
-    the stuck-input bug). Submits whatever is already in the box, reliably. Does not paste anything
-    new. Prints what it submitted so a sensitive/wrong stuck directive is visible, not blindly fired."""
+    the stuck-input bug). Submits what was in the box, WRAPPED in the standard provenance envelope
+    ([message from system:<script> | msg-id]) and recorded in the durable log — a watchdog-fired
+    submission must never be indistinguishable from a live human Enter (a ghost draft once executed
+    with operator authority on exactly that confusion). The envelope also defuses '!'/'/' lines:
+    prefixed text can no longer execute as a bash/slash command. Known TUI render artifacts are
+    cleared, not submitted."""
     name = a.get("name") or os.environ.get("WS_NAME")
     if not name:
         sys.exit("fleet-msg: kick needs a name")
+    src = a.get("as_script") or "kick"
+    sender = src if src.startswith("system:") else f"system:{src}"
     pane = _claude_pane(name)
     if not pane:
         print(f"({name}: down — nothing to kick)"); return
@@ -420,11 +446,28 @@ def cmd_kick(a):
     if not cur:
         print(f"({name}: input already clear — nothing stuck)"); return
     if a.get("dry"):
-        print(f"{name}: WOULD submit stuck input: {cur!r}"); return
+        print(f"{name}: WOULD submit stuck input as {sender}: {cur!r}"); return
     subprocess.run(["tmux", "send-keys", "-t", pane, "C-u"], capture_output=True)  # clear the stranded
-    time.sleep(0.4)                                                                # text, then re-submit
-    ok = _submit(pane, cur) == "submitted"
-    print(f"{name}: {'submitted' if ok else 'FAILED to submit'} stuck input: {cur!r}")
+    time.sleep(0.4)                                                                # text first
+    if _is_artifact(cur):
+        print(f"{name}: cleared TUI artifact (not submitted): {cur!r}")
+        return
+    mid, ts = _new_id(), _now()
+    env = {"id": mid, "ts": ts, "from": sender, "body": cur}
+    ok = _submit(pane, _wire(env)) == "submitted"
+    status = "delivered" if ok else "stuck"
+    db = _db()
+    db.execute("INSERT OR REPLACE INTO messages(msg_id,ts,sender,sender_session,recipient,"
+               "recipient_session,status,delivered_ts,body) VALUES(?,?,?,?,?,?,?,?,?)",
+               (mid, ts, sender, None, name, _session_of(name), status,
+                ts if ok else None, cur))
+    db.commit(); db.close()
+    _append_log({"id": mid, "ts": ts, "from": sender, "to": [name], "body": cur,
+                 "sender_session": None, "event": "kick",
+                 "recipients": {name: {"status": status, "session": _session_of(name),
+                                       "delivered_ts": ts if ok else None}}})
+    print(f"{name}: {'submitted' if ok else 'FAILED to submit'} stuck input as {sender} "
+          f"({mid}): {cur!r}")
 
 
 def cmd_log(a):
@@ -463,6 +506,7 @@ def main():
     s.add_argument("body", nargs="?")
     f = sub.add_parser("flush"); f.add_argument("name", nargs="?")
     k = sub.add_parser("kick"); k.add_argument("name", nargs="?"); k.add_argument("--dry", action="store_true")
+    k.add_argument("--as", dest="as_script", help="originating script for the provenance envelope (renders as system:<script>)")
     lg = sub.add_parser("log")
     lg.add_argument("n", nargs="?", type=int); lg.add_argument("--from", dest="from")
     lg.add_argument("--to"); lg.add_argument("--since"); lg.add_argument("--json", action="store_true")

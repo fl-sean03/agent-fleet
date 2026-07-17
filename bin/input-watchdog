@@ -17,8 +17,8 @@ POLICY — a workspace is fired only when ALL hold:
 
 EXECUTOR: `fleet-msg kick <ws>` — the existing verified submitter (agent-alive RCE gate, C-u,
 re-paste, verified Enter loop). This script decides WHEN; it never touches a pane itself.
-Detection also rides kick: `--dry` prints exactly what WOULD be submitted after all its gates,
-so there is one composer-reading implementation in the fleet, not two.
+Detection reads the composer through fleet-msg's OWN functions (module load), so there is one
+composer-reading implementation in the fleet, not two.
 """
 import hashlib
 import json
@@ -75,13 +75,22 @@ def busy(ws):
     tail = "\n".join(r.stdout.splitlines()[-20:])
     return bool(re.search(r"esc to interrupt|[✻✽✶✢·] [A-Z][a-z]+ing…", tail))
 
+import importlib.machinery
+FM = importlib.machinery.SourceFileLoader("fm", f"{BIN}/fleet-msg").load_module()
+
 def stuck_text(ws):
-    """What `fleet-msg kick --dry` would submit — None if clear/down/dead (its gates)."""
-    r = subprocess.run([f"{BIN}/fleet-msg", "kick", ws, "--dry"], capture_output=True, text=True)
-    m = re.search(r"WOULD submit stuck input: '(.*)'\s*$", r.stdout, re.S)
-    if not m:
+    """Composer text that a kick would submit — None if clear/down/dead (same gates as kick).
+    Reads via fleet-msg's own _composer/_agent_alive DIRECTLY: v1 parsed `kick --dry` stdout,
+    which prints the text as Python repr — a directive containing an apostrophe flips repr to
+    double quotes and the single-quote regex went blind (a live 30-minute miss on exactly that).
+    Never parse repr."""
+    pane = FM._claude_pane(ws)
+    if not pane or not FM._agent_alive(pane):
         return None
-    txt = "".join(c for c in m.group(1) if 32 <= ord(c) < 127).strip()
+    vis, txt = FM._composer(pane)
+    if not vis:
+        return None
+    txt = "".join(c for c in txt if 32 <= ord(c) < 127).strip()
     return txt if len(txt) >= 3 else None
 
 def main():
@@ -110,7 +119,11 @@ def main():
             if DRY:
                 log(f"DRYRUN {ws}: would kick stuck input: {txt!r}")
             else:
-                r = subprocess.run([f"{BIN}/fleet-msg", "kick", ws], capture_output=True, text=True)
+                # --as: the submitted turn carries the provenance envelope
+                # "[message from system:input-watchdog | msg-id]" and lands in the durable log —
+                # never indistinguishable from a live human Enter.
+                r = subprocess.run([f"{BIN}/fleet-msg", "kick", ws, "--as", "input-watchdog"],
+                                   capture_output=True, text=True)
                 log(f"KICKED {ws}: {r.stdout.strip() or r.stderr.strip()}")
             state.pop(ws, None)
         else:

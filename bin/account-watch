@@ -18,7 +18,7 @@
 #              targets, main hand-swapped, 2026-07-12). Under a hard cap the guard is waived entirely.
 #   per-model: accounts can be per-model capped (Fable weekly_scoped) while 5h/7d read healthy. When
 #              any ROTATING workspace's MODEL diverges to Fable (descriptor MODEL=claude-fable-5;
-#              example-confined/ws-arc 2026-07-13), prefer targets that are Fable-healthy (usage fable% < 99 and no
+#              example-confined/ws-beta 2026-07-13), prefer targets that are Fable-healthy (usage fable% < 99 and no
 #              fresh marker); if every target is Fable-blocked the fleet still moves and swap-fleet
 #              LEAVES the Fable-pinned workspaces on their current account (its per-model gate).
 #   choose   : soonest five_hour resets_at; tie-break soonest seven_day resets_at (tokens burned on the
@@ -272,7 +272,7 @@ aw_fable_blocked(){
 }
 
 # aw_divergent_fable → echo the names of ROTATING workspaces whose descriptor pins MODEL to Fable
-# while the fleet model is something else (example-confined/ws-arc/infrastructure, 2026-07-13). These move with the
+# while the fleet model is something else (example-confined/ws-beta/infrastructure, 2026-07-13). These move with the
 # fleet but die on a Fable-capped account, so target choice prefers Fable-healthy accounts for them.
 aw_divergent_fable(){
   local f m

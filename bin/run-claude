@@ -71,10 +71,22 @@ elif [ -n "${RESUME:-}" ]; then            # legacy fallback for any pre-SESSION
     [ -n "$sid" ] && { CL_ARGS+=(--resume "$sid"); echo "→ resuming canonical session ${sid:0:8}"; } || echo "→ fresh session"
   else CL_ARGS+=(--resume "$RESUME"); echo "→ resuming pinned session ${RESUME:0:8}"; fi
 fi
+# FORK=1 (one-shot: set it transiently in a descriptor, then remove it): resume the pinned session but
+# FORK it into a brand-new session id carrying the FULL transcript. A new session id registers Remote
+# Control fresh, so -n (below) finally takes effect and the app shows the workspace NAME instead of the
+# old session's stuck auto-derived title (-n cannot rename an already-registered/resumed session — for
+# those, the in-session `/rename <name>` command is the fix: it persists server-side and syncs to the
+# app and the --resume picker). The old session id is left intact on disk.
+[ "${FORK:-}" = 1 ] && CL_ARGS+=(--fork-session)
 if [ "${REMOTE_CONTROL:-}" = "on" ]; then
   RCNAME="${RC_NAME:-${WS_NAME:-$(basename "$PWD")}}"
   CL_ARGS+=(--remote-control "$RCNAME")
-  export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$RCNAME"   # the real source of the displayed name
+  # -n/--name is the RELIABLE RC display name for NEW sessions. Without it the app titles each session
+  # by its auto-derived first-message summary, so after an account swap every workspace can show a
+  # near-identical auto-title instead of its own name. The NAME_PREFIX env below did NOT override
+  # that; --name does. (For a session that is already registered, -n does nothing — use `/rename`.)
+  CL_ARGS+=(-n "$RCNAME")
+  export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX="$RCNAME"   # (kept; superseded by --name for display)
   echo "→ Remote Control: ON (mobile session '$RCNAME')"
 fi
 # MODEL: pin the workspace's model in the DESCRIPTOR so it survives every relaunch. An in-session

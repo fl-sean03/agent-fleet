@@ -18,7 +18,7 @@ check_not(){ local d="$1"; shift; if "$@"; then bad "$d"; else ok "$d"; fi; }
 
 export HOME="$TMP"
 A="$TMP/.agents"
-mkdir -p "$A"/{accounts/acct-a,cfg/ws1,client-cfg/cli1} "$TMP/.claude/projects" "$TMP/bin" "$TMP/.local/bin"
+mkdir -p "$A"/{accounts/acct-a,cfg/ws1,confined-cfg/cli1} "$TMP/.claude/projects" "$TMP/bin" "$TMP/.local/bin"
 ln -sfn "$TMP/.claude/projects" "$A/accounts/acct-a/projects"
 ln -sfn "$TMP/.claude/projects" "$A/cfg/ws1/projects"
 
@@ -109,9 +109,9 @@ run_guard
 check_not "no FAILED UNITS alert when none are failed" bash -c "grep -q 'FAILED UNITS' '$TMP/alerts.txt' 2>/dev/null"
 
 echo "== failed-unit sweep: a failed unit pages, and a NEW failure re-pages inside the window =="
-printf 'c009r3-qe.service loaded failed failed QE pilot\n' > "$TMP/fixture-failed-usr.txt"
+printf 'example-job.service loaded failed failed QE pilot\n' > "$TMP/fixture-failed-usr.txt"
 run_guard
-check "a failed user unit is alerted"        bash -c "grep -q 'FAILED UNITS.*usr:c009r3-qe' '$TMP/alerts.txt'"
+check "a failed user unit is alerted"        bash -c "grep -q 'FAILED UNITS.*usr:example-job' '$TMP/alerts.txt'"
 run_guard
 check_not "same failed set is throttled"     bash -c "grep -q 'FAILED UNITS' '$TMP/alerts.txt' 2>/dev/null"
 printf 'logrotate.service loaded failed failed Rotate logs\n' > "$TMP/fixture-failed-sys.txt"

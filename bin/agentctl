@@ -22,7 +22,7 @@ have(){ tmux has-session -t "agent-$1" 2>/dev/null; }
 proctree(){ local p=$1; echo "$p"; local c; for c in $(pgrep -P "$p" 2>/dev/null); do proctree "$c"; done; }  # recursive PID tree
 
 load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspace '$PROJECT' (try: agentctl ls)"
-  ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""
+  ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""; EFFORT=""; PROFILE=""
   # shellcheck disable=SC1090
   source "$f"; SESSION="agent-$PROJECT"; [ -n "$ROOT" ] || die "$PROJECT: ROOT unset"
   # auto-derive kind for descriptors that don't declare one: anything rooted under $CONFINED_ROOT is
@@ -40,7 +40,7 @@ agentpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | sed -n 2p; }  
 
 addpane(){ local a="$1"
   [ "$a" = "claude" ] && [ "${SANDBOX:-}" = "bwrap" ] && a="claude-confined"
-  local envp="env REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' WS_NAME='$PROJECT' RESUME='${RESUME:-}' ACCOUNT='${ACCOUNT:-}' SESSION_ID='${SESSION_ID:-}' SSH='${SSH:-}' MODEL='${MODEL:-}'"
+  local envp="env REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' WS_NAME='$PROJECT' RESUME='${RESUME:-}' ACCOUNT='${ACCOUNT:-}' SESSION_ID='${SESSION_ID:-}' SSH='${SSH:-}' MODEL='${MODEL:-}' EFFORT='${EFFORT:-}' PROFILE='${PROFILE:-}'"
   if [ -x "$BIN/run-$a" ]; then tmux split-window -t "$SESSION:main" -c "$ROOT" "exec $envp $BIN/run-$a"
   else tmux split-window -t "$SESSION:main" -c "$ROOT" "exec bash"; fi
 }
@@ -70,7 +70,9 @@ do_up(){ load "$1"; sock
 do_send(){ local to="$1"; shift
   [ -n "$to" ] || die "usage: agentctl send <name|@all|@human> <text|@file>"
   local txt="$*"; [ -n "$txt" ] || die "nothing to send"
-  "$BIN/fleet-msg" send --to "$to" --from "${WS_NAME:-system}" "$txt"
+  # FLEET_MSG_FROM: a system script's declared identity (e.g. "system:session-guard") — the
+  # provenance standard: machine-mediated messages name their originating script, never bare "system".
+  "$BIN/fleet-msg" send --to "$to" --from "${FLEET_MSG_FROM:-${WS_NAME:-system}}" "$txt"
 }
 do_read(){ load "$1"; have "$1" || die "$1 not up"; local n="${2:-40}"
   tmux capture-pane -p -J -t "$(agentpane)" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n "$n"
@@ -135,19 +137,26 @@ do_new(){ local name="" full="" root="" confined=0 rc="" norc=0 up=0 profile="" 
   [ -n "$name" ] || die "usage: agentctl new <name> [--profile NAME] [--confined \"Full Name\"] [--root PATH] [--rc NAME|--no-rc] [--up]"
   case "$name" in _*|*/*|*' '*) die "bad name '$name'";; esac
   [ -f "$P/$name.env" ] && die "workspace '$name' already exists"
+  local kind=project sandbox="" remote=on rcname
   # --profile: adopt the profile's policy at creation. A profile whose KIND=confined provisions a
-  # confined workspace automatically (so `new acme --profile client` = confined + PROFILE=client);
-  # the profile's MODEL becomes the default. Instructions/skills/settings are composed at LAUNCH.
+  # confined workspace automatically (so `new exampleco --profile client` = confined + PROFILE=client);
+  # its MODEL becomes the default, its SANDBOX and REMOTE_CONTROL are honored too. Instructions/
+  # skills/settings are composed at LAUNCH, so editing the profile later updates every workspace
+  # of that type.
   local PROFDIR="$A/profiles"; [ -d "$PROFDIR" ] || PROFDIR="${FLEET_KIT_ROOT:-$HOME/agent-fleet}/profiles"
   if [ -n "$profile" ]; then
     [ -d "$PROFDIR/$profile" ] || die "unknown profile '$profile' (agent-profile list)"
-    local pk pm; pk=$(grep -oP '^KIND=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
+    local pk ps pm pr
+    pk=$(grep -oP '^KIND=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
+    ps=$(grep -oP '^SANDBOX=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
     pm=$(grep -oP '^MODEL=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
+    pr=$(grep -oP '^REMOTE_CONTROL=\K.*' "$PROFDIR/$profile/profile.conf" 2>/dev/null | sed 's/[[:space:]]*#.*//;s/[[:space:]]*$//')
     [ "$pk" = confined ] && confined=1
+    [ -n "$ps" ] && sandbox="$ps"
     [ -n "$pm" ] && model="$pm"
+    [ "$pr" = on ] || [ -z "$pr" ] || remote=""
     [ -n "$full" ] || full="$name"
   fi
-  local kind=project sandbox="" remote=on rcname
   if [ $confined -eq 1 ]; then
     kind=confined; sandbox=bwrap; root="$CONFINED_ROOT/$name"
     [ -d "$root" ] && die "$root already exists"
@@ -316,6 +325,7 @@ case "${1:-help}" in
   msglog)    shift; exec "$BIN/fleet-msg" log "$@" ;;
   login)     shift; do_login "$@" ;;
   set-token) shift; do_set_token "$@" ;;
+  path)      load "${2:?usage: agentctl path <name>}" >/dev/null; echo "$ROOT" ;;
   status|ls) do_status "${2:-}" ;;
   up-all)    for f in "$P"/*.env; do [ -e "$f" ] || continue; grep -q '^AUTOSTART="no"' "$f" && continue; do_up "$(basename "${f%.env}")"; done ;;
   down-all)  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-'); do tmux kill-session -t "$s"; echo "down: $s"; done ;;

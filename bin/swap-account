@@ -30,8 +30,8 @@ DESC="$A/projects/$WS.env"; [ -f "$DESC" ] || { echo "no workspace '$WS'"; exit 
 ROOT=$(grep -oP 'ROOT="?\K[^"]+' "$DESC" | head -1); ROOT="${ROOT/\$HOME/$HOME}"; ROOT="${ROOT/#\~/$HOME}"
 enc=$(printf '%s' "$ROOT" | sed 's#[^a-zA-Z0-9]#-#g')
 
-# KIND — same derivation as agentctl: an explicit KIND=, else anything rooted under ~/clients is a
-# confined client. This matters because a client's auth lives somewhere completely different.
+# KIND — same derivation as agentctl: an explicit KIND=, else anything rooted under $CONFINED_ROOT is
+# confined. This matters because a confined workspace's auth lives somewhere completely different.
 KIND=$(grep -oP '^KIND="?\K[^"]+' "$DESC" | head -1 || true)
 [ -n "$KIND" ] || case "$ROOT" in "${CONFINED_ROOT:-$HOME/confined}"/*) KIND=confined;; *) KIND=project;; esac
 

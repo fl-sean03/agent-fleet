@@ -26,8 +26,8 @@ check(){ local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
 check_not(){ local d="$1"; shift; if "$@"; then bad "$d"; else ok "$d"; fi; }
 
 export HOME="$TMP"
-A="$TMP/.agents"; CC="$A/confined-cfg/acme"
-mkdir -p "$A"/{projects,bin,accounts/acct-a,accounts/acct-b} "$CC/backups" "$TMP/.local/bin" "$TMP/clients/acme"
+A="$TMP/.agents"; CC="$A/confined-cfg/exampleco"
+mkdir -p "$A"/{projects,bin,accounts/acct-a,accounts/acct-b} "$CC/backups" "$TMP/.local/bin" "$TMP/clients/exampleco"
 ln -sfn "$REPO/bin/account-profile" "$A/bin/account-profile" 2>/dev/null
 # account-profile validates labels against the rotation allow-list — the project path uses it
 printf 'acct-a\nacct-b\n' > "$A/accounts/.rotation"
@@ -38,7 +38,7 @@ cat > "$TMP/.local/bin/agentctl" <<'EOF'
 printf '%s %s\n' "${1:-}" "${2:-}" >> "$HOME/agentctl.calls"; exit 0
 EOF
 chmod +x "$TMP/.local/bin/agentctl"
-printf 'ROOT="$HOME/clients/acme"\nKIND="confined"\nACCOUNT="acct-a"\nSESSION_ID="aaaa"\n' > "$A/projects/acme.env"
+printf 'ROOT="$HOME/clients/exampleco"\nKIND="confined"\nACCOUNT="acct-a"\nSESSION_ID="aaaa"\n' > "$A/projects/exampleco.env"
 # HOST profile credentials — the thing that must NEVER be copied into a confined workspace
 printf '{"claudeAiOauth":{"refreshToken":"sk-HOST-ACCT-B-SECRET"}}\n' > "$A/accounts/acct-b/.credentials.json"
 printf '{"claudeAiOauth":{"refreshToken":"sk-HOST-ACCT-A-SECRET"}}\n' > "$A/accounts/acct-a/.credentials.json"
@@ -51,21 +51,21 @@ reset_client(){
   printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-A"}}\n' > "$CC/.credentials.json"        # live = acct-a
   printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-A"}}\n' > "$CC/.credentials.acct-a.json"
   printf 'acct-a\n' > "$CC/.account"
-  sed -i '/^ACCOUNT=/d' "$A/projects/acme.env"; printf 'ACCOUNT="acct-a"\n' >> "$A/projects/acme.env"
+  sed -i '/^ACCOUNT=/d' "$A/projects/exampleco.env"; printf 'ACCOUNT="acct-a"\n' >> "$A/projects/exampleco.env"
 }
 live_token(){ grep -oP '"refreshToken":"\K[^"]+' "$CC/.credentials.json" 2>/dev/null; }
 
 echo "== a missing stash FAILS LOUDLY and changes nothing =="
 reset_client
-out=$("$SA" acme acct-b 2>&1); rc=$?
+out=$("$SA" exampleco acct-b 2>&1); rc=$?
 check "exits non-zero"                       test "$rc" -ne 0
 check "says the stash is missing"            bash -c "printf '%s' \"\$1\" | grep -q 'NO credential stash'" _ "$out"
-check "points at the ONE correct remedy"     bash -c "printf '%s' \"\$1\" | grep -q 'agentctl login acme'" _ "$out"
+check "points at the ONE correct remedy"     bash -c "printf '%s' \"\$1\" | grep -q 'agentctl login exampleco'" _ "$out"
 eq "$(live_token)" "sk-CLIENT-OWN-A"      && ok "live credential untouched"        || bad "live credential changed"
 eq "$(cat "$CC/.account")" "acct-a"       && ok ".account still says acct-a"       || bad ".account moved"
 check_not "the agent was NOT bounced"        test -s "$TMP/agentctl.calls"
 # THE ORIGINAL BUG: the descriptor must not claim an account the client is not using
-eq "$(grep -oP '^ACCOUNT="\K[^"]+' "$A/projects/acme.env")" "acct-a" && ok "descriptor NOT rewritten to a lie" || bad "descriptor lies about the account"
+eq "$(grep -oP '^ACCOUNT="\K[^"]+' "$A/projects/exampleco.env")" "acct-a" && ok "descriptor NOT rewritten to a lie" || bad "descriptor lies about the account"
 
 echo "== a host profile's credential is NEVER deployed to a confined workspace =="
 # the stash for acct-b is absent, but the HOST has an acct-b credential sitting right there
@@ -75,7 +75,7 @@ check_not "no host token leaked into any client stash"       bash -c "grep -rq '
 echo "== a dud stash (no refresh token) is refused =="
 reset_client
 printf '{"claudeAiOauth":{"accessToken":"sk-ant-oat-x","refreshToken":""}}\n' > "$CC/.credentials.acct-b.json"
-out=$("$SA" acme acct-b 2>&1); rc=$?
+out=$("$SA" exampleco acct-b 2>&1); rc=$?
 check "exits non-zero"                    test "$rc" -ne 0
 check "names it a dud"                    bash -c "printf '%s' \"\$1\" | grep -qi 'dud\|NO refresh token'" _ "$out"
 eq "$(live_token)" "sk-CLIENT-OWN-A"   && ok "live credential untouched by a dud"  || bad "dud was deployed"
@@ -83,27 +83,27 @@ eq "$(live_token)" "sk-CLIENT-OWN-A"   && ok "live credential untouched by a dud
 echo "== the happy path: the client's OWN stash is deployed =="
 reset_client
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
-out=$("$SA" acme acct-b 2>&1); rc=$?
+out=$("$SA" exampleco acct-b 2>&1); rc=$?
 check "exits 0"                                    test "$rc" -eq 0
 eq "$(live_token)" "sk-CLIENT-OWN-B"            && ok "live credential is now the client's OWN acct-b login" || bad "wrong credential deployed"
 check_not "and is NOT the host's acct-b token"     grep -q 'sk-HOST' "$CC/.credentials.json"
 eq "$(cat "$CC/.account")" "acct-b"             && ok ".account records the move"      || bad ".account not updated"
-eq "$(grep -oP '^ACCOUNT="\K[^"]+' "$A/projects/acme.env")" "acct-b" && ok "descriptor agrees with reality" || bad "descriptor/state divergence"
-check "the workspace was stopped and restarted"       bash -c "grep -q '^stop acme' '$TMP/agentctl.calls' && grep -q '^up acme' '$TMP/agentctl.calls'"
+eq "$(grep -oP '^ACCOUNT="\K[^"]+' "$A/projects/exampleco.env")" "acct-b" && ok "descriptor agrees with reality" || bad "descriptor/state divergence"
+check "the workspace was stopped and restarted"       bash -c "grep -q '^stop exampleco' '$TMP/agentctl.calls' && grep -q '^up exampleco' '$TMP/agentctl.calls'"
 check "a backup of the previous live credential exists" bash -c "ls -A '$CC/backups/' | grep -q credentials"
 
 echo "== the DEPARTING account's rotation is preserved into its stash =="
 reset_client
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-A-ROTATED"}}\n' > "$CC/.credentials.json"   # live rotated since stash
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
-"$SA" acme acct-b >/dev/null 2>&1
+"$SA" exampleco acct-b >/dev/null 2>&1
 check "acct-a stash refreshed from the live file (latest rotation)" grep -q 'sk-CLIENT-OWN-A-ROTATED' "$CC/.credentials.acct-a.json"
 
 echo "== but NEVER from an empty/zeroed live file (how a real empty-stash dud was minted) =="
 reset_client
 printf '{"claudeAiOauth":{"refreshToken":""}}\n' > "$CC/.credentials.json"                          # CLI zeroed it
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
-out=$("$SA" acme acct-b 2>&1)
+out=$("$SA" exampleco acct-b 2>&1)
 check "the good acct-a stash is NOT overwritten by the zeroed live file" grep -q 'sk-CLIENT-OWN-A' "$CC/.credentials.acct-a.json"
 check "and it says so"                    bash -c "printf '%s' \"\$1\" | grep -qi 'EMPTY/zeroed'" _ "$out"
 check "the switch still proceeds"         grep -q 'sk-CLIENT-OWN-B' "$CC/.credentials.json"
@@ -112,11 +112,11 @@ echo "== a pin is POLICY: state may not move out from under it silently =="
 reset_client
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
 printf 'acct-a\n' > "$CC/.pinned-account"
-out=$("$SA" acme acct-b 2>&1); rc=$?
+out=$("$SA" exampleco acct-b 2>&1); rc=$?
 check "refuses to move a pinned workspace"        test "$rc" -ne 0
 check "explains --repin"                       bash -c "printf '%s' \"\$1\" | grep -q -- '--repin'" _ "$out"
 eq "$(live_token)" "sk-CLIENT-OWN-A"        && ok "credential untouched while pinned" || bad "pinned workspace was moved"
-"$SA" acme acct-b --repin >/dev/null 2>&1
+"$SA" exampleco acct-b --repin >/dev/null 2>&1
 eq "$(live_token)" "sk-CLIENT-OWN-B"        && ok "--repin performs the move"         || bad "--repin did not move"
 eq "$(cat "$CC/.pinned-account")" "acct-b"  && ok "--repin moves the pin too (no lie)" || bad "pin not updated"
 
@@ -127,7 +127,7 @@ echo "== --force must NOT be a back door to the pin (the override must never be 
 reset_client
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
 printf 'acct-a\n' > "$CC/.pinned-account"
-out=$("$SA" acme acct-b --force 2>&1); rc=$?
+out=$("$SA" exampleco acct-b --force 2>&1); rc=$?
 check "--force does NOT override a pin"          test "$rc" -ne 0
 eq "$rc" "3"                                  && ok "pin refusal exits 3 (policy) not 1 (failure)" || bad "pin refusal exit code: $rc"
 eq "$(live_token)" "sk-CLIENT-OWN-A"          && ok "--force left the pinned credential alone"     || bad "--force moved a pinned workspace"
@@ -135,13 +135,13 @@ eq "$(cat "$CC/.pinned-account")" "acct-a"    && ok "--force left the pin alone"
 check "refusal reads as policy, not failure"     bash -c "printf '%s' \"\$1\" | grep -qi 'policy, not a failure'" _ "$out"
 # a real failure must stay distinguishable from a policy refusal
 reset_client; rm -f "$CC/.credentials.acct-b.json"
-"$SA" acme acct-b --force >/dev/null 2>&1; rc=$?
+"$SA" exampleco acct-b --force >/dev/null 2>&1; rc=$?
 eq "$rc" "1" && ok "a missing stash still exits 1 (a real failure)" || bad "missing-stash exit code: $rc"
 # and --repin moves pin + state together, never one without the other
 reset_client
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-B"}}\n' > "$CC/.credentials.acct-b.json"
 printf 'acct-a\n' > "$CC/.pinned-account"
-"$SA" acme acct-b --repin >/dev/null 2>&1
+"$SA" exampleco acct-b --repin >/dev/null 2>&1
 eq "$(cat "$CC/.pinned-account")" "acct-b" && ok "--repin moves the pin"   || bad "--repin pin"
 eq "$(cat "$CC/.account")" "acct-b"        && ok "--repin moves the state" || bad "--repin state"
 eq "$(cat "$CC/.pinned-account")" "$(cat "$CC/.account")" && ok "pin and state never disagree after --repin" || bad "pin/state divergence"
@@ -165,12 +165,12 @@ check_not "a pinned skip does NOT page main"  bash -c "sed -n '/⊘ skipped:/,+2
 echo "== already-on-target is a no-op unless --force (the repair path) =="
 reset_client
 printf 'acct-a\n' > "$CC/.account"
-out=$("$SA" acme acct-a 2>&1)
+out=$("$SA" exampleco acct-a 2>&1)
 check "says already on"                    bash -c "printf '%s' \"\$1\" | grep -q 'already on'" _ "$out"
 check_not "no bounce"                      test -s "$TMP/agentctl.calls"
 rm -f "$TMP/agentctl.calls"
 printf '{"claudeAiOauth":{"refreshToken":"sk-CLIENT-OWN-A-RESTASHED"}}\n' > "$CC/.credentials.acct-a.json"
-"$SA" acme acct-a --force >/dev/null 2>&1
+"$SA" exampleco acct-a --force >/dev/null 2>&1
 check "--force re-deploys the stash"       grep -q 'sk-CLIENT-OWN-A-RESTASHED' "$CC/.credentials.json"
 
 echo "== a PROJECT workspace is unaffected by all of this =="

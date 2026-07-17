@@ -13,25 +13,25 @@ check(){ local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
 check_not(){ local d="$1"; shift; if "$@"; then bad "$d"; else ok "$d"; fi; }
 
 export HOME="$TMP"; A="$TMP/.agents"
-mkdir -p "$A/projects" "$TMP/clients/acme" "$TMP/work/rig"
+mkdir -p "$A/projects" "$TMP/clients/exampleco" "$TMP/work/rig"
 ln -sfn "$REPO/bin" "$A/bin"
-printf 'ROOT="$HOME/clients/acme"\nKIND="confined"\nSANDBOX="bwrap"\n' > "$A/projects/acme.env"
+printf 'ROOT="$HOME/clients/exampleco"\nKIND="confined"\nSANDBOX="bwrap"\n' > "$A/projects/exampleco.env"
 printf 'ROOT="$HOME/work/rig"\n' > "$A/projects/rig.env"
 AC="$REPO/bin/agentctl"
 
 echo "== set-token: the headless auth mode =="
 check "agentctl has set-token"  bash -c "'$AC' set-token 2>&1 | grep -qv 'unknown'"
-"$AC" set-token acme sk-ant-oat-TESTTOKEN >/dev/null 2>&1
-eq "$(cat "$A/confined-cfg/acme/oauth-token")" "sk-ant-oat-TESTTOKEN" && ok "token written verbatim (no trailing newline)" || bad "token content"
-eq "$(stat -c %a "$A/confined-cfg/acme/oauth-token")" "600" && ok "token file is 0600"      || bad "token perms"
-eq "$(stat -c %a "$A/confined-cfg/acme")" "700"             && ok "confined cfg dir is 0700"  || bad "cfg dir perms"
-check "warns it is Sonnet-only / no RC (a downgrade)" bash -c "'$AC' set-token acme sk-x 2>&1 | grep -qi 'sonnet'"
-check "points at agentctl login for Opus+RC"          bash -c "'$AC' set-token acme sk-x 2>&1 | grep -q 'agentctl login acme'"
+"$AC" set-token exampleco sk-ant-oat-TESTTOKEN >/dev/null 2>&1
+eq "$(cat "$A/confined-cfg/exampleco/oauth-token")" "sk-ant-oat-TESTTOKEN" && ok "token written verbatim (no trailing newline)" || bad "token content"
+eq "$(stat -c %a "$A/confined-cfg/exampleco/oauth-token")" "600" && ok "token file is 0600"      || bad "token perms"
+eq "$(stat -c %a "$A/confined-cfg/exampleco")" "700"             && ok "confined cfg dir is 0700"  || bad "cfg dir perms"
+check "warns it is Sonnet-only / no RC (a downgrade)" bash -c "'$AC' set-token exampleco sk-x 2>&1 | grep -qi 'sonnet'"
+check "points at agentctl login for Opus+RC"          bash -c "'$AC' set-token exampleco sk-x 2>&1 | grep -q 'agentctl login exampleco'"
 
 echo "== it is fail-closed =="
 check_not "refuses a PROJECT workspace"   bash -c "'$AC' set-token rig sk-x >/dev/null 2>&1"
 check_not "refuses an unknown workspace"  bash -c "'$AC' set-token nosuch sk-x >/dev/null 2>&1"
-check_not "refuses a missing token arg"   bash -c "'$AC' set-token acme >/dev/null 2>&1"
+check_not "refuses a missing token arg"   bash -c "'$AC' set-token exampleco >/dev/null 2>&1"
 
 echo "== the retired entrypoint is really gone =="
 check_not "no separate client tool in the repo"  test -e "$REPO/bin/clientctl"

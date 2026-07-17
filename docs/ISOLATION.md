@@ -45,8 +45,8 @@ It does **not** see: your home directory, your other workspaces, your other agen
 your credentials, `/etc/passwd`. Not "denied" — **not mounted**. There is nothing to escalate to.
 
 ```bash
-agentctl new acme --confined "Acme Corp" --up
-agentctl login acme        # its own OAuth; never touches your other accounts' credentials
+agentctl new exampleco --confined "ExampleCo Corp" --up
+agentctl login exampleco        # its own OAuth; never touches your other accounts' credentials
 ```
 
 Because the namespace *is* the wall, the agent inside can run with permissions relaxed — the
@@ -78,7 +78,7 @@ into `-`. Which produces a trap:
 
 ```
 home            /home/alice           →  -home-alice          (the include prefix)
-confined work   /home/alice/confined/acme  →  -home-alice-confined-acme
+confined work   /home/alice/confined/exampleco  →  -home-alice-confined-exampleco
 ```
 
 The confined store **starts with the include prefix**. A naive "is it under my home?" test harvests

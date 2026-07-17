@@ -20,7 +20,7 @@ check_not(){ local d="$1"; shift; if "$@"; then bad "$d"; else ok "$d"; fi; }
 
 # --- sandboxed fleet ---------------------------------------------------------------------------
 export HOME="$TMP"
-A="$TMP/.agents"; mkdir -p "$A"/{projects,accounts/acct-a,accounts/acct-b,confined-cfg/acme,skills} "$TMP/.claude/projects"
+A="$TMP/.agents"; mkdir -p "$A"/{projects,accounts/acct-a,accounts/acct-b,confined-cfg/exampleco,skills} "$TMP/.claude/projects"
 ln -sfn "$REPO/profiles" "$A/profiles"
 for s in agent-workspaces investigation-tree loop-engineering host-access-skill brandkit; do
   mkdir -p "$A/skills/$s"; echo "# $s" > "$A/skills/$s/SKILL.md"
@@ -31,17 +31,17 @@ for acct in acct-a acct-b; do
   ln -sfn "$TMP/.claude/projects" "$A/accounts/$acct/projects"
 done
 echo acct-a > "$A/accounts/.active"
-printf '{"oauthAccount":{"emailAddress":"acme-own@example.com"}}\n' > "$A/confined-cfg/acme/.claude.json"
+printf '{"oauthAccount":{"emailAddress":"exampleco-own@example.com"}}\n' > "$A/confined-cfg/exampleco/.claude.json"
 # a confined workspace's LIVE hand-tuned settings — compose must not destroy these (a real fleet carries exactly these)
-printf '{"env":{"DISABLE_AUTOUPDATER":"1"},"model":"claude-fable-5","effortLevel":"max"}\n' > "$A/confined-cfg/acme/settings.json"
-printf '{"claudeAiOauth":{"refreshToken":"sk-ACME-OWN"}}\n' > "$A/confined-cfg/acme/.credentials.json"
-mkdir -p "$A/confined-cfg/acme/projects/-work"; echo '{}' > "$A/confined-cfg/acme/projects/-work/sess.jsonl"
+printf '{"env":{"DISABLE_AUTOUPDATER":"1"},"model":"claude-fable-5","effortLevel":"max"}\n' > "$A/confined-cfg/exampleco/settings.json"
+printf '{"claudeAiOauth":{"refreshToken":"sk-EXAMPLECO-OWN"}}\n' > "$A/confined-cfg/exampleco/.credentials.json"
+mkdir -p "$A/confined-cfg/exampleco/projects/-work"; echo '{}' > "$A/confined-cfg/exampleco/projects/-work/sess.jsonl"
 
 mkdesc(){ printf '%s\n' "$2" > "$A/projects/$1.env"; }
 mkdesc rig  'ROOT="$HOME/work/rig"
 PROFILE="lab"
 SESSION_ID="11111111-1111-1111-1111-111111111111"'
-mkdesc acme 'ROOT="$HOME/clients/acme"
+mkdesc exampleco 'ROOT="$HOME/clients/exampleco"
 KIND="confined"
 PROFILE="client"
 SESSION_ID="22222222-2222-2222-2222-222222222222"'
@@ -58,8 +58,8 @@ for p in base client lab; do check "$p profile listed" bash -c "'$AP' list | gre
 
 echo "== policy resolution: descriptor > profile > base =="
 eq "$("$AP" policy rig KIND)"     "project"          && ok "lab → KIND=project (profile)"        || bad "rig KIND"
-eq "$("$AP" policy acme KIND)"    "confined"         && ok "client profile → KIND=confined (auto-confined)" || bad "acme KIND"
-eq "$("$AP" policy acme SANDBOX)" "bwrap"            && ok "client → SANDBOX=bwrap (profile)"    || bad "acme SANDBOX"
+eq "$("$AP" policy exampleco KIND)"    "confined"         && ok "client profile → KIND=confined (auto-confined)" || bad "exampleco KIND"
+eq "$("$AP" policy exampleco SANDBOX)" "bwrap"            && ok "client → SANDBOX=bwrap (profile)"    || bad "exampleco SANDBOX"
 eq "$("$AP" policy rig SANDBOX)"  ""                 && ok "lab → SANDBOX empty"                 || bad "rig SANDBOX"
 eq "$("$AP" policy rig MODEL)"    "claude-opus-4-8"  && ok "MODEL falls through to base"         || bad "rig MODEL"
 eq "$("$AP" policy ovr MODEL)"    "claude-sonnet-5"  && ok "descriptor MODEL beats profile"      || bad "ovr MODEL"
@@ -97,7 +97,7 @@ echo "== THE INVARIANT: credentials never live on the composed path =="
 check_not "NO .credentials.json in the composed cfg dir" test -e "$cr/.credentials.json"
 eq "$("$AP" credstore rig)" "$A/accounts/acct-a" && ok "credstore(project) = the ACCOUNT dir" || bad "credstore rig"
 eq "$("$AP" credstore rig --account acct-b)" "$A/accounts/acct-b" && ok "credstore follows --account" || bad "credstore acct-b"
-eq "$("$AP" credstore acme)" "$A/confined-cfg/acme" && ok "credstore(confined) = its ISOLATED cfg (never an account)" || bad "credstore acme"
+eq "$("$AP" credstore exampleco)" "$A/confined-cfg/exampleco" && ok "credstore(confined) = its ISOLATED cfg (never an account)" || bad "credstore exampleco"
 
 echo "== rotation-readiness: an account change moves creds, not the config dir =="
 cr2=$("$AP" compose rig --account acct-b)
@@ -109,13 +109,13 @@ check "acct-a credential untouched by the swap"  grep -q 'sk-acct-a' "$A/account
 check "acct-b credential untouched by the swap"  grep -q 'sk-acct-b' "$A/accounts/acct-b/.credentials.json"
 
 echo "== compose: confined workspace — the wall holds =="
-ca=$("$AP" compose acme)
-eq "$ca" "$A/confined-cfg/acme" && ok "confined ws composes INTO its isolated cfg" || bad "client cfg path: $ca"
+ca=$("$AP" compose exampleco)
+eq "$ca" "$A/confined-cfg/exampleco" && ok "confined ws composes INTO its isolated cfg" || bad "client cfg path: $ca"
 check "confined instructions present"        grep -q "confined workspace" "$ca/AGENTS.md"
 check "CLAUDE.md is a real FILE (copy)"    bash -c "test -f '$ca/CLAUDE.md' && ! test -L '$ca/CLAUDE.md'"
 check "skills are COPIED, not symlinked"   bash -c "test -d '$ca/skills/investigation-tree' && ! test -L '$ca/skills/investigation-tree'"
 check "copied skill has real content"      test -s "$ca/skills/investigation-tree/SKILL.md"
-check "confined ws keeps its OWN credential"    grep -q 'sk-ACME-OWN' "$ca/.credentials.json"
+check "confined ws keeps its OWN credential"    grep -q 'sk-EXAMPLECO-OWN' "$ca/.credentials.json"
 # pre-existing settings are LIVE STATE, not ours to delete: they become the lowest layer.
 jget(){ python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))
 for k in sys.argv[2].split("."): d = d.get(k, {}) if isinstance(d, dict) else {}

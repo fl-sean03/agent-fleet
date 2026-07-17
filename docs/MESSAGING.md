@@ -67,6 +67,36 @@ exact turn where it was processed. Bidirectional trace, from either end.
 agentctl msglog --to ws-gpu --since 24h --json | jq '.[] | {ts, from, body}'
 ```
 
+## System senders and the provenance envelope
+
+Every machine-mediated injection is wrapped in the same envelope the delivered text already
+carries:
+
+```
+[message from system:<script> | msg-…]
+<the text>
+```
+
+The rule: **a submission fired by a script must never be indistinguishable from a live human
+Enter.** The incident behind it — a watchdog once auto-submitted a stale draft sitting in a
+composer, and the agent executed it with operator authority because it looked exactly like the
+operator pressing Enter. The envelope names the *script* (`system:input-watchdog`,
+`system:session-guard`), not a bare `system`, so the recipient can weigh the authority correctly,
+and the wrapped text lands in the durable log like any message. Wrapping also defuses `!`/`/`
+prefixes: enveloped text can no longer execute as a bash or slash command.
+
+Two ways a script declares itself:
+
+- `FLEET_MSG_FROM="system:<script>"` in its environment — picked up by `agentctl send` /
+  `fleet-msg send` (precedence: explicit `--from` > `FLEET_MSG_FROM` > workspace name > `system`).
+- `fleet-msg kick <ws> --as <script>` — a kick submits the stranded composer text **enveloped and
+  logged** (event `kick` in the durable store), attributed to `system:<script>`.
+
+`kick` also refuses to submit known **TUI render artifacts** — strings like `No response
+requested` or `esc to interrupt` that the composer reader can misread as stranded input. Those
+are cleared, never submitted (UI noise fired as a user turn carries user authority; see
+`_TUI_ARTIFACTS` in `bin/fleet-msg` and extend it as new render strings surface).
+
 ## Addressing
 
 | Form | Means |

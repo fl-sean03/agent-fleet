@@ -1,0 +1,7 @@
+[Unit]
+Description=Run backup-watch daily
+[Timer]
+OnCalendar=*-*-* 12:30:00 UTC
+Persistent=true
+[Install]
+WantedBy=timers.target

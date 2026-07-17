@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# backup-watch — daily staleness check on your backup jobs. Exists because backup tiers FAIL
+# SILENTLY: a backup script that logs "SKIP: target unreachable" and exits 0 keeps its systemd
+# timer green — that once hid a dead tier for 5+ days with nobody notified. This makes staleness
+# LOUD: log + at most one alert per day into the main agent pane (which reaches the operator via
+# Remote Control).
+#
+# Configure the jobs to watch in ~/.agents/backup-watch.conf, one per line ('|'-separated):
+#
+#     <unit>|<success-regex>|<max-age-days>|<label>
+#
+#     backup-local.service|snapshot .* saved|2|local-disk
+#     backup-cloud.service|snapshot .* saved|2|cloud
+#     # a '#' at the start of a line comments it out
+#
+# THE ONE RULE for success-regex: it must match a line the job logs ONLY on a real backup (an
+# actual "snapshot saved" line), NEVER on its skip path. "Finished <unit>." also matches the skip
+# path — which is exactly the silent failure this tool exists to catch.
+set -uo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+A="$HOME/.agents"; LOG="$A/backup-watch.log"; MARK="$A/.backup-watch-alerted"
+CONF="${BACKUP_WATCH_CONF:-$A/backup-watch.conf}"
+log(){ echo "[$(date -u +%FT%TZ)] $*" >> "$LOG"; }
+
+[ -f "$CONF" ] || { log "no $CONF — nothing to watch (see the header of this script for the format)"; exit 0; }
+
+now=$(date -u +%s); alerts=()
+
+check(){ # <unit> <success-regex> <max-age-days> <label>
+  local unit="$1" re="$2" maxd="$3" label="$4" last age
+  last=$(journalctl -u "$unit" --no-pager --since "-90d" -o short-unix 2>/dev/null \
+         | grep -E "$re" | tail -1 | cut -d' ' -f1 | cut -d. -f1)
+  if [ -z "$last" ]; then alerts+=("$label: NO successful run found in journal"); return; fi
+  age=$(( (now - last) / 86400 ))
+  [ "$age" -gt "$maxd" ] && alerts+=("$label: last success ${age}d ago (max ${maxd}d)")
+}
+
+while IFS='|' read -r unit re maxd label; do
+  unit="${unit%%#*}"                       # full-line comments → empty unit → skipped
+  unit="${unit#"${unit%%[![:space:]]*}"}"; unit="${unit%"${unit##*[![:space:]]}"}"
+  [ -n "$unit" ] || continue
+  case "$maxd" in ''|*[!0-9]*) log "skipping malformed line (max-age-days not a number): $unit"; continue;; esac
+  check "$unit" "$re" "$maxd" "${label:-$unit}"
+done < "$CONF"
+
+if [ "${#alerts[@]}" -eq 0 ]; then log "all tiers current"; rm -f "$MARK"; exit 0; fi
+log "STALE: ${alerts[*]}"
+# alert at most once per calendar day — a standing outage should not re-page every run
+today=$(date -u +%F)
+[ "$(cat "$MARK" 2>/dev/null)" = "$today" ] && exit 0
+echo "$today" > "$MARK"
+# FLEET_MSG_FROM: the provenance standard — a machine-mediated message names its originating script.
+FLEET_MSG_FROM="system:backup-watch" agentctl send main \
+  "[backup-watch] Backup staleness: ${alerts[*]}" >/dev/null 2>&1 \
+  && log "alerted main pane" || log "alert send failed"

@@ -146,12 +146,34 @@ verify_ws(){ # <ws> → 0 if the live claude proc for this workspace reads crede
 }
 verify_confined(){ # <confined workspace> → 0 if its .claude.json login email == target account email
   local c="$1" e
-  for _ in $(seq 1 30); do   # bwrap confined workspace boot + first .claude.json write can exceed 20s (13:30 swap)
+  for _ in $(seq 1 "${VERIFY_TRIES:-30}"); do   # bwrap confined workspace boot + first .claude.json write can exceed 20s
     e=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1])).get('oauthAccount',{}).get('emailAddress',''))" "$A/confined-cfg/$c/.claude.json" 2>/dev/null)
     [ -n "$TEMAIL" ] && [ "$e" = "$TEMAIL" ] && return 0
     sleep 2
   done
   log "C: verify_confined $c: observed email '$e' != target '$TEMAIL' after 60s (email is stale metadata until an interactive login — diagnostic, see runbook)"
+  return 1
+}
+
+# verify_rc_retry <ws> — after a swap relaunch, the workspace boots RC-enabled but its FIRST RC
+# registration against the freshly-swapped account can fail with a transient "Remote credentials fetch
+# failed" (the RC credential exchange lags the account change), and the CLI never retries — so Remote
+# Control stays DOWN fleet-wide after every swap until poked. The agent is idle for a beat right after
+# the bounce (before the resume-nudge), so re-triggering /remote-control then registers cleanly, under
+# the correct name (run-claude passes -n). Best-effort (all tmux calls tolerate failure); logs the outcome.
+verify_rc_retry(){
+  local w="$1" pane="agent-$1.2" attempt txt
+  ws_rc_on "$w" || return 0
+  for attempt in 1 2 3; do
+    txt=$(tmux capture-pane -p -t "$pane" -S -20 2>/dev/null || true)
+    printf '%s' "$txt" | grep -qiE 'remote-control is active|Continue here, on your phone' && return 0
+    printf '%s' "$txt" | grep -q 'esc to interrupt' && return 0   # busy (a live turn owns the box) — leave it
+    tmux send-keys -t "$pane" C-u 2>/dev/null || true; sleep 1
+    tmux send-keys -t "$pane" "/remote-control" 2>/dev/null || true; sleep 3
+    tmux send-keys -t "$pane" Enter 2>/dev/null || true; sleep 5
+  done
+  txt=$(tmux capture-pane -p -t "$pane" -S -20 2>/dev/null || true)
+  printf '%s' "$txt" | grep -qiE 'remote-control is active|Continue here' && return 0
   return 1
 }
 
@@ -244,6 +266,7 @@ if [ "$TAILONLY" = 0 ] && [ -z "$ONLYCONFINED" ]; then
     log "A: swapping $w → $ACCT"
     was_busy=0; ws_busy "$w" && { was_busy=1; }
     aout=$("$A/bin/swap-account" "$w" "$ACCT" 2>&1); rc=$?; printf '%s\n' "$aout" >>"$LOG"
+    # record mid-turn interruption only if the workspace actually BOUNCED ("already on" = untouched)
     if [ "$was_busy" = 1 ] && ! printf '%s' "$aout" | grep -q "already on"; then
       echo "$w" >> "$INTERRUPTED_F"
     fi
@@ -253,6 +276,8 @@ if [ "$TAILONLY" = 0 ] && [ -z "$ONLYCONFINED" ]; then
       else
         log "A: ✓ $w verified on $ACCT"; a_moved=$((a_moved+1))
         ws_rc_on "$w" && echo "$w" >> "$RC_MOVED_F"   # RC bridge on the OLD account is now orphaned
+        if ws_rc_on "$w"; then verify_rc_retry "$w" && log "A: ✓ $w RC registered on $ACCT" \
+          || log "A: ⚠ $w RC not registered after retries (transient; recover: fleet-msg kick $w / /remote-control)"; fi
       fi
       a_ok=$((a_ok+1))
     else
@@ -276,6 +301,8 @@ run_tail(){
       if printf '%s' "$bout" | grep -q "already on"; then log "B: = main already on $ACCT (verified)"
       else
         changed=1; main_moved=1; log "B: ✓ main verified on $ACCT"
+        verify_rc_retry main && log "B: ✓ main RC registered on $ACCT" \
+          || log "B: ⚠ main RC not registered after retries (recover: /remote-control in main)"
         ws_rc_on main && echo "main" >> "$RC_MOVED_F"
       fi
     else
@@ -305,9 +332,13 @@ run_tail(){
     #   --force: we already decided above that this workspace needs to move (its .account may claim the
     #   target while verify_confined disagrees — the repair path), so don't let swap-account no-op.
     #   NOTE --force does NOT bypass the pin gate (that needs --repin, which we never pass): the
-    #   roster filter above already removed pin-mismatched clients, and this is the second layer.
+    #   roster filter above already removed pin-mismatched workspaces, and this is the second layer.
+    c_busy=0; ws_busy "$c" && c_busy=1
     cout=$("$A/bin/swap-account" "$c" "$ACCT" --force 2>&1); crc=$?
     printf '%s\n' "$cout" >>"$LOG"
+    if [ "$c_busy" = 1 ] && [ "$crc" = 0 ] && ! printf '%s' "$cout" | grep -q "already on"; then
+      echo "$c" >> "$INTERRUPTED_F"
+    fi
     if [ "$crc" = 3 ]; then
       # refused by POLICY (pinned), not a failure — the roster filter normally catches this first;
       # reaching here means the pin appeared after the roster was built. Log it as the clean skip it is.

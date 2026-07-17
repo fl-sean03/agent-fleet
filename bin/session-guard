@@ -35,7 +35,7 @@ alert_main(){
 
 # 0) shared-store integrity preflight (rebase 2026-07-01): every ACCOUNT profile's projects/ must
 # resolve to the shared host store — a diverged copy silently forks sessions on account swap.
-# (client-cfg profiles are deliberately isolated and are NOT checked.)
+# (confined-cfg dirs are deliberately isolated and are NOT checked.)
 HOST_STORE="$(readlink -f "$HOME/.claude/projects" 2>/dev/null || true)"
 # cfg/* are the COMPOSED per-workspace config dirs (PROFILE= workspaces, 2026-07-15). They carry the
 # same invariant for the same reason: their projects/ must be the one shared store.
@@ -45,8 +45,8 @@ for p in "$A"/accounts/*/projects "$A"/cfg/*/projects; do
     log "!!! SHARED-STORE VIOLATION: $p does not resolve to ~/.claude/projects — sessions will fork on swap"
 done
 
-# 1) archive transcripts from host + every account profile + every confined client
-for base in "$HOME/.claude" "$A"/accounts/* "$A"/client-cfg/*; do
+# 1) archive transcripts from host + every account profile + every confined workspace
+for base in "$HOME/.claude" "$A"/accounts/* "$A"/confined-cfg/*; do
   [ -d "$base/projects" ] || continue
   name=$(basename "$base")
   rsync -a --prune-empty-dirs --include='*/' --include='*.jsonl' --exclude='*' \
@@ -100,7 +100,7 @@ for pid in $(pgrep -x claude 2>/dev/null); do
     alert_main "routing-$ws" "ROUTING OVERRIDE on '$ws': its live process has $var=$val. A fleet agent should talk to Anthropic directly; this is how the 2026-07-15 main incident looked (a plugin rerouted it to a local proxy and it ran on a non-Anthropic model unnoticed). Verify this is intended; if not, check that workspace's config dir settings.json for an 'env' block and relaunch."
   done
 done
-for s in "$HOME"/.claude/settings.json "$A"/accounts/*/settings.json "$A"/cfg/*/settings.json "$A"/client-cfg/*/settings.json; do
+for s in "$HOME"/.claude/settings.json "$A"/accounts/*/settings.json "$A"/cfg/*/settings.json "$A"/confined-cfg/*/settings.json; do
   [ -f "$s" ] || continue
   # Only ROUTING keys, not any env block: legitimate fleet settings carry benign env (one client
   # workspace sets DISABLE_AUTOUPDATER). A guard that fires on those trains everyone to ignore it.
@@ -306,7 +306,7 @@ fi
 # =================================================================================================
 # 5) FAILED-UNIT + CAMPAIGN-STALL SWEEP (stall-sweep prevention spec)
 #
-# Units fail silently: c009r3-qe sat failed NINE DAYS unseen; logrotate/dpkg-db-backup died at
+# Units fail silently: example-job sat failed NINE DAYS unseen; logrotate/dpkg-db-backup died at
 # midnight on the full disk unseen; idle-down reported failed on a cosmetic exit-status bug and
 # nobody noticed either. And an ACTIVE unit can be a corpse: a client campaign died mid-flight
 # and read as 'science stopped' for 16h because its service stayed green while its log went silent.
