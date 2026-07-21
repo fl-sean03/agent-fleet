@@ -62,6 +62,10 @@ live credentials, no network. `./run-tests.sh` (the Python suite needs `pip inst
 
 ---
 
+## Skills
+
+This kit ships only the three skills wired to the harness itself: [`agent-orchestration`](skills/agent-orchestration/) (recursive principal-subordinate delegation), [`agent-workspaces`](skills/agent-workspaces/) (driving the fleet through `agentctl`), and [`init-docs`](skills/init-docs/) (documentation scaffolding for agentic work). The full skill library is a companion repo, **[fl-sean03/skills](https://github.com/fl-sean03/skills)**: design taste, video production, engineering methodology, research workflows, and writing standards. It's harness-agnostic, and its install steps symlink the skills into `~/.claude/skills`, where the workspaces here already pick them up.
+
 ## Docs
 
 | Read this | For |
