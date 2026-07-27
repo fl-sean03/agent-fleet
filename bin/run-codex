@@ -1,3 +1,276 @@
 #!/usr/bin/env bash
+# =============================================================================
+# run-codex — launch an OpenAI Codex agent pane.
+#
+# Dispatched by agentctl as ~/.agents/bin/run-codex when a descriptor carries
+# AGENTS="codex" (the harness axis — see docs/HARNESSES.md). Consumes the same env
+# contract agentctl's addpane forwards to every launcher (WS_NAME / ROOT / MODEL /
+# EFFORT / REMOTE_CONTROL / RC_NAME / PROFILE / MEMHIGH / MEMMAX) plus a
+# codex-native CODEX_SESSION, and maps it onto the Codex CLI.
+#
+# -----------------------------------------------------------------------------
+# WHY THE INTERACTIVE TUI, NOT `codex exec`
+# -----------------------------------------------------------------------------
+# agentctl panes are LONG-LIVED. run-claude launches interactive `claude` (not
+# `claude -p`) so the agent sits alive in the tty waiting for input delivered via
+# tmux send-keys / fleet-msg, and only falls to a shell when it exits. The faithful
+# codex parallel is the interactive TUI:
+#     resume:  codex resume <SESSION_ID> [opts]
+#     fresh:   codex [opts]
+# NOT `codex exec`, which runs ONE prompt and exits — a pane launched that way dies
+# after a single turn. `codex exec` is the right tool for a headless one-shot job
+# (reference at the bottom of this file); it is the wrong tool for a persistent agent.
+#
+# Tradeoffs of the interactive choice:
+#   + long-lived, resumable, message-deliverable; matches run-claude's shape and the
+#     liveness expectations of session-guard (whose codex arm is `^(codex|node)$`).
+#   - the TUI is a full-screen alt-screen app, so turn injection is tmux send-keys
+#     (fleet-msg knows the codex composer glyph), not stdin piping.
+#   - `--json` event streaming and `--skip-git-repo-check` are EXEC-ONLY flags and
+#     do not exist for the TUI, so they are not used here.
+#
+# -----------------------------------------------------------------------------
+# WHAT CODEX DOES DIFFERENTLY FROM CLAUDE (the four real divergences)
+# -----------------------------------------------------------------------------
+# 1. SESSION IDS CANNOT BE PINNED. claude accepts a caller-chosen --session-id,
+#    which is how every workspace gets one deterministic conversation forever.
+#    Codex generates its own UUIDv7 per session (rollout-<ISO>-<uuid>.jsonl under
+#    $CODEX_HOME/sessions/YYYY/MM/DD/). So the flow inverts: launch fresh, CAPTURE
+#    the id codex chose, write it back to the descriptor as CODEX_SESSION, and the
+#    NEXT launch resumes it. See the capture poller below.
+# 2. NO PER-ACCOUNT STORE. claude has ~/.agents/accounts/<label>/ per account.
+#    Codex has ONE $CODEX_HOME (default ~/.codex) holding auth, config, sessions and
+#    history. So ACCOUNT= is ignored here and a codex workspace sits out account
+#    rotation (swap-fleet skips any workspace whose harness is not claude). If you
+#    run more than one codex identity, give each its own CODEX_HOME.
+# 3. EFFORT IS CONFIG, NOT ENV. claude reads CLAUDE_CODE_EFFORT_LEVEL from the
+#    environment; codex takes `-c model_reasoning_effort=<level>` as an argument.
+# 4. TRUST IS PER-EXACT-PATH AND INTERACTIVE. The TUI prompts "Do you trust this
+#    directory?" on an unknown root and STRANDS an unattended pane until answered.
+#    Trust on a parent directory does NOT inherit. Preseeded below.
+#
+# -----------------------------------------------------------------------------
+# ENV CONTRACT — consumed vs ignored
+# -----------------------------------------------------------------------------
+# CONSUMED:
+#   WS_NAME    -> memcap unit name, log label, capture-sidecar name (falls back to
+#                 basename of ROOT/PWD).
+#   ROOT       -> `-C "$ROOT"` (codex working root); falls back to $PWD.
+#   MODEL      -> `-m` ONLY when it looks like a codex model id. Claude-style values
+#                 are ignored in favour of CODEX_MODEL / CODEX_MODEL_DEFAULT (the two
+#                 naming schemes do not map onto each other).
+#   EFFORT     -> `-c model_reasoning_effort=<mapped>`; claude-only `max` -> codex
+#                 `ultra`, its top tier. Other values pass through.
+#   MEMHIGH/MEMMAX -> scope MemoryHigh/MemoryMax (defaults match run-claude).
+#   CODEX_SESSION  -> codex-native resume target.
+# LOGGED ONLY (documented divergence):
+#   REMOTE_CONTROL, RC_NAME -> codex remote control is a separate app-server/broker
+#                 daemon (`codex remote-control`), not a launcher flag like claude's
+#                 --remote-control. The pane is still driveable via tmux either way.
+# IGNORED (claude-only, no codex analog wired here):
+#   SESSION_ID (divergence 1) · ACCOUNT (divergence 2) · PROFILE (codex's analog is
+#   `-p <name>` layering $CODEX_HOME/<name>.config.toml) · FORK · RESUME ·
+#   SANDBOX (handled by run-codex-confined) · KIND · AUTOSTART.
+# CODEX-SPECIFIC knobs this launcher introduces:
+#   CODEX_MODEL / CODEX_MODEL_DEFAULT · CODEX_PROVIDER_OVERRIDE ·
+#   CODEX_SESSION_CAPTURE_FILE · CODEX_CAPTURE_TIMEOUT · CODEX_TRUST_PRESEED
+# =============================================================================
+
 export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
-if command -v codex >/dev/null; then codex || true; echo "[codex exited — shell]"; else echo "codex not installed (npm i -g @openai/codex, then auth)"; fi; exec bash
+
+# --- Nested-session / auth hygiene -------------------------------------------
+# Parallel to run-claude's CLAUDE_CODE_CHILD_SESSION unsets: if this launcher is
+# spawned from WITHIN another agent's turn (an agent running agentctl), it can inherit
+# markers that suppress the TUI or — worse — an API-key env that SHADOWS the
+# subscription auth we want.
+#   CODEX_SANDBOX / CODEX_SANDBOX_NETWORK_DISABLED : set inside codex's own sandbox;
+#     inherited, they can disable the child's network.
+#   CODEX_NON_INTERACTIVE : set by `codex exec`; inherited it can suppress the TUI.
+#   CODEX_ACCESS_TOKEN / CODEX_API_KEY / OPENAI_API_KEY : would force api-key auth
+#     and bypass the subscription auth path.
+#   CODEX_THREAD_ID / CODEX_INTERNAL_ORIGINATOR_OVERRIDE : defensive — the thread is
+#     set via resume args; a stale inherited id must not leak in.
+# CODEX_HOME is deliberately NOT unset: it is the auth+config anchor.
+unset CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CODEX_NON_INTERACTIVE \
+      CODEX_THREAD_ID CODEX_INTERNAL_ORIGINATOR_OVERRIDE \
+      CODEX_ACCESS_TOKEN CODEX_API_KEY OPENAI_API_KEY 2>/dev/null || true
+# (No resume-gate suppression: the resume-summary modal run-claude works around is
+# claude-specific. `codex resume <id>` has no equivalent prompt.)
+
+# --- Top-of-file knobs -------------------------------------------------------
+# PROVIDER OVERRIDE: if config.toml pins model_provider to a local proxy (a router
+# or relay), every turn goes through that proxy and inherits its credential
+# lifetime — including its staleness. Forcing the built-in provider per launch keeps
+# the pane on codex's own auth regardless of what the shared config says. Set to the
+# empty string to trust config.toml as-is.
+CODEX_PROVIDER_OVERRIDE="${CODEX_PROVIDER_OVERRIDE:-model_provider=openai}"
+# Native model fallback for when the descriptor MODEL is a claude name (the common
+# case in a mixed fleet). Check which ids your install offers before changing it.
+CODEX_MODEL_DEFAULT="${CODEX_MODEL_DEFAULT:-gpt-5.6-sol}"
+CODEX_CAPTURE_TIMEOUT="${CODEX_CAPTURE_TIMEOUT:-1800}"
+CODEX_HOME_REAL="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SESSION_CAPTURE_FILE="${CODEX_SESSION_CAPTURE_FILE:-$HOME/.agents/state/${WS_NAME:-$(basename "${ROOT:-$PWD}")}.codex-session}"
+
+# --- Resolve identity / working root -----------------------------------------
+WS="${WS_NAME:-$(basename "${ROOT:-$PWD}")}"
+CX_ROOT="${ROOT:-$PWD}"
+echo "→ codex workspace: $WS (root $CX_ROOT)"
+echo "→ auth: $CODEX_HOME_REAL/auth.json${CODEX_PROVIDER_OVERRIDE:+ (provider forced: -c $CODEX_PROVIDER_OVERRIDE)}"
+
+# Shared option array — identical for the fresh `codex …` and `codex resume <id> …`
+# forms; both accept -C/-m/-s/-a/-c.
+#   -s workspace-write : codex self-sandboxes tool writes to the workspace.
+#   -a never           : never pause for human approval (unattended pane) —
+#                        execution failures return to the model instead of blocking
+#                        on a prompt nobody is there to answer.
+# (The literal parallel to claude's --dangerously-skip-permissions would be
+#  --dangerously-bypass-approvals-and-sandbox. Not used unconfined: the self-sandbox
+#  costs nothing here and bounds a runaway tool call.)
+OPTS=(-C "$CX_ROOT" -s workspace-write -a never)
+[ -n "$CODEX_PROVIDER_OVERRIDE" ] && OPTS+=(-c "$CODEX_PROVIDER_OVERRIDE")
+
+# MODEL: honour the descriptor only if it names a codex model; otherwise fall back
+# (a claude name carries no codex meaning and is a hard launch error).
+CX_MODEL=""
+if [ -n "${CODEX_MODEL:-}" ]; then
+  CX_MODEL="$CODEX_MODEL"
+elif [ -n "${MODEL:-}" ] && printf '%s' "$MODEL" | grep -qiE '^(gpt-|o3|o4)'; then
+  CX_MODEL="$MODEL"; echo "→ model: $MODEL (descriptor MODEL is codex-shaped)"
+else
+  CX_MODEL="$CODEX_MODEL_DEFAULT"
+  [ -n "${MODEL:-}" ] && echo "→ model: descriptor MODEL='$MODEL' is not a codex id — using default $CX_MODEL"
+fi
+OPTS+=(-m "$CX_MODEL"); echo "→ model: $CX_MODEL"
+
+# EFFORT -> model_reasoning_effort (no dedicated CLI flag exists; set via -c).
+# Claude-only `max` maps onto codex `ultra`. Unknown values pass through for codex to
+# validate. NOTE: if config.toml sets a high global default, every turn inherits it —
+# pin EFFORT per descriptor rather than relying on the global.
+if [ -n "${EFFORT:-}" ]; then
+  case "$EFFORT" in
+    max) CX_EFFORT=ultra ;;
+    *)   CX_EFFORT="$EFFORT" ;;
+  esac
+  OPTS+=(-c "model_reasoning_effort=$CX_EFFORT")
+  echo "→ effort: $EFFORT -> model_reasoning_effort=$CX_EFFORT (descriptor pin)"
+fi
+
+# --- TRUST PRESEED (default ON; divergence 4) --------------------------------
+# An agentctl-managed root is trusted by construction, so mark it trusted BEFORE
+# launch: idempotent append-if-absent, using the exact block codex itself persists
+# when you answer "Yes". Without this, the first launch of any new workspace hangs on
+# a prompt nobody is watching. Opt out with CODEX_TRUST_PRESEED=0.
+#   CAVEAT: this appends to the shared config, which therefore grows one block per
+#   root and never shrinks. Prune stale blocks periodically, or give each identity
+#   its own CODEX_HOME so its trust list dies with it.
+if [ "${CODEX_TRUST_PRESEED:-1}" != 0 ]; then
+  CX_CFG="$CODEX_HOME_REAL/config.toml"
+  if ! grep -qF "[projects.\"$CX_ROOT\"]" "$CX_CFG" 2>/dev/null; then
+    if printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$CX_ROOT" >> "$CX_CFG" 2>/dev/null; then
+      echo "→ trust: marked $CX_ROOT trusted in config.toml (was untrusted)"
+    else
+      echo "⚠ trust: could not write $CX_CFG — the TUI may prompt on this untrusted root"
+    fi
+  else
+    echo "→ trust: $CX_ROOT already trusted"
+  fi
+fi
+
+# --- Claude-only descriptor fields: acknowledge, never silently swallow -------
+if [ "${REMOTE_CONTROL:-}" = "on" ]; then
+  echo "→ Remote Control requested ('${RC_NAME:-$WS}'): codex RC is a separate daemon plane"
+  echo "  (codex remote-control), not a launcher flag — the pane is still driveable via tmux."
+fi
+[ -n "${SESSION_ID:-}" ] && echo "→ (ignoring claude SESSION_ID ${SESSION_ID:0:8}: codex ids are self-generated; use CODEX_SESSION)"
+[ -n "${ACCOUNT:-}" ]    && echo "→ (ignoring ACCOUNT '$ACCOUNT': codex has one shared store; no per-account codex profile)"
+[ -n "${PROFILE:-}" ]    && echo "→ (ignoring claude PROFILE '$PROFILE': codex analog is -p/CODEX_HOME, not wired)"
+
+# --- Resume-or-fresh (the session-capture contract; divergence 1) ------------
+RESUME_ID=""
+if [ -n "${CODEX_SESSION:-}" ]; then
+  if ls "$CODEX_HOME_REAL/sessions/"*/*/*/rollout-*-"$CODEX_SESSION".jsonl >/dev/null 2>&1 \
+     || grep -qF "\"id\":\"$CODEX_SESSION\"" "$CODEX_HOME_REAL/session_index.jsonl" 2>/dev/null; then
+    RESUME_ID="$CODEX_SESSION"; echo "→ resuming codex session ${CODEX_SESSION:0:8}"
+  else
+    echo "⚠ CODEX_SESSION ${CODEX_SESSION:0:8} not found on disk — starting FRESH (will capture a new id)"
+  fi
+fi
+
+if [ -n "$RESUME_ID" ]; then
+  LAUNCH=(codex resume "$RESUME_ID" "${OPTS[@]}")
+else
+  LAUNCH=(codex "${OPTS[@]}")
+  # FRESH: arm a bounded background poller BEFORE handing the tty to the TUI. It
+  # finds the newest rollout created at/after T0 whose session_meta.cwd matches this
+  # root, prints a CODEX_SESSION_CAPTURE: marker to the pane, and writes the sidecar.
+  # swap-harness (or a human) then persists CODEX_SESSION=<id> into the descriptor —
+  # WITHOUT that write-back every bounce forks a brand-new thread. The rollout only
+  # materialises at session init / first turn, so the poller is time-bounded and
+  # self-exits on the first match. It never runs on the resume path.
+  T0=$(date +%s)
+  ( CAP_ROOT="$CX_ROOT"; CAP_FILE="$CODEX_SESSION_CAPTURE_FILE"; SESS_DIR="$CODEX_HOME_REAL/sessions"
+    deadline=$((T0 + CODEX_CAPTURE_TIMEOUT)); mkdir -p "$(dirname "$CAP_FILE")" 2>/dev/null || true
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      id=$(python3 - "$CAP_ROOT" "$T0" "$SESS_DIR" <<'PY' 2>/dev/null
+import glob,json,os,sys,re
+root,t0,sdir=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+best=None;bt=t0
+for f in glob.glob(os.path.join(sdir,'*/*/*/rollout-*.jsonl')):
+    try:
+        if os.path.getmtime(f) < t0-2: continue
+        with open(f) as fh: first=fh.readline()
+        o=json.loads(first); p=o.get('payload',{})
+        if p.get('cwd')!=root: continue
+        m=re.search(r'-([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$',f)
+        if not m: continue
+        mt=os.path.getmtime(f)
+        if mt>=bt: best,bt=m.group(1),mt
+    except Exception: continue
+print(best or '')
+PY
+)
+      if [ -n "$id" ]; then
+        echo "CODEX_SESSION_CAPTURE: $id"
+        printf '%s\n' "$id" > "$CAP_FILE" 2>/dev/null || true
+        break
+      fi
+      sleep 3
+    done ) &
+  echo "→ fresh codex session — capture poller armed (sidecar $CODEX_SESSION_CAPTURE_FILE, timeout ${CODEX_CAPTURE_TIMEOUT}s)"
+fi
+
+# --- MEMORY CAP (same doctrine as run-claude; unit renamed codex-ws-…) -------
+# Bound this agent's RSS so one agent cannot OOM the whole box. `systemd-run --user
+# --scope` runs codex SYNCHRONOUSLY in THIS tty — interactivity is preserved,
+# because a scope is not --pty and not a --service: the process stays the shell's
+# child. MemoryHigh is soft (reclaim pressure), MemoryMax is hard (THIS agent dies
+# before the box does). choom raises oom_score_adj so the kernel prefers agent pages
+# over system daemons. Overridable per workspace via MEMHIGH=/MEMMAX=; MEM_CAP=0
+# disables. FALLBACK: if the scope is unavailable, launch unbounded with a LOUD note
+# — a launch must never block on the cap.
+# Heavy compute the agent spawns inherits this cap and this oom_score_adj at fork,
+# so launch long compute in its own sibling scope, not inside the agent's.
+MEMHIGH="${MEMHIGH:-10G}"; MEMMAX="${MEMMAX:-12G}"
+CAP=()
+if [ "${MEM_CAP:-1}" = 0 ]; then
+  echo "→ memory cap: DISABLED (MEM_CAP=0) — launching codex unbounded"
+elif command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --scope --collect --quiet -p MemoryMax=64M --unit "codex-memcap-probe-$$" -- /bin/true >/dev/null 2>&1; then
+  MEMUNIT="codex-ws-${WS}"; MEMUNIT="${MEMUNIT//[^A-Za-z0-9_-]/-}-$$"
+  OOM=(); command -v choom >/dev/null 2>&1 && OOM=(choom -n 500 --)
+  CAP=(systemd-run --user --scope --collect --unit "$MEMUNIT"
+       -p MemoryHigh="$MEMHIGH" -p MemoryMax="$MEMMAX" -- "${OOM[@]}")
+  echo "→ memory cap: MemoryHigh=$MEMHIGH MemoryMax=$MEMMAX oom_score_adj=$([ "${#OOM[@]}" -gt 0 ] && echo 500 || echo 'default(choom absent)') (scope $MEMUNIT)"
+else
+  echo "⚠ memory cap: systemd-run --user --scope unavailable/failed — launching codex UNBOUNDED (no per-agent cap this run)"
+fi
+
+"${CAP[@]}" "${LAUNCH[@]}" || true
+echo; echo "[codex exited — this pane is now a shell. 'run-codex' to restart]"; exec bash
+
+# =============================================================================
+# Headless one-shot reference (NOT this launcher's path — for a background job):
+#     codex exec [resume <id>] --json -s workspace-write -a never \
+#                -C "$ROOT" -m "$MODEL" --skip-git-repo-check "PROMPT"
+# `-a`/`--ask-for-approval` is INTERACTIVE-ONLY; `codex exec` rejects it.
+# =============================================================================

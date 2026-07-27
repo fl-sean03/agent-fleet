@@ -68,7 +68,7 @@ command -v tmux >/dev/null || exit 0
 SB="$ARCH/_scrollback"; mkdir -p "$SB"
 for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-' || true); do
   ws="${s#agent-}"
-  pane=$(tmux list-panes -t "$s:main" -F '#{pane_id}' 2>/dev/null | sed -n 2p)
+  pane=$(tmux list-panes -t "=$s:main" -F '#{pane_id}' 2>/dev/null | sed -n 2p)
   [ -n "$pane" ] || continue
   tmux capture-pane -p -J -S - -t "$pane" 2>/dev/null > "$SB/$ws.txt" || true   # full scrollback → latest snapshot
   ctx=$(tail -40 "$SB/$ws.txt" 2>/dev/null | grep -oE '[0-9]+% context used' | grep -oE '^[0-9]+' | head -1)
@@ -165,13 +165,13 @@ agent_pattern(){
 # depth and you page a human about a perfectly healthy client agent every 15 minutes.
 pane_descendants(){
   local sess="$1" pid
-  for pid in $(tmux list-panes -t "$sess:main" -F '#{pane_pid}' 2>/dev/null); do fl_proctree "$pid"; done
+  for pid in $(tmux list-panes -t "=$sess:main" -F '#{pane_pid}' 2>/dev/null); do fl_proctree "$pid"; done
 }
 
 for f in "$A"/projects/*.env; do
   [ -e "$f" ] || continue
   ws=$(basename "${f%.env}")
-  tmux has-session -t "agent-$ws" 2>/dev/null || continue          # down on purpose is not a failure
+  tmux has-session -t "=agent-$ws" 2>/dev/null || continue          # down on purpose is not a failure
   agents=$(ws_agents "$ws")
   for ag in $agents; do
     pat=$(agent_pattern "$ag"); found=0; hog=""; hogrss=0
@@ -229,8 +229,8 @@ STUCK_STATE="$A/.session-guard-stuckinput"; mkdir -p "$STUCK_STATE"
 for f in "$A"/projects/*.env; do
   [ -e "$f" ] || continue
   ws=$(basename "${f%.env}")
-  tmux has-session -t "agent-$ws" 2>/dev/null || continue
-  pane_txt=$(tmux capture-pane -p -t "agent-$ws:main.2" 2>/dev/null)
+  tmux has-session -t "=agent-$ws" 2>/dev/null || continue
+  pane_txt=$(tmux capture-pane -p -t "=agent-$ws:main.2" 2>/dev/null)
   # only when IDLE: a busy agent legitimately holds queued input mid-turn
   echo "$pane_txt" | grep -q "esc to interrupt" && { rm -f "$STUCK_STATE/$ws"; continue; }
   # input box = the LAST ❯ line AND it must sit in the pane's bottom region — scrollback renders
@@ -248,7 +248,7 @@ for f in "$A"/projects/*.env; do
   # key the marker to the PANE PID as well as the text: a bounce replaces the pane, and a marker
   # from the PREVIOUS process must never combine with the new one into a "two consecutive sweeps"
   # page (main's finding, 2026-07-16: markers survived the 14:42 swap and false-paged 3 workspaces)
-  pane_pid=$(tmux display-message -p -t "agent-$ws:main.2" '#{pane_pid}' 2>/dev/null)
+  pane_pid=$(tmux display-message -p -t "=agent-$ws:main.2" '#{pane_pid}' 2>/dev/null)
   txt40=$(printf '%s' "$cur" | head -c 40)
   sig="$txt40 pid=$pane_pid"
   if [ -f "$STUCK_STATE/$ws" ] && [ "$(cat "$STUCK_STATE/$ws" 2>/dev/null)" = "$sig" ]; then

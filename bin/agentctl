@@ -25,7 +25,11 @@ die(){ echo "agentctl: $*" >&2; exit 1; }
 have(){ fl_have "$1"; }
 
 load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspace '$PROJECT' (try: agentctl ls)"
-  ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""; EFFORT=""; PROFILE=""
+  # RESET EVERY FORWARDED KEY. load() is called in a LOOP by up-all/status, in one shell
+  # process — so any key left unreset carries the PREVIOUS workspace's value into the next
+  # one. For a session-id field that means workspace B silently resuming workspace A's
+  # conversation. Anything added to addpane's env list below MUST be reset here.
+  ROOT=""; AGENTS="claude"; SSH=""; SANDBOX=""; REMOTE_CONTROL=""; RC_NAME=""; RESUME=""; AUTOSTART=""; KIND="project"; ACCOUNT=""; SESSION_ID=""; MODEL=""; EFFORT=""; PROFILE=""; CODEX_SESSION=""
   # shellcheck disable=SC1090
   source "$f"; SESSION="agent-$PROJECT"; [ -n "$ROOT" ] || die "$PROJECT: ROOT unset"
   # auto-derive kind for descriptors that don't declare one: anything rooted under $CONFINED_ROOT is
@@ -38,16 +42,23 @@ load(){ PROJECT="$1"; local f="$P/$PROJECT.env"; [ -f "$f" ] || die "no workspac
   return 0
 }
 
-firstpane(){ tmux list-panes -t "$SESSION:main" -F '#{pane_id}' | head -1; }
+firstpane(){ tmux list-panes -t "=$SESSION:main" -F '#{pane_id}' | head -1; }
 agentpane(){ fl_agent_pane "$PROJECT" || true; }   # control=pane1, claude=pane2 (lib; empty when down — same contract as the old sed -n 2p under set -e)
 
 addpane(){ local a="$1"
-  [ "$a" = "claude" ] && [ "${SANDBOX:-}" = "bwrap" ] && a="claude-confined"
-  local envp="env REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' WS_NAME='$PROJECT' RESUME='${RESUME:-}' ACCOUNT='${ACCOUNT:-}' SESSION_ID='${SESSION_ID:-}' SSH='${SSH:-}' MODEL='${MODEL:-}' EFFORT='${EFFORT:-}' PROFILE='${PROFILE:-}'"
-  if [ -x "$BIN/run-$a" ]; then tmux split-window -t "$SESSION:main" -c "$ROOT" "exec $envp $BIN/run-$a"
-  else tmux split-window -t "$SESSION:main" -c "$ROOT" "exec bash"; fi
+  # HARNESS DISPATCH (docs/HARNESSES.md): AGENTS=<x> runs bin/run-<x>, and SANDBOX="bwrap"
+  # upgrades that to bin/run-<x>-confined when a confined launcher exists for that harness.
+  # Keyed on the launcher's EXISTENCE, not on a per-harness `if` — adding a harness means
+  # dropping in run-<x>[-confined], with no edit here.
+  [ "${SANDBOX:-}" = "bwrap" ] && [ -x "$BIN/run-$a-confined" ] && a="$a-confined"
+  # Descriptor variables are set by `source`, which does not EXPORT them, so only the keys
+  # listed here reach the launcher. A launcher that reads a key missing from this list sees
+  # it as unset — and every key here must also be reset in load() (see the note there).
+  local envp="env REMOTE_CONTROL='${REMOTE_CONTROL:-}' RC_NAME='${RC_NAME:-}' WS_NAME='$PROJECT' RESUME='${RESUME:-}' ACCOUNT='${ACCOUNT:-}' SESSION_ID='${SESSION_ID:-}' SSH='${SSH:-}' MODEL='${MODEL:-}' EFFORT='${EFFORT:-}' PROFILE='${PROFILE:-}' CODEX_SESSION='${CODEX_SESSION:-}'"
+  if [ -x "$BIN/run-$a" ]; then tmux split-window -t "=$SESSION:main" -c "$ROOT" "exec $envp $BIN/run-$a"
+  else tmux split-window -t "=$SESSION:main" -c "$ROOT" "exec bash"; fi
 }
-addssh(){ local t="$1"; tmux split-window -t "$SESSION:main" -c "$ROOT" \
+addssh(){ local t="$1"; tmux split-window -t "=$SESSION:main" -c "$ROOT" \
   "exec bash -lc 'echo \"→ ssh $t\"; ssh $t; echo; echo \"[ssh $t closed — shell. ssh $t to reconnect]\"; exec bash'"; }
 
 # ---- lifecycle -------------------------------------------------------------
@@ -59,7 +70,7 @@ do_up(){ load "$1"; sock
   tmux send-keys -t "$ctrl" "clear; echo '=== $PROJECT ($KIND) — $ROOT ==='; echo 'agent ops: agentctl send|read|status|attach $PROJECT'" C-m
   for ag in $AGENTS; do addpane "$ag"; done
   [ -n "$SSH" ] && addssh "$SSH"
-  tmux select-layout -t "$SESSION:main" tiled >/dev/null
+  tmux select-layout -t "=$SESSION:main" tiled >/dev/null
   tmux select-pane -t "$ctrl" 2>/dev/null || true
   echo "✓ up: $SESSION  (kind:$KIND agents:$AGENTS${SANDBOX:+ sandbox:$SANDBOX}${REMOTE_CONTROL:+ rc:'${RC_NAME:-$PROJECT}'}${RESUME:+ resume:${RESUME:0:8}})"
 }
@@ -85,7 +96,7 @@ do_read(){ load "$1"; have "$1" || die "$1 not up"; local n="${2:-40}"
 ws_state(){ # echoes: up panes rc_active model auth   for $SESSION (must be loaded)
   if ! have "$PROJECT"; then echo "down 0 - - -"; return; fi
   local np body rc model auth
-  np=$(tmux list-panes -t "$SESSION" 2>/dev/null | wc -l | tr -d ' ')
+  np=$(tmux list-panes -t "=$SESSION" 2>/dev/null | wc -l | tr -d ' ')
   body=$(tmux capture-pane -p -J -t "$(agentpane)" 2>/dev/null || true)
   # RC indicator: the CLI footer shows a bare "/rc" when Remote Control is live (older builds said
   # "/rc active"; the launch banner says "/remote-control is active") — match all three (drift fix 2026-07-04)
@@ -293,9 +304,9 @@ do_down(){ load "$1"
   # Capture each pane's FULL process tree, kill the session, then SIGKILL any survivor. claude re-execs a
   # shell on exit (run-claude) and can outlive `tmux kill-session`, orphaning a writer that keeps
   # appending its session jsonl — which is what caused the split-brain / divergent-copy bug.
-  local pids all="" pp; pids=$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null || true)
+  local pids all="" pp; pids=$(tmux list-panes -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null || true)
   for pp in $pids; do all="$all $(fl_proctree "$pp")"; done
-  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  tmux kill-session -t "=$SESSION" 2>/dev/null || true
   for pp in $all; do kill "$pp" 2>/dev/null || true; done; sleep 1
   for pp in $all; do kill -9 "$pp" 2>/dev/null || true; done
   echo "✓ down: $SESSION (graceful; terminated $(echo $all | wc -w) procs)"; }
@@ -315,7 +326,7 @@ case "${1:-help}" in
              [ -f "$P/$n.env" ] && mv "$P/$n.env" "$A/attic/retired-descriptors/$n.env.retired-$(date -u +%Y-%m-%d)"
              echo "  ✓ $n retired (stopped + delisted, no autostart). bring back: agentctl up $n — resumes the SAME session" ;;
   stop)      n="${2:-}"; [ -n "$n" ] || die "usage: agentctl stop <name>"; do_down "$n" ;;   # TRANSIENT stop (keep descriptor listed); plumbing for swap/idle — not the user verb
-  attach)    load "$2"; exec tmux attach -t "$SESSION" ;;
+  attach)    load "$2"; exec tmux attach -t "=$SESSION" ;;
   new)       shift; do_new "$@" ;;
   send)      shift; do_send "$@" ;;
   read)      do_read "$2" "${3:-40}" ;;
@@ -331,11 +342,11 @@ case "${1:-help}" in
   path)      load "${2:?usage: agentctl path <name>}" >/dev/null; echo "$ROOT" ;;
   status|ls) do_status "${2:-}" ;;
   up-all)    for f in "$P"/*.env; do [ -e "$f" ] || continue; grep -q '^AUTOSTART="no"' "$f" && continue; do_up "$(basename "${f%.env}")"; done ;;
-  down-all)  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-'); do tmux kill-session -t "$s"; echo "down: $s"; done ;;
+  down-all)  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^agent-'); do tmux kill-session -t "=$s"; echo "down: $s"; done ;;
   add)       load "$2"; have "$2" || die "$2 not up"; a="${3:-claude}"
-             if [ "$a" = shell ]; then tmux split-window -t "$SESSION:main" -c "$ROOT" "exec bash"
+             if [ "$a" = shell ]; then tmux split-window -t "=$SESSION:main" -c "$ROOT" "exec bash"
              elif [ "$a" = ssh ]; then [ -n "$SSH" ] || die "no SSH= in $2"; addssh "$SSH"
-             else addpane "$a"; fi; tmux select-layout -t "$SESSION:main" tiled >/dev/null; echo "✓ added $a to $2" ;;
+             else addpane "$a"; fi; tmux select-layout -t "=$SESSION:main" tiled >/dev/null; echo "✓ added $a to $2" ;;
   projects)  ls "$P" 2>/dev/null | sed 's/\.env$//' ;;
   accounts)  shift; exec "$BIN/account-status" "$@" ;;   # who is on which Claude account (--probe = live cap check)
   idle)      shift; exec "$BIN/idle-down" "$@" ;;         # spin down workspaces idle >=N days ([--days N] [--dry])

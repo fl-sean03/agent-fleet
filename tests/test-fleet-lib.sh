@@ -101,8 +101,11 @@ cat > "$TMP/stubbin/tmux" <<'EOS'
 case "$*" in
   *list-panes*agent-two*)      printf '%%1\n%%2\n' ;;
   *list-panes*agent-one*)      printf '%%7\n' ;;
-  *"capture-pane -p -t agent-busy1:main.2"*) printf 'working\n  esc to interrupt\n❯ \n' ;;
-  *"capture-pane -p -t agent-idle1:main.2"*) printf '❯ \n' ;;
+  # Glob on the SESSION, not on the whole literal target: production now passes tmux's exact-match
+  # form ("=agent-busy1:main.2") so a stub pinned to the bare name silently stopped matching and
+  # ws_busy read an empty pane. A stub is a contract copy — keep it loose where the contract allows.
+  *capture-pane*agent-busy1:main.2*) printf 'working\n  esc to interrupt\n❯ \n' ;;
+  *capture-pane*agent-idle1:main.2*) printf '❯ \n' ;;
   *has-session*agent-up*)      exit 0 ;;
   *has-session*)               exit 1 ;;
 esac

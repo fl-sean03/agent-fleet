@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# =============================================================================
+# swap-harness <workspace> <claude|codex> [--force] [--fresh]
+# -----------------------------------------------------------------------------
+# Switch a workspace's HARNESS without losing its conversation — the peer of
+# bin/swap-account, which switches the ACCOUNT= field. Same workspace, same
+# conversation, continuing on the other runtime.
+#
+# The harness axis is the descriptor's AGENTS= field (docs/HARNESSES.md): agentctl
+# dispatches AGENTS=<x> to run-<x> (plus SANDBOX="bwrap" to run-<x>-confined),
+# forwards CODEX_SESSION, and swap-fleet already excludes any workspace whose
+# harness is not claude from Claude account rotation — so a codex workspace
+# automatically sits out account swaps.
+#
+#   swap-harness demo codex            # flip to codex, RESUMING the claude conversation
+#   swap-harness demo codex --fresh    # flip to codex, fresh session (skip the import)
+#   swap-harness demo claude           # flip back (claude resumes its own SESSION_ID)
+#
+# -----------------------------------------------------------------------------
+# CONVERSATION CONTINUITY — claude -> codex resumes the conversation (default ON)
+# -----------------------------------------------------------------------------
+# Codex ships a scriptable, per-session Claude -> Codex import (an app-server
+# externalAgentConfig/import call, wrapped by the `codex-companion.mjs transfer`
+# verb that ships with the codex plugin). It maps a SPECIFIC Claude session JSONL
+# onto a resumable Codex thread. It is a LOCAL transcript-to-rollout conversion,
+# not a model summarization: no model turn, no token cost.
+#
+# On claude -> codex this script:
+#   1. resolves the workspace's claude transcript (confined vs. normal project),
+#   2. WINDOWS it — the tail of turns fitting a token budget, because codex's context
+#      window is far smaller than a months-old transcript — and stages a valid claude
+#      JSONL under ~/.claude/projects/ (the companion's path guard requires a source
+#      under that tree),
+#   3. imports it to a threadId, guarded by a timeout; on any failure it falls back to
+#      writing a handoff-brief file and says so plainly,
+#   4. writes CODEX_SESSION=<threadId>, flips AGENTS=codex, and `agentctl up` — the
+#      codex launcher finds CODEX_SESSION, locates the rollout, and RESUMES it.
+# --fresh skips the import. codex -> claude needs none of this: claude resumes its own
+# SESSION_ID transcript, which was never touched.
+#
+# -----------------------------------------------------------------------------
+# WHY THE VERIFY WITNESS IS HARNESS-AWARE
+# -----------------------------------------------------------------------------
+# swap-account proves a swap landed with ws_live_account (fleet-lib.sh), which reads
+# CLAUDE_SECURESTORAGE_CONFIG_DIR / CLAUDE_CONFIG_DIR out of the live *claude*
+# process's environ. A codex process sets neither — its auth is its own store — so
+# ws_live_account returns empty for a perfectly healthy codex agent and would
+# false-fail (and then wrongly roll back) every claude -> codex flip. So the witness
+# is chosen by harness: the codex side confirms a live `codex` process under the
+# workspace's own tmux panes (the same recursive pane walk session-guard uses),
+# narrowed by the workspace ROOT appearing in its argv; the claude side keeps
+# ws_live_account. A confined claude is invisible to ws_live_account by design
+# (HOME is the isolated config dir), which is accepted — and ws_live_codex still
+# witnesses a confined codex correctly.
+#
+# DELIBERATE DIVERGENCES FROM swap-account: rollback is included (styled on
+# swap-account's confined-workspace rollback); `agentctl up` is guarded with `|| true`
+# so a failed launch flows into verify+rollback instead of aborting under set -e;
+# the verify budget is larger for codex (slower TUI boot); and it serialises on the
+# SAME lock swap-fleet holds, because a harness flip and an account rotation both
+# bounce workspaces and must be mutually exclusive.
+#
+# EXIT CODES: 0 ok · 1 failure (no workspace / lock busy) · 2 usage · 5 verification
+#             failed but the descriptor was ROLLED BACK (safe) · 6 rollback itself
+#             UNVERIFIED (needs a human).
+# =============================================================================
+set -euo pipefail
+AGENTCTL="$HOME/.local/bin/agentctl"; [ -x "$AGENTCTL" ] || AGENTCTL="$(command -v agentctl || echo agentctl)"
+export PATH="$HOME/.local/bin:$PATH"
+
+WS="${1:?usage: swap-harness <workspace> <claude|codex> [--force] [--fresh]}"
+TARGET="${2:?usage: swap-harness <workspace> <claude|codex> [--force] [--fresh]}"
+shift 2 || true
+FORCE=0; DO_IMPORT=1
+while [ "$#" -gt 0 ]; do case "$1" in
+  --force) FORCE=1 ;;    # re-launch even if already on target (repair path)
+  --fresh) DO_IMPORT=0 ;;# claude->codex: skip the conversation import
+  *) echo "unknown swap-harness option: $1" >&2; exit 2 ;;
+esac; shift; done
+
+case "$TARGET" in
+  claude|codex) ;;
+  *) echo "swap-harness: target must be 'claude' or 'codex' (got '$TARGET')" >&2; exit 2 ;;
+esac
+
+A="${A:-$HOME/.agents}"
+FL_SELF="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=fleet-lib.sh
+. "$FL_SELF/fleet-lib.sh"
+DESC="$A/projects/$WS.env"; [ -f "$DESC" ] || { echo "no workspace '$WS'"; exit 1; }
+ROOT=$(ws_root "$WS" 2>/dev/null || true)
+LOG="${LOG:-$A/logs/swap-harness.log}"; mkdir -p "$(dirname "$LOG")" 2>/dev/null || true; FL_SCRIPT=swap-harness
+
+# --- import machinery -------------------------------------------------------------
+# Resolve the companion by GLOB, newest first — never by a hardcoded account label or
+# plugin version. Reaching into a specific profile's plugin cache breaks silently the
+# day that profile is retired or the plugin is upgraded, and it fails INTO the
+# handoff-brief fallback where nobody notices the cause. Override with COMPANION=.
+if [ -z "${COMPANION:-}" ]; then
+  COMPANION="$(ls -t "$HOME"/.agents/accounts/*/plugins/{cache,marketplaces}/*codex*/**/codex-companion.mjs \
+                     "$HOME"/.claude/plugins/{cache,marketplaces}/*codex*/**/codex-companion.mjs 2>/dev/null | head -1 || true)"
+fi
+STAGE_DIR="$HOME/.claude/projects/harness-swap"            # MUST live under ~/.claude/projects (companion guard)
+IMPORT_BUDGET_TOKENS="${IMPORT_BUDGET_TOKENS:-80000}"      # ~2/3 of a typical codex window; leaves resume headroom
+IMPORT_TIMEOUT="${IMPORT_TIMEOUT:-150}"                    # > the companion's own RPC timeout
+
+# SERIALISE on the fleet swap lock. Non-blocking by default (a manual flip should not
+# hang behind a fleet rotation); SWAP_HARNESS_WAIT=1 queues instead.
+exec 9>"$ACCTS/.swap.lock"
+if [ "${SWAP_HARNESS_WAIT:-0}" = 1 ]; then
+  flock 9
+else
+  flock -n 9 || { echo "another swap (fleet or harness) holds the swap lock — aborting (SWAP_HARNESS_WAIT=1 to queue)" >&2; exit 1; }
+fi
+
+# ---- harness-aware liveness ------------------------------------------------------
+ws_live_codex(){ # <ws> [root] → rc 0 iff a live codex agent runs under agent-<ws>'s panes
+  local ws="$1" root="${2:-}" pane pid comm cmd found=1
+  for pane in $(tmux list-panes -t "=agent-$ws:main" -F '#{pane_pid}' 2>/dev/null); do
+    for pid in $(fl_proctree "$pane"); do
+      comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+      cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+      case "$comm" in
+        codex) ;;                                                    # native codex binary
+        node)  printf '%s' "$cmd" | grep -q 'codex' || continue ;;   # node-hosted codex only
+        *)     continue ;;
+      esac
+      if [ -n "$root" ] && printf '%s' "$cmd" | grep -qF -- "$root"; then return 0; fi
+      found=0
+    done
+  done
+  return "$found"
+}
+
+ws_live_harness(){ # <ws> [root] → the harness ACTUALLY running (claude|codex|''), by live truth
+  local ws="$1" root="${2:-}"
+  if ws_live_codex "$ws" "$root"; then printf 'codex\n'; return 0; fi
+  [ -n "$(ws_live_account "$ws" 2>/dev/null || true)" ] && { printf 'claude\n'; return 0; }
+  return 1
+}
+
+# ---- claude transcript resolution (confined vs normal project) -------------------
+resolve_claude_transcript(){ # <ws> → path of the claude transcript jsonl on stdout, or '' (rc 0)
+  local ws="$1" sid kind sandbox ck enc root cand
+  sid=$(ws_session_id "$ws" 2>/dev/null || true); [ -n "$sid" ] || return 0
+  kind=$(ws_kind "$ws" 2>/dev/null || true)
+  sandbox=$(ws_get "$ws" SANDBOX 2>/dev/null || true)
+  root=$(ws_root "$ws" 2>/dev/null || true)
+  if [ "$kind" = client ] || [ "$sandbox" = bwrap ]; then
+    # confined: the config dir is the isolated one and the in-jail cwd is /work
+    ck=$(ws_client_cfg "$ws" 2>/dev/null || true); [ -n "$ck" ] || ck="$ws"
+    for cand in "$A/confined-cfg/$ck/projects/-work/$sid.jsonl" "$A/confined-cfg/$ck/projects/"*/"$sid.jsonl"; do
+      [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+    done
+    return 0
+  fi
+  # project: every account's projects/ symlinks to the one physical store; glob any
+  enc=$(fl_encode_cwd "$root")
+  for cand in "$HOME/.claude/projects/$enc/$sid.jsonl" "$A/accounts"/*/"projects/$enc/$sid.jsonl" "$HOME/.claude/projects"/*/"$sid.jsonl"; do
+    [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 0
+}
+
+# ---- window + stage a valid claude JSONL (memory-safe, O(budget) not O(file)) -----
+stage_window(){ # <src> <dest> <budget-tokens> → stages windowed JSONL; stderr summary; rc 1 if no turns
+  python3 - "$1" "$2" "$3" <<'PY'
+import json,sys,collections,os
+src,dest,budget=sys.argv[1],sys.argv[2],int(sys.argv[3])
+def toks(o):
+    m=o.get("message") or {}; c=m.get("content"); n=0
+    if isinstance(c,str): n=len(c)
+    elif isinstance(c,list):
+        for b in c:
+            if not isinstance(b,dict): continue
+            for k in ("text","thinking"):
+                v=b.get(k)
+                if isinstance(v,str): n+=len(v)
+            if b.get("type")=="tool_use":
+                try: n+=len(json.dumps(b.get("input",{})))
+                except Exception: pass
+            if b.get("type")=="tool_result":
+                v=b.get("content")
+                if isinstance(v,str): n+=len(v)
+                elif isinstance(v,list):
+                    for x in v:
+                        if isinstance(x,dict) and isinstance(x.get("text"),str): n+=len(x["text"])
+    return max(1,n//4)
+dq=collections.deque(); total=0; dropped=0
+with open(src,encoding="utf-8",errors="replace") as fh:
+    for raw in fh:
+        raw=raw.rstrip("\n")
+        if not raw.strip(): continue
+        try: o=json.loads(raw)
+        except Exception: continue
+        if o.get("type") not in ("user","assistant"): continue
+        if not isinstance(o.get("message"),dict): continue
+        t=toks(o); dq.append((raw,t)); total+=t
+        while total>budget and len(dq)>1:
+            _,tt=dq.popleft(); total-=tt; dropped+=1
+if not dq:
+    sys.stderr.write("kept=0 dropped=%d est_tokens=0 windowed=0 (no standard message turns)\n"%dropped); sys.exit(1)
+lines=[r for r,_ in dq]
+try:                                    # null a windowed head's dangling parentUuid
+    o0=json.loads(lines[0])
+    if o0.get("parentUuid") is not None: o0["parentUuid"]=None; lines[0]=json.dumps(o0)
+except Exception: pass
+os.makedirs(os.path.dirname(dest),exist_ok=True)
+with open(dest,"w",encoding="utf-8") as out:
+    for r in lines: out.write(r+"\n")
+sys.stderr.write("kept=%d dropped=%d est_tokens=%d windowed=%d\n"%(len(dq),dropped,total,1 if dropped else 0))
+PY
+}
+
+# ---- run the native import -> threadId (timeout-guarded; '' + rc1 on any failure) --
+codex_import(){ # <staged> <root> → threadId on stdout
+  local staged="$1" root="$2" out tid
+  [ -n "$COMPANION" ] && [ -f "$COMPANION" ] || { echo "  ⚠ codex-companion.mjs not found (set COMPANION=<path> to override)" >&2; return 1; }
+  command -v node >/dev/null 2>&1 || { echo "  ⚠ node not on PATH — cannot import" >&2; return 1; }
+  out=$(timeout "$IMPORT_TIMEOUT" node "$COMPANION" transfer --source "$staged" --cwd "$root" --json 2>/dev/null) || return 1
+  tid=$(printf '%s' "$out" | python3 -c '
+import sys,json,re
+raw=sys.stdin.read(); tid=""
+try: tid=(json.loads(raw) or {}).get("threadId") or ""
+except Exception:
+    m=re.search(r"threadId\D+([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12})",raw)
+    tid=m.group(1) if m else ""
+print(tid)' 2>/dev/null || true)
+  tid="${tid//[![:alnum:]-]/}"
+  [ -n "$tid" ] || return 1
+  printf '%s\n' "$tid"
+}
+
+# ---- fallback: a handoff brief the fresh codex can pick up. Turn delivery into the
+# codex TUI is not part of this script, so the brief is a FILE in the workspace root,
+# not an injected turn. -------------------------------------------------------------
+handoff_brief(){ # <src-transcript> <dest-md> <ws>
+  python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null || true
+import json,sys,collections
+src,dest,ws=sys.argv[1],sys.argv[2],sys.argv[3]
+dq=collections.deque(maxlen=12)
+for raw in open(src,encoding="utf-8",errors="replace"):
+    try: o=json.loads(raw)
+    except Exception: continue
+    if o.get("type") not in ("user","assistant"): continue
+    m=o.get("message") or {}; c=m.get("content"); role=m.get("role","?"); txt=""
+    if isinstance(c,str): txt=c
+    elif isinstance(c,list):
+        txt="\n".join(b.get("text","") for b in c if isinstance(b,dict) and b.get("type")=="text" and b.get("text"))
+    if txt.strip(): dq.append((role,txt.strip()[:2000]))
+with open(dest,"w",encoding="utf-8") as out:
+    out.write("# Harness handoff brief — %s\n\n"%ws)
+    out.write("Codex import failed; conversation continuity fell back to this brief. "
+              "The last %d text turns of the prior Claude conversation follow.\n\n"%len(dq))
+    for role,txt in dq: out.write("## %s\n%s\n\n"%(role,txt))
+PY
+}
+
+# ---- current state ---------------------------------------------------------------
+desc_harness=$(ws_agents "$WS")
+live_harness=$(ws_live_harness "$WS" "$ROOT" 2>/dev/null || true)
+prev_codex_session=$(ws_get "$WS" CODEX_SESSION 2>/dev/null || true); prev_codex_session="${prev_codex_session//[![:alnum:]-]/}"
+
+# ---- rollback -------------------------------------------------------------------
+sh_rollback(){ # <to_harness> <why> → rc 0 restored+verified, rc 1 UNVERIFIED
+  local to="$1" why="$2" lh t
+  echo "↩ ROLLBACK $WS → harness '$to' ($why)" >&2
+  fl_log "ROLLBACK $WS → $to ($why)"
+  "$AGENTCTL" stop "$WS" >/dev/null 2>&1 || true; sleep 1
+  if fl_have "$WS"; then tmux kill-session -t "=agent-$WS" 2>/dev/null || true; sleep 1; fi
+  sed -i '/^AGENTS=/d' "$DESC"; printf 'AGENTS="%s"\n' "$to" >> "$DESC"
+  sed -i '/^CODEX_SESSION=/d' "$DESC"
+  [ -n "$prev_codex_session" ] && printf 'CODEX_SESSION="%s"\n' "$prev_codex_session" >> "$DESC"
+  "$AGENTCTL" up "$WS" || true
+  [ "$to" = codex ] && t="${SWAP_VERIFY_TRIES:-12}" || t="${SWAP_VERIFY_TRIES:-8}"
+  for _ in $(seq 1 "$t"); do
+    lh=$(ws_live_harness "$WS" "$ROOT" 2>/dev/null || true)
+    if [ "$lh" = "$to" ]; then
+      echo "↩ rollback complete — $WS is back on harness '$to' (live agent confirmed)" >&2
+      fl_log "$WS: rolled back to $to, verified live"; return 0
+    fi
+    sleep 1
+  done
+  echo "✗✗ ROLLBACK UNVERIFIED — $WS may have NO live '$to' agent. Check: agentctl status; agentctl up $WS" >&2
+  fl_log "$WS: ROLLBACK to $to UNVERIFIED — no live $to agent after relaunch"; return 1
+}
+
+# ---- 1. no-op / early exit -------------------------------------------------------
+if [ "$FORCE" = 0 ]; then
+  if [ "$live_harness" = "$TARGET" ]; then
+    if [ "$desc_harness" != "$TARGET" ]; then
+      sed -i '/^AGENTS=/d' "$DESC"; printf 'AGENTS="%s"\n' "$TARGET" >> "$DESC"
+      echo "→ descriptor said AGENTS='${desc_harness}' but the live agent is $TARGET — reconciled descriptor to truth"
+      fl_log "$WS: reconciled descriptor AGENTS '${desc_harness}' → '$TARGET' (matched live agent)"
+    fi
+    echo "✓ $WS already on harness $TARGET (live agent confirmed) — nothing to do"; exit 0
+  fi
+  if [ "$desc_harness" = "$TARGET" ] && [ -z "$live_harness" ]; then
+    echo "✓ $WS already configured AGENTS=$TARGET (currently down) — nothing to swap; start it: agentctl up $WS"; exit 0
+  fi
+fi
+
+from_harness="$live_harness"; [ -n "$from_harness" ] || from_harness="$desc_harness"
+echo "→ swapping $WS harness: ${from_harness} → $TARGET (descriptor '$desc_harness', live '${live_harness:-none}')"
+fl_log "$WS: harness swap ${from_harness} → $TARGET (descriptor '$desc_harness', live '${live_harness:-none}')"
+
+# ---- 2. STOP FIRST — flush the transcript, then kill a lingering husk -------------
+# (transient stop, NOT retire: the descriptor stays listed)
+"$AGENTCTL" stop "$WS" >/dev/null 2>&1 || true; sleep 1
+if fl_have "$WS"; then
+  echo "→ tmux session lingered after stop — killing agent-$WS"
+  tmux kill-session -t "=agent-$WS" 2>/dev/null || true; sleep 1
+fi
+
+# ---- 3. claude -> codex conversation continuity (import), default ON --------------
+imported_tid=""; brief_path=""
+if [ "$TARGET" = codex ] && [ "$from_harness" != codex ] && [ "$DO_IMPORT" = 1 ]; then
+  transcript=$(resolve_claude_transcript "$WS" 2>/dev/null || true)
+  if [ -n "$transcript" ] && [ -f "$transcript" ]; then
+    ts=$(date -u +%Y%m%dT%H%M%SZ); staged="$STAGE_DIR/$WS-$ts.jsonl"
+    echo "→ continuity: claude transcript $(basename "$transcript") ($(du -h "$transcript" 2>/dev/null | cut -f1)) — windowing to ≤${IMPORT_BUDGET_TOKENS} tok"
+    if stage_window "$transcript" "$staged" "$IMPORT_BUDGET_TOKENS"; then
+      echo "→ importing staged session → codex thread (companion transfer; no model turn)…"
+      if imported_tid=$(codex_import "$staged" "$ROOT"); then
+        echo "✓ imported → codex thread ${imported_tid:0:8} (codex will RESUME the conversation)"
+        fl_log "$WS: imported claude transcript → codex thread ${imported_tid} (staged $(basename "$staged"))"
+        rm -f "$staged" 2>/dev/null || true
+      else
+        echo "⚠ codex import FAILED (timeout/error) — falling back to a handoff brief; codex starts FRESH" >&2
+        brief_path="$ROOT/.harness-handoff.md"; handoff_brief "$transcript" "$brief_path" "$WS"
+        [ -f "$brief_path" ] && echo "→ handoff brief written: $brief_path (staged transcript kept: $staged)" || brief_path=""
+        fl_log "$WS: codex import FAILED — handoff brief ${brief_path:-none}, staged $staged"
+      fi
+    else
+      echo "⚠ no standard message turns in the transcript — codex starts FRESH (no import)" >&2
+      fl_log "$WS: transcript had no importable turns — fresh codex"
+    fi
+  else
+    echo "→ continuity: no claude transcript found for $WS — codex starts FRESH"
+    fl_log "$WS: no claude transcript resolved — fresh codex"
+  fi
+elif [ "$TARGET" = codex ] && [ "$DO_IMPORT" = 0 ]; then
+  echo "→ --fresh: skipping conversation import — codex starts a fresh session"
+fi
+
+# ---- 4. rewrite the harness axis (idempotent) ------------------------------------
+sed -i '/^AGENTS=/d' "$DESC"
+printf 'AGENTS="%s"\n' "$TARGET" >> "$DESC"
+
+# ---- 5. CODEX_SESSION write-back (claude -> codex only; idempotent) --------------
+if [ "$TARGET" = codex ]; then
+  sed -i '/^CODEX_SESSION=/d' "$DESC"
+  if [ -n "$imported_tid" ]; then
+    printf 'CODEX_SESSION="%s"\n' "$imported_tid" >> "$DESC"
+  else
+    echo "→ CODEX_SESSION left unset — fresh codex thread (the launcher captures the id on first turn)"
+  fi
+fi
+# codex -> claude: CODEX_SESSION is left intact for a later re-flip; run-claude ignores it.
+
+# ---- 6. relaunch on the new harness (guarded so a failure flows into rollback) ----
+"$AGENTCTL" up "$WS" || true
+
+# ---- 7. VERIFY, harness-aware, bounded poll (codex gets longer for its slower boot)
+if [ "$TARGET" = codex ]; then tries="${SWAP_VERIFY_TRIES:-12}"; else tries="${SWAP_VERIFY_TRIES:-6}"; fi
+ok=0
+for _ in $(seq 1 "$tries"); do
+  lh=$(ws_live_harness "$WS" "$ROOT" 2>/dev/null || true)
+  [ "$lh" = "$TARGET" ] && { ok=1; break; }
+  sleep 1
+done
+
+if [ "$ok" = 1 ]; then
+  echo "✓ $WS now on harness: $TARGET (live $TARGET agent confirmed)"
+  if [ "$TARGET" = codex ]; then
+    [ -n "$imported_tid" ] && echo "  conversation RESUMED via codex thread ${imported_tid:0:8}"
+    [ -n "$brief_path" ]   && echo "  (fresh session; handoff brief at $brief_path)"
+  fi
+  fl_log "$WS: ${from_harness} → $TARGET verified (live $TARGET agent under agent-$WS${imported_tid:+; resumed ${imported_tid:0:8}})"
+  exit 0
+fi
+
+# ---- 8. HARD FAILURE — target harness never came alive → ROLL BACK ---------------
+echo "✗ $WS did NOT come up on harness $TARGET (no live $TARGET agent after $tries polls) — rolling back to '$from_harness'." >&2
+fl_log "$WS: swap → $TARGET FAILED (no live agent after $tries polls) — rolling back to $from_harness"
+sh_rollback "$from_harness" "target harness $TARGET not live after relaunch" || exit 6
+exit 5

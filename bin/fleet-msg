@@ -115,7 +115,13 @@ def _resolve(to_raw, sender):
 
 
 def _claude_pane(name):
-    r = subprocess.run(["tmux", "list-panes", "-t", f"agent-{name}:main", "-F", "#{pane_id}"],
+    # EXACT TARGET, NOT A PREFIX (2026-07-27). tmux resolves a `-t` name by exact match and then falls
+    # back to a PREFIX match, so with workspaces named agent-foo and agent-foo-bar, a message addressed
+    # to "foo" resolved panes from "foo-bar" whenever agent-foo happened to be down — delivering to the
+    # wrong agent with no error. The leading "=" is tmux's own opt-out: it matches that session or
+    # nothing. Enforced by tests/test-tmux-exact-target.sh, which found this line precisely because the
+    # target is assembled in Python and a shell-oriented sweep of bin/ walked straight past it.
+    r = subprocess.run(["tmux", "list-panes", "-t", f"=agent-{name}:main", "-F", "#{pane_id}"],
                        capture_output=True, text=True)
     if r.returncode != 0:
         return None

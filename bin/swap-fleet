@@ -337,7 +337,7 @@ run_tail(){
                                       cat "$INTERRUPTED_F" 2>/dev/null; } | sort -u )
     for ws in $nudge_list; do
       [ "$ws" = main ] && continue    # main has its own tailored nudge below
-      tmux has-session -t "agent-$ws" 2>/dev/null || continue
+      tmux has-session -t "=agent-$ws" 2>/dev/null || continue
       local was_cut=""; grep -qx "$ws" "$INTERRUPTED_F" 2>/dev/null && was_cut=" You were INTERRUPTED MID-TURN by this bounce — your last task is unfinished, not done."
       # DORMANCY GATE (operator policy 2026-07-17: "we should not be sending swap messages if the
       # agent has not been in use/process for the last 6 hours"): AUTOMATED wake messages go only to agents whose

@@ -63,13 +63,13 @@ fi
 
 echo "grok-ready: NOT READY (auth $state — grok's ~6h token does not self-refresh headlessly)"
 if [ "${1:-}" = "--login" ]; then
-  tmux kill-session -t "$LOGIN_TMUX" 2>/dev/null || true
+  tmux kill-session -t "=$LOGIN_TMUX" 2>/dev/null || true
   tmux new-session -d -s "$LOGIN_TMUX" -x 200 -y 50 \
     "export PATH=$HOME/.local/bin:\$PATH; grok login --device-auth 2>&1"
   # the URL renders within a few seconds; scrape it for the human
   for _ in 1 2 3 4 5 6 7 8; do
     sleep 2
-    url=$(tmux capture-pane -t "$LOGIN_TMUX" -p 2>/dev/null | grep -oE "https://accounts\.x\.ai/[^ ]+" | head -1)
+    url=$(tmux capture-pane -t "=$LOGIN_TMUX" -p 2>/dev/null | grep -oE "https://accounts\.x\.ai/[^ ]+" | head -1)
     [ -n "$url" ] && break
   done
   if [ -n "${url:-}" ]; then
@@ -77,7 +77,7 @@ if [ "${1:-}" = "--login" ]; then
     echo "grok-ready: approval completes in background (tmux session '$LOGIN_TMUX'); re-run grok-ready after"
     exit 3
   fi
-  tmux kill-session -t "$LOGIN_TMUX" 2>/dev/null || true
+  tmux kill-session -t "=$LOGIN_TMUX" 2>/dev/null || true
   echo "grok-ready: could not start device login (no URL rendered)"; exit 1
 fi
 echo "grok-ready: run 'grok-ready --login' to mint a device-code URL for the human"

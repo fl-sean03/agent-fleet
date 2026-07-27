@@ -112,10 +112,10 @@ fl_idle_hours(){ # <ws> → idle hours (1 decimal) for log lines; '?' when unkno
 # ---------------------------------------------------------------------------------------------
 # tmux / pane — pane model: each agent-<ws> session has pane 1 = control shell, pane 2 = the agent.
 # ---------------------------------------------------------------------------------------------
-fl_have(){ tmux has-session -t "agent-$1" 2>/dev/null; }
+fl_have(){ tmux has-session -t "=agent-$1" 2>/dev/null; }
 
 fl_agent_pane(){ # <ws> → the agent pane's %id (second pane; sole pane if only one exists)
-  local p; p=$(tmux list-panes -t "agent-$1:main" -F '#{pane_id}' 2>/dev/null) || return 1
+  local p; p=$(tmux list-panes -t "=agent-$1:main" -F '#{pane_id}' 2>/dev/null) || return 1
   [ -n "$p" ] || return 1
   if [ "$(printf '%s\n' "$p" | wc -l)" -ge 2 ]; then printf '%s\n' "$p" | sed -n 2p
   else printf '%s\n' "$p" | head -1; fi
@@ -128,7 +128,7 @@ fl_pane_text(){ # <ws> → visible text of the agent pane (wrapped lines joined)
 
 ws_busy(){ # <ws> → rc 0 while a live turn owns the pane ('esc to interrupt' = the only reliable
   # busy footer; spinner glyphs persist in idle panes and false-positive)
-  tmux capture-pane -p -t "agent-$1:main.2" 2>/dev/null | grep -q "esc to interrupt"
+  tmux capture-pane -p -t "=agent-$1:main.2" 2>/dev/null | grep -q "esc to interrupt"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -140,7 +140,7 @@ fl_proctree(){ local p="$1" c; echo "$p"; for c in $(pgrep -P "$p" 2>/dev/null);
 
 fl_agent_alive(){ # <ws> → rc 0 if any live agent-ish process exists under the session's panes
   local pane pid comm
-  for pane in $(tmux list-panes -t "agent-$1:main" -F '#{pane_pid}' 2>/dev/null); do
+  for pane in $(tmux list-panes -t "=agent-$1:main" -F '#{pane_pid}' 2>/dev/null); do
     for pid in $(fl_proctree "$pane"); do
       comm=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
       case "$comm" in claude|claude-bin|node|bun|codex|opencode|ssh|bwrap) return 0 ;; esac
@@ -207,7 +207,7 @@ verify_submitted(){ # <ws> — a nudge is paste+Enter; if the Enter was swallowe
   # replayed draft was auto-fired into an agent three times in one afternoon). Stranded text stays
   # VISIBLE for the operator; the only submit path is a manual, envelope-tagged `fleet-msg kick <ws>`.
   local ws="$1"; sleep 2
-  local line; line=$(tmux capture-pane -p -t "agent-$ws:main.2" 2>/dev/null | grep "❯" | tail -1)
+  local line; line=$(tmux capture-pane -p -t "=agent-$ws:main.2" 2>/dev/null | grep "❯" | tail -1)
   if printf '%s' "$line" | grep -qE "❯ .+"; then
     fl_log "nudge for $ws did not submit — LEFT VISIBLE in its composer (auto-submit removed 2026-07-17; manual: fleet-msg kick $ws)"
   fi

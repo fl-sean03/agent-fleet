@@ -29,7 +29,7 @@ ACTIVE=$(cat "$HOME/.agents/accounts/.active" 2>/dev/null || true)
 CUR=$(cat "$CFG/.account" 2>/dev/null || true)
 if [ -n "$ACTIVE" ] && [ "$CUR" != "$ACTIVE" ]; then
   STASH="$CFG/.credentials.$ACTIVE.json"
-  if tmux has-session -t "agent-$WS" 2>/dev/null; then WS_UP=1; else WS_UP=0; fi
+  if tmux has-session -t "=agent-$WS" 2>/dev/null; then WS_UP=1; else WS_UP=0; fi
   if [ -f "$STASH" ] && [ "$WS_UP" = 0 ]; then
     # Phase-C-style aligned switch: refresh the departing label's stash from live first
     [ -n "$CUR" ] && [ -f "$CFG/.credentials.json" ] \

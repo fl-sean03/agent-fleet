@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run-codex-confined — launch OpenAI Codex inside the SAME bubblewrap jail that
+# bin/run-claude-confined uses for claude, so a confined workspace (SANDBOX="bwrap")
+# can run codex with the same isolation posture: the namespace sees ONLY the
+# workspace ($ROOT, mounted /work) plus codex's own store. Everything else on the
+# host — your home, other confined workspaces, /etc/passwd — is NOT MOUNTED, so it
+# is genuinely unreadable rather than merely denied.
+#
+# Dispatched by agentctl when a descriptor carries AGENTS="codex" + SANDBOX="bwrap".
+# See docs/HARNESSES.md for the axis and docs/ISOLATION.md for the tier model.
+#
+# =============================================================================
+# READ THIS BEFORE PUTTING A CONFIDENTIAL WORKSPACE ON CODEX
+# -----------------------------------------------------------------------------
+# THIS TIER IS WEAKER THAN CONFINED CLAUDE, and the reason is structural, not a bug.
+#
+# run-claude-confined gives each confined workspace its OWN config dir
+# (~/.agents/confined-cfg/<name>) holding its OWN credential and its OWN session
+# store. Nothing of the operator's is mounted. Codex keeps auth, config, sessions,
+# history and its local databases in ONE $CODEX_HOME (default ~/.codex), all of it
+# written on every turn — so there is nowhere else for codex auth to live, and this
+# launcher must mount that store read-write into the jail. Consequences:
+#
+#   * the confined agent CAN READ the operator's auth.json (subscription tokens)
+#     and the operator's entire codex history (sessions/, history.jsonl, the local
+#     memory/log databases).
+#   * the workspace's OWN codex sessions land in that SHARED store, mixed in with
+#     the operator's and with every other confined workspace's.
+#
+# Partial mitigation kept below: codex's inner sandbox defaults to workspace-write,
+# which landlock-confines the MODEL's tool writes to /work, so the agent's tools
+# cannot MUTATE the shared store. It does not stop reads.
+#
+# THE REAL FIX is a per-workspace CODEX_HOME. codex honours the CODEX_HOME env var
+# for the whole store, and `-p <name>` layers $CODEX_HOME/<name>.config.toml on top
+# of the base config, so a per-workspace store is achievable — it costs one
+# `codex login` per store. Until you do that: do not put a workspace under a
+# confidentiality obligation on this tier.
+#
+# =============================================================================
+# JAIL DESIGN NOTES
+# -----------------------------------------------------------------------------
+# [1] BIND THE VENDOR PACKAGE DIRECTORY, NOT THE LONE BINARY.
+#   The codex binary is fully self-contained — a static-pie musl executable needing
+#   no node and no dynamic loader — but it is NOT a lone file. It resolves siblings
+#   RELATIVE TO ITS OWN EXECUTABLE via codex-package.json (layoutVersion 1:
+#   entrypoint bin/codex, resourcesDir codex-resources, pathDir codex-path):
+#     codex-path/rg              bundled ripgrep — the file-search tool
+#     codex-resources/bwrap      codex's OWN inner-sandbox helper
+#     codex-resources/zsh/bin/zsh   bundled shell for the shell tool
+#     bin/codex-code-mode-host   spawned for "code mode" tool execution
+#   Binding only bin/codex breaks search, code mode and the inner sandbox. So bind
+#   the WHOLE package dir read-only at /opt/codex, preserving layout, and exec
+#   /opt/codex/bin/codex. It is all native code — still no node in the jail. Not
+#   setting the npm-provenance env vars also side-steps codex's npm self-update
+#   offer, which is an interactive prompt that would strand an unattended pane.
+#
+# [2] RESOLVE THE PACKAGE DIR BY LAYOUT, NOT BY INSTALL SHAPE.
+#   Codex ships two ways — an npm package with a vendored triple under
+#   node_modules/, and a standalone installer that unpacks a release directory.
+#   Hardcoding either path means the launcher silently stops working the day the
+#   install method changes (it fails the preflight and drops to a bare shell, which
+#   inside a confined workspace is the one outcome this launcher exists to prevent).
+#   So: walk UP from the resolved `codex` binary looking for codex-package.json.
+#   That is layout-driven and survives both shapes.
+#
+# [3] BIND $CODEX_HOME READ-WRITE, AT ITS REAL PATH.
+#   Read-WRITE and the WHOLE directory (not per-file binds) is REQUIRED: token
+#   refresh is a write-temp-then-atomic-rename inside the store, and session/index/
+#   history writes land all over the tree. Per-file binds break atomic rename.
+#   At its REAL path rather than remapped to /codex-home, because config.toml may
+#   legitimately contain ABSOLUTE paths (model catalogues, MCP server commands,
+#   log destinations) that a remap would break. Binding at the real path costs one
+#   thing — the jail learns the store's absolute path — and buys config portability.
+#   If your config.toml has no absolute paths, remapping is the tighter choice.
+#
+# [4] TRUST PRESEED KEYS ON /work, THE IN-JAIL PATH.
+#   codex prompts per-EXACT-path and strands an unattended pane. Inside the jail
+#   codex's cwd and --cd are BOTH /work, so the trust lookup is [projects."/work"] —
+#   NOT the host root. Every confined workspace mounts at /work, so they share this
+#   one entry: fine (each confined root is trusted by construction) and it leaks no
+#   workspace identity into the shared config.
+#
+# [5] THE OUTER JAIL IS THE WALL; codex's inner sandbox is defence in depth.
+#   run-claude-confined runs claude --dangerously-skip-permissions because the
+#   namespace is the wall. codex's literal parallel is
+#   --dangerously-bypass-approvals-and-sandbox. We do NOT default to it: because the
+#   shared store is mounted read-write, keeping `-s workspace-write` landlock-confines
+#   the model's tool writes to /work and shields the store. Verified working: the
+#   workspace-write landlock initialises inside the outer --unshare-all user namespace
+#   (landlock and seccomp do not need a nested userns). Escape hatches if it ever
+#   fails to initialise on your kernel:
+#     CODEX_CONFINED_SANDBOX=bypass              -> --dangerously-bypass-approvals-and-sandbox
+#     CODEX_CONFINED_SANDBOX=danger-full-access  -> -s danger-full-access -a never
+#   The outer jail remains the full wall in both cases; only store write-protection
+#   is lost.
+# =============================================================================
+set -euo pipefail
+
+# --- Nested-session / auth hygiene (host-side: bwrap forwards the parent env
+# unless --clearenv, so clearing here is what keeps these out of the jail). Same set
+# run-codex clears — sandbox/non-interactive markers that could disable the child's
+# network or suppress the TUI, and api-key envs that would SHADOW the subscription
+# auth path. CODEX_HOME is deliberately NOT unset; it is set explicitly below.
+unset CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CODEX_NON_INTERACTIVE \
+      CODEX_THREAD_ID CODEX_INTERNAL_ORIGINATOR_OVERRIDE \
+      CODEX_ACCESS_TOKEN CODEX_API_KEY OPENAI_API_KEY 2>/dev/null || true
+
+# --- Identity / working root (mirrors run-claude-confined: cwd is the workspace) --
+WORK="${ROOT:-$PWD}"
+WS="${WS_NAME:-$(basename "$WORK")}"
+CODEX_HOME_REAL="${CODEX_HOME:-$HOME/.codex}"
+
+# --- Resolve the self-contained vendor package dir (layout-driven; see [1],[2]) ---
+# Walk up from the resolved binary until a codex-package.json sits beside a bin/codex.
+# Works for the standalone release layout and the npm vendored-triple layout alike.
+CX_PKG=""
+_bin="$(readlink -f "$(command -v codex 2>/dev/null)" 2>/dev/null || true)"
+if [ -n "$_bin" ]; then
+  _d="$(dirname "$_bin")"
+  for _ in 1 2 3 4; do
+    if [ -f "$_d/codex-package.json" ] && [ -x "$_d/bin/codex" ]; then CX_PKG="$_d"; break; fi
+    [ "$_d" = "/" ] && break
+    _d="$(dirname "$_d")"
+  done
+fi
+if [ -z "$CX_PKG" ]; then
+  # Last resort: an npm install whose entrypoint is a JS shim, so the binary above is
+  # node and the walk finds nothing. Probe the vendored triple directly.
+  for _c in "$HOME"/.nvm/versions/node/*/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*-linux-musl \
+            /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*-linux-musl; do
+    [ -f "$_c/codex-package.json" ] && [ -x "$_c/bin/codex" ] && { CX_PKG="$_c"; break; }
+  done
+fi
+
+# --- Preflight — never run a confined workspace unconfined; fail LOUDLY to a shell --
+[ -x "$(command -v bwrap)" ] || { echo "bwrap not installed — refusing to run a confined workspace unconfined."; exec bash; }
+if [ -z "$CX_PKG" ] || [ ! -x "$CX_PKG/bin/codex" ]; then
+  echo "✗ codex package dir not found. Looked upward from '$(command -v codex 2>/dev/null || echo '<codex not on PATH>')'"
+  echo "  for a directory containing codex-package.json + bin/codex, then probed the npm vendor paths."
+  echo "  Refusing to launch (a confined workspace must never fall back to the host). Fix the codex install, then retry."
+  exec bash
+fi
+[ -d "$CODEX_HOME_REAL" ] || { echo "CODEX_HOME '$CODEX_HOME_REAL' not found — codex has no auth/config store"; exec bash; }
+[ -f "$CODEX_HOME_REAL/auth.json" ] || echo "ℹ no auth yet in $CODEX_HOME_REAL — run 'codex login' on the HOST once; this jail only binds the store"
+
+# --- Top-of-file knobs (parity with run-codex + the confined sandbox knob) --------
+CODEX_PROVIDER_OVERRIDE="${CODEX_PROVIDER_OVERRIDE:-model_provider=openai}"
+CODEX_MODEL_DEFAULT="${CODEX_MODEL_DEFAULT:-gpt-5.6-sol}"
+CODEX_CAPTURE_TIMEOUT="${CODEX_CAPTURE_TIMEOUT:-1800}"
+CODEX_SESSION_CAPTURE_FILE="${CODEX_SESSION_CAPTURE_FILE:-$HOME/.agents/state/${WS}.codex-session}"
+CODEX_CONFINED_SANDBOX="${CODEX_CONFINED_SANDBOX:-workspace-write}"   # workspace-write | danger-full-access | bypass  (see [5])
+
+echo "→ confined codex workspace: $WS  (root $WORK → /work)"
+echo "→ codex package: $CX_PKG → /opt/codex (read-only; static binary, no node in jail)"
+echo "→ store: $CODEX_HOME_REAL bound read-write at its real path (see note [3]) — SHARED, not isolated"
+
+# --- Build the codex arg vector. Inside the jail the working root is ALWAYS /work,
+# so -C/--cd is /work, never the host path. ------------------------------------------
+case "$CODEX_CONFINED_SANDBOX" in
+  bypass)             SANDBOX_ARGS=(--dangerously-bypass-approvals-and-sandbox)
+                      echo "→ sandbox: --dangerously-bypass-approvals-and-sandbox (namespace IS the wall; NO store write-protection)" ;;
+  danger-full-access) SANDBOX_ARGS=(-s danger-full-access -a never)
+                      echo "→ sandbox: -s danger-full-access -a never (no store write-protection)" ;;
+  *)                  SANDBOX_ARGS=(-s workspace-write -a never)
+                      echo "→ sandbox: -s workspace-write -a never (landlock-confines tool writes to /work, shields the shared store)" ;;
+esac
+OPTS=(-C /work "${SANDBOX_ARGS[@]}")
+[ -n "$CODEX_PROVIDER_OVERRIDE" ] && OPTS+=(-c "$CODEX_PROVIDER_OVERRIDE")
+
+# MODEL: honour the descriptor only if codex-shaped; else CODEX_MODEL/default. Same
+# filter as run-codex (a claude name carries no codex meaning).
+CX_MODEL=""
+if [ -n "${CODEX_MODEL:-}" ]; then
+  CX_MODEL="$CODEX_MODEL"
+elif [ -n "${MODEL:-}" ] && printf '%s' "$MODEL" | grep -qiE '^(gpt-|o3|o4)'; then
+  CX_MODEL="$MODEL"; echo "→ model: $MODEL (descriptor MODEL is codex-shaped)"
+else
+  CX_MODEL="$CODEX_MODEL_DEFAULT"
+  [ -n "${MODEL:-}" ] && echo "→ model: descriptor MODEL='$MODEL' is not a codex id — using default $CX_MODEL"
+fi
+OPTS+=(-m "$CX_MODEL"); echo "→ model: $CX_MODEL"
+
+# EFFORT -> -c model_reasoning_effort. Codex has no effort ENV (unlike claude's
+# CLAUDE_CODE_EFFORT_LEVEL), so this crosses the jail as a codex ARGUMENT, not a
+# --setenv. Claude-only `max` -> codex `ultra`.
+if [ -n "${EFFORT:-}" ]; then
+  case "$EFFORT" in
+    max) CX_EFFORT=ultra ;;
+    *)   CX_EFFORT="$EFFORT" ;;
+  esac
+  OPTS+=(-c "model_reasoning_effort=$CX_EFFORT")
+  echo "→ effort: $EFFORT -> model_reasoning_effort=$CX_EFFORT (descriptor pin)"
+fi
+
+# --- TRUST PRESEED (see [4]) — key on /work, written host-side to the shared config
+# (which is the same file the jail reads). Idempotent append-if-absent.
+if [ "${CODEX_TRUST_PRESEED:-1}" != 0 ]; then
+  CX_CFG="$CODEX_HOME_REAL/config.toml"
+  if ! grep -qF '[projects."/work"]' "$CX_CFG" 2>/dev/null; then
+    if printf '\n[projects."/work"]\ntrust_level = "trusted"\n' >> "$CX_CFG" 2>/dev/null; then
+      echo "→ trust: preseeded [projects.\"/work\"] (the in-jail root) — prompt-free"
+    else
+      echo "⚠ trust: could not write $CX_CFG — the confined TUI may prompt on /work"
+    fi
+  else
+    echo "→ trust: /work already trusted"
+  fi
+fi
+
+# --- Claude-only descriptor fields: acknowledge, never silently swallow -----------
+if [ "${REMOTE_CONTROL:-}" = "on" ]; then
+  echo "→ Remote Control requested ('${RC_NAME:-$WS}'): codex RC is a separate daemon plane"
+  echo "  (codex remote-control), not a launcher flag — the pane is still driveable via tmux."
+fi
+[ -n "${SESSION_ID:-}" ] && echo "→ (ignoring claude SESSION_ID ${SESSION_ID:0:8}: codex ids are self-generated; use CODEX_SESSION)"
+[ -n "${ACCOUNT:-}" ]    && echo "→ (ignoring ACCOUNT '$ACCOUNT': codex has one shared store; no per-account codex profile)"
+[ -n "${PROFILE:-}" ]    && echo "→ (ignoring claude PROFILE '$PROFILE': no per-workspace codex config; the store is shared)"
+
+# --- Resume-or-fresh (session-capture contract; see run-codex) ---------------------
+# Both the existence check and the capture poller run HOST-SIDE, before bwrap: they
+# read the real store with host python3 (there is no python in the jail), and —
+# crucially — the poller matches on the cwd codex RECORDS, which inside the jail is
+# /work, NOT the host root. Every confined root records cwd=/work, so two FRESH
+# confined launches started in the same window could cross-capture. That is inherent
+# to a shared store plus an identical in-jail cwd; launch confined workspaces one at
+# a time, or give each its own CODEX_HOME.
+CX_ARGV=()
+RESUME_ID=""
+if [ -n "${CODEX_SESSION:-}" ]; then
+  if ls "$CODEX_HOME_REAL/sessions/"*/*/*/rollout-*-"$CODEX_SESSION".jsonl >/dev/null 2>&1 \
+     || grep -qF "\"id\":\"$CODEX_SESSION\"" "$CODEX_HOME_REAL/session_index.jsonl" 2>/dev/null; then
+    RESUME_ID="$CODEX_SESSION"; echo "→ resuming codex session ${CODEX_SESSION:0:8}"
+  else
+    echo "⚠ CODEX_SESSION ${CODEX_SESSION:0:8} not found on disk — starting FRESH (will capture a new id)"
+  fi
+fi
+
+if [ -n "$RESUME_ID" ]; then
+  CX_ARGV=(resume "$RESUME_ID" "${OPTS[@]}")
+else
+  CX_ARGV=("${OPTS[@]}")
+  T0=$(date +%s)
+  ( CAP_ROOT="/work"; CAP_FILE="$CODEX_SESSION_CAPTURE_FILE"; SESS_DIR="$CODEX_HOME_REAL/sessions"
+    deadline=$((T0 + CODEX_CAPTURE_TIMEOUT)); mkdir -p "$(dirname "$CAP_FILE")" 2>/dev/null || true
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      id=$(python3 - "$CAP_ROOT" "$T0" "$SESS_DIR" <<'PY' 2>/dev/null
+import glob,json,os,sys,re
+root,t0,sdir=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+best=None;bt=t0
+for f in glob.glob(os.path.join(sdir,'*/*/*/rollout-*.jsonl')):
+    try:
+        if os.path.getmtime(f) < t0-2: continue
+        with open(f) as fh: first=fh.readline()
+        o=json.loads(first); p=o.get('payload',{})
+        if p.get('cwd')!=root: continue
+        m=re.search(r'-([0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$',f)
+        if not m: continue
+        mt=os.path.getmtime(f)
+        if mt>=bt: best,bt=m.group(1),mt
+    except Exception: continue
+print(best or '')
+PY
+)
+      if [ -n "$id" ]; then
+        echo "CODEX_SESSION_CAPTURE: $id"
+        printf '%s\n' "$id" > "$CAP_FILE" 2>/dev/null || true
+        break
+      fi
+      sleep 3
+    done ) &
+  echo "→ fresh codex session — capture poller armed host-side (sidecar $CODEX_SESSION_CAPTURE_FILE, timeout ${CODEX_CAPTURE_TIMEOUT}s)"
+fi
+
+# --- MEMORY CAP (identical doctrine to run-claude-confined; unit codex-ws-…) -------
+# The scope wraps the WHOLE bwrap+codex tree and runs SYNCHRONOUSLY in this tty, so
+# interactivity is preserved. bwrap's cgroup-namespace unshare only changes the VIEW
+# of the cgroup path, not membership, so memory.max still enforces inside the jail.
+# Overridable via MEMHIGH=/MEMMAX=; MEM_CAP=0 disables. FALLBACK: run bwrap unbounded
+# with a loud note — never block a launch on the cap.
+MEMHIGH="${MEMHIGH:-10G}"; MEMMAX="${MEMMAX:-12G}"
+CAP=()
+if [ "${MEM_CAP:-1}" = 0 ]; then
+  echo "→ memory cap: DISABLED (MEM_CAP=0) — launching confined codex unbounded"
+elif command -v systemd-run >/dev/null 2>&1 \
+     && systemd-run --user --scope --collect --quiet -p MemoryMax=64M --unit "codex-memcap-probe-$$" -- /bin/true >/dev/null 2>&1; then
+  MEMUNIT="codex-ws-${WS}"; MEMUNIT="${MEMUNIT//[^A-Za-z0-9_-]/-}-$$"
+  OOM=(); command -v choom >/dev/null 2>&1 && OOM=(choom -n 500 --)
+  CAP=(systemd-run --user --scope --collect --unit "$MEMUNIT"
+       -p MemoryHigh="$MEMHIGH" -p MemoryMax="$MEMMAX" -- "${OOM[@]}")
+  echo "→ memory cap: MemoryHigh=$MEMHIGH MemoryMax=$MEMMAX oom_score_adj=$([ "${#OOM[@]}" -gt 0 ] && echo 500 || echo 'default(choom absent)') (scope $MEMUNIT)"
+else
+  echo "⚠ memory cap: systemd-run --user --scope unavailable/failed — launching confined codex UNBOUNDED"
+fi
+
+# --- THE JAIL. Mounts mirror run-claude-confined; the codex-specific binds are
+# swapped in. --unshare-all --share-net: fresh user/pid/ipc/uts/cgroup namespaces,
+# host NET kept (the API call needs outbound HTTPS). No /etc/passwd bind — parity
+# with confined claude, and codex tolerates its absence.
+#   The trailing --ro-bind re-binds the codex package read-only IF it happens to live
+#   inside the store we just bound read-write (the standalone installer puts it there).
+#   Without it, the jail could overwrite the very binary every other workspace runs.
+CX_PKG_RO=()
+case "$CX_PKG/" in "$CODEX_HOME_REAL"/*) CX_PKG_RO=(--ro-bind "$CX_PKG" "$CX_PKG")
+  echo "→ note: the codex package lives inside the store — re-bound read-only so the jail cannot modify it" ;;
+esac
+echo "→ confined codex  (sees only: $WORK  + the codex store; host filesystem walled off)"
+"${CAP[@]}" bwrap \
+  --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin \
+  --ro-bind /etc/resolv.conf /etc/resolv.conf --ro-bind /etc/ssl /etc/ssl \
+  --ro-bind /etc/hosts /etc/hosts --ro-bind /etc/nsswitch.conf /etc/nsswitch.conf \
+  --ro-bind-try /etc/ca-certificates.conf /etc/ca-certificates.conf \
+  --proc /proc --dev /dev --tmpfs /tmp \
+  --ro-bind "$CX_PKG" /opt/codex \
+  --bind "$WORK" /work --bind "$CODEX_HOME_REAL" "$CODEX_HOME_REAL" "${CX_PKG_RO[@]}" \
+  --setenv HOME "$(dirname "$CODEX_HOME_REAL")" --setenv CODEX_HOME "$CODEX_HOME_REAL" \
+  --setenv TERM "${TERM:-xterm-256color}" --setenv LANG "${LANG:-C.UTF-8}" \
+  --chdir /work --unshare-all --share-net --die-with-parent \
+  /opt/codex/bin/codex "${CX_ARGV[@]}" || true
+echo; echo "[confined codex exited — this pane is now a HOST shell. 'cd $WORK' + 'run-codex-confined' to restart]"
+exec bash
