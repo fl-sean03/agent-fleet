@@ -209,6 +209,40 @@ for f in "$A"/projects/*.env; do
   done
 done
 
+# ── OVERSIZED TRANSCRIPT: the freeze that presents as a healthy agent ──────────────────────────────
+#
+# A conversation JSONL that grows past a few tens of megabytes stops being appended to. The process
+# stays up, the pane looks normal, and the liveness check above passes — because a process DOES exist.
+# Nothing the agent then does is persisted.
+#
+# Observed three times on one fleet, at 68.65MB, 79MB and 103.7MB, in two distinct shapes:
+#   * IDLE-FROZEN — one write at startup, then silence, then the process exits after 3-4h. Three
+#     cycles measured at 3h31m/3h11m/3h59m, 42-52s CPU, no oom-kill, 459M peak against a 12G cap.
+#   * WORKING-FROZEN — the agent kept working, its context grew ~117k tokens, and the file stayed
+#     byte- AND hash-identical to its archive copy. This shape loses live work.
+#
+# WHY SIZE AND NOT mtime: liveness was deliberately moved off transcript mtime because mtime cannot
+# tell a dead agent from a quiet one — an idle agent writes nothing either. Size is deterministic and
+# warns BEFORE the freeze. There is no clean threshold (the smallest observed freeze is below the
+# largest safe size), so this warns early and calls the countdown a planning aid, not a margin.
+#
+# Alert-only: the remedy retires a conversation, which is the owner's decision. It is
+#   1. write a handoff file in the workspace   2. retire the session id (comment it out, keep it)
+#   3. start fresh                             4. pin the new id
+# and it destroys nothing — the transcript stays on disk.
+TRANSCRIPT_WARN_MB="${SG_TRANSCRIPT_WARN_MB:-60}"
+TRANSCRIPT_FREEZE_MB="${SG_TRANSCRIPT_FREEZE_MB:-68}"
+for f in "$A"/projects/*.env; do
+  [ -e "$f" ] || continue
+  ws=$(basename "${f%.env}")
+  transcript=$(ws_transcript "$ws" 2>/dev/null) || continue
+  [ -f "$transcript" ] || continue
+  mb=$(( $(stat -c %s "$transcript" 2>/dev/null || echo 0) / 1048576 ))
+  [ "$mb" -ge "$TRANSCRIPT_WARN_MB" ] || continue
+  log "!!! OVERSIZED TRANSCRIPT: $ws at ${mb}MB (warn >=${TRANSCRIPT_WARN_MB}MB) — past this size the JSONL stops being appended to and the agent freezes while still looking healthy"
+  alert_main "bigtranscript-$ws" "OVERSIZED TRANSCRIPT: workspace '$ws' conversation is ${mb}MB (warn >=${TRANSCRIPT_WARN_MB}MB). Past roughly this size the JSONL STOPS BEING APPENDED TO: the process stays up and the pane looks normal, so the liveness check passes, but nothing the agent does is persisted. Observed three times at 68.65MB, 79MB and 103.7MB, so there is NO clean threshold and any size past the warn level is already at risk. One shape exits after a few idle hours; the other keeps WORKING while persisting nothing, and that one loses live work. Remedy: write a handoff file in the workspace, retire the session id (comment it out, keep it), start fresh, pin the new id. It destroys nothing — the transcript stays on disk. Alert only: retiring a conversation is the owner's call."
+done
+
 # BOX-LEVEL MEMORY FLOOR: per-agent RSS above catches one hog; this catches the AGGREGATE — 15
 # max-effort agents at 0.5-2G each plus compute jobs can exhaust the box with no single villain
 # (a 400MB headroom probe OOM'd at 24/30Gi used — the box was tight, nobody was huge).
